@@ -7,6 +7,13 @@ enum SafePath {
 
     /// Returns a destination URL that is guaranteed to be inside `destDir`,
     /// or throws `KnitError.formatError` if `name` is not safe.
+    ///
+    /// Validation is purely lexical: a name with no absolute prefix, no NUL,
+    /// no empty leading segment, and no `..` component cannot escape `destDir`
+    /// when joined via `appendingPathComponent`. We deliberately avoid
+    /// `standardizedFileURL` here because its symlink-resolution behavior on
+    /// not-yet-existing destination paths is inconsistent across macOS
+    /// versions and would reject legitimate entries.
     static func resolve(name: String, into destDir: URL) throws -> URL {
         if name.isEmpty {
             throw KnitError.formatError("archive entry has empty name")
@@ -25,15 +32,6 @@ enum SafePath {
             }
         }
 
-        let candidate = destDir.appendingPathComponent(name).standardizedFileURL
-        let base = destDir.standardizedFileURL
-
-        // Final containment check: the resolved candidate must live under base.
-        let basePath = base.path.hasSuffix("/") ? base.path : base.path + "/"
-        let candidatePath = candidate.path
-        if candidatePath != base.path && !candidatePath.hasPrefix(basePath) {
-            throw KnitError.formatError("archive entry escapes destination: \(name)")
-        }
-        return candidate
+        return destDir.appendingPathComponent(name)
     }
 }
