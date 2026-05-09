@@ -1,6 +1,26 @@
 # Knit
 
-A high-speed compression tool for Apple Silicon. In addition to multi-threaded standard ZIP, Knit supports `.knit`, an internal-only format optimized for speed. Right-click integration with Finder is included.
+> Fast, modern file compression for Apple Silicon.
+
+Knit is a compression utility built natively for Apple Silicon Macs (M-series). It pairs a standard ZIP encoder with a custom `.knit` archive format, both driven by a multi-threaded compression engine designed to saturate the M-series memory subsystem and modern NVMe storage — fast enough that the bottleneck shifts from the CPU back to your disk.
+
+When interoperability matters, `knit zip` produces fully spec-compliant ZIP archives — including ZIP64 for files beyond 4 GB — that open with any standard unzip implementation on any platform. When you want the absolute best throughput, `knit pack` writes a `.knit` container: each entry is split into independent zstd frames, allowing the encoder to fan out across every core and the decoder to support random-access seeking into any block. Single huge files (10 GB+) compress in parallel via a pigz-style chunked DEFLATE strategy that emits one valid stream while still keeping all cores busy.
+
+In benchmarks on a 1 GB mixed corpus (M5 Max), Knit is up to **~50× faster** than macOS's built-in `ditto` / Archive Utility for `.knit` output, and roughly **~10× faster** than `pigz` for standard ZIP — at equal or better compression ratios. The numbers reproduce with the included `Scripts/bench.sh` harness.
+
+Right-click integration is included: installing Knit adds three Finder Quick Actions — *Knit Compress (ZIP)*, *Knit Compress (.knit)*, and *Knit Extract* — that wrap the CLI for day-to-day use. Under the hood, the engine is built on **libdeflate** for single-threaded DEFLATE, **system zlib** for `Z_SYNC_FLUSH`-based chunk-parallel ZIP, **libzstd** for `.knit`, and a **Metal compute pipeline** that today accelerates CRC32, with a full GPU zstd block encoder on the roadmap.
+
+## Highlights
+
+- 🚀 **Apple Silicon native** — arm64-only binary, tuned for unified memory and high-bandwidth interconnect
+- 📦 **Two formats, one tool**
+  - **ZIP** — fully standard, ZIP64-capable, interoperable everywhere
+  - **`.knit`** — block-parallel zstd container, faster and smaller than DEFLATE at equivalent compression levels
+- ⚡ **Up to ~50× faster** than macOS Archive Utility, **~10× faster** than `pigz`
+- 🧵 **Single-file parallelism** via zlib `Z_SYNC_FLUSH` stitching — one logical DEFLATE stream, full multi-core utilization
+- 🖱 **Finder right-click integration** through macOS Quick Actions
+- 🎮 **Metal compute scaffolding** with working GPU CRC32; full GPU zstd encoder coming
+- 🔐 **Distribution-ready** — Developer ID code signing and Apple notarization wired into the packaging script
 
 ## Requirements
 
@@ -68,9 +88,10 @@ Reproduce with `./Scripts/bench.sh [size_mb=1024]`.
 
 | Use case | Recommended |
 |---|---|
-| Sharing with other Macs / Windows / Linux | **ZIP** (`knit zip --parallel`) |
-| Sharing among internal Apple Silicon Macs | **`.knit`** (`knit pack`) — faster and smaller than standard ZIP |
-| Personal backups | **`.knit`** is fine |
+| Sharing across platforms (Windows, Linux, older Macs) | **ZIP** (`knit zip --parallel`) |
+| Apple-Silicon-to-Apple-Silicon transfers | **`.knit`** (`knit pack`) — faster encode/decode and smaller output than DEFLATE |
+| Local backups, scratch archives, large dataset snapshots | **`.knit`** is the better default |
+| Anything that needs to round-trip through `unzip`, browsers, CI tooling, or other archiving software | **ZIP** |
 
 ## Architecture
 
@@ -100,25 +121,32 @@ Scripts/
   package-dmg.sh          DMG build + sign + notarize
 ```
 
-## Status
+## Roadmap & known limitations
 
-- [x] **M1** Project skeleton + vendored dependencies
-- [x] **M2** ZIP container (ZIP64) + libdeflate + zlib chunk-parallel DEFLATE
-- [x] **M3** Finder right-click integration via Quick Actions
-- [x] **M4** `.knit` format + Reader/Writer + CPU zstd block-parallel compression
-- [x] **M5 (foundation)** Metal device detection, MSL runtime compilation, GPU CRC32 kernel
-- [ ] **M5 (extended)** Full zstd block encoder in Metal — multi-week effort, deferred
-- [x] **M6** DMG packaging + sign + notarize scripts
+- **Full GPU compression is on the way, not in yet.** The Metal compute pipeline is wired end-to-end and currently accelerates CRC32; the bulk of compression still runs on the CPU. A block-parallel zstd encoder in MSL is the next major milestone — see the TODO comment in `Sources/KnitCore/Engine/MetalKernels/crc32_block.metal`.
+- **`.knit` is a custom container format.** It needs Knit (or a future port of the format) to decode. Tools like `unzip`, 7-Zip, the GNOME Archive Manager, etc. don't understand it. If you need broad interoperability, use ZIP.
+- **Apple Silicon only.** The CLI is built for arm64 Macs running macOS 15 or later. Intel Macs are not supported and there are no plans to support them.
+- **Not yet streaming on the writer side.** Both formats currently mmap their inputs; very-large directories are fine, but writers don't yet stream from arbitrary `Read` sources or stdin.
 
-## Limitations
+## Contributing
 
-- **Full GPU compression is not implemented in Phase 1**: compression currently runs on the CPU; the GPU only assists with CRC32. A `.knit` block-compression shader is planned for Phase 2 — see the TODO in `Sources/KnitCore/Engine/MetalKernels/crc32_block.metal`.
-- **`.knit` is internal-only**: only Macs with Knit installed can extract it. Not interoperable with Windows or Linux.
-- **The `knit` CLI is Apple Silicon native**: Intel Macs are not supported.
+Issues and pull requests are welcome. If you're reporting a benchmark regression or a roundtrip integrity bug, please include:
+
+- macOS version, chip (`sysctl -n machdep.cpu.brand_string`), and `swift --version`
+- The exact `knit` command line and a minimal reproducer corpus (or its `find -ls` listing if it's not redistributable)
+- Output of `knit info` and `knit metal-info`
+
+For format-level changes to `.knit`, please open an issue first to discuss — the magic bytes / header layout are versioned (`KnitFormat.archiveVersion`) and breaking changes will get a new version tag.
 
 ## License
 
-- Knit: internal use only (Boldright Inc.)
-- libdeflate: MIT
-- zstd: BSD / GPL dual
-- system zlib: zlib license
+Knit is released under the **MIT License** — see [LICENSE](LICENSE) for the full text.
+
+The project bundles or links against the following third-party components, each retained under its own license:
+
+| Component | License | Role |
+|---|---|---|
+| [libdeflate](https://github.com/ebiggers/libdeflate) | MIT | fastest single-threaded DEFLATE |
+| [zstd](https://github.com/facebook/zstd) | BSD-3-Clause / GPLv2 dual | core compressor for `.knit` |
+| system zlib (macOS) | zlib license | `Z_SYNC_FLUSH` chunk-parallel DEFLATE |
+| [swift-argument-parser](https://github.com/apple/swift-argument-parser) | Apache-2.0 | CLI parsing |
