@@ -12,15 +12,15 @@ Right-click integration is included: installing Knit adds three Finder Quick Act
 
 ## Highlights
 
-- 🚀 **Apple Silicon native** — arm64-only binary, tuned for unified memory and high-bandwidth interconnect
-- 📦 **Two formats, one tool**
+- **Apple Silicon native** — arm64-only binary, tuned for unified memory and high-bandwidth interconnect
+- **Two formats, one tool**
   - **ZIP** — fully standard, ZIP64-capable, interoperable everywhere
   - **`.knit`** — block-parallel zstd container, faster and smaller than DEFLATE at equivalent compression levels
-- ⚡ **Up to ~50× faster** than macOS Archive Utility, **~10× faster** than `pigz`
-- 🧵 **Single-file parallelism** via zlib `Z_SYNC_FLUSH` stitching — one logical DEFLATE stream, full multi-core utilization
-- 🖱 **Finder right-click integration** through macOS Quick Actions
-- 🎮 **Metal compute scaffolding** with working GPU CRC32; full GPU zstd encoder coming
-- 🔐 **Distribution-ready** — Developer ID code signing and Apple notarization wired into the packaging script
+- **Up to ~50× faster** than macOS Archive Utility, **~10× faster** than `pigz`
+- **Single-file parallelism** via zlib `Z_SYNC_FLUSH` stitching — one logical DEFLATE stream, full multi-core utilization
+- **Finder right-click integration** through macOS Quick Actions
+- **Metal compute scaffolding** with working GPU CRC32; full GPU zstd encoder coming
+- **Distribution-ready** — Developer ID code signing and Apple notarization wired into the packaging script
 
 ## Requirements
 
