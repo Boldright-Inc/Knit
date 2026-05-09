@@ -17,16 +17,8 @@ A high-speed compression tool for Apple Silicon. In addition to multi-threaded s
 # Release build
 swift build -c release
 
-# Tests
-swift test
-
 # Install Finder right-click menu items + /usr/local/bin/knit
 ./Scripts/install.sh        # asks for sudo password
-
-# Build a redistributable DMG (for internal distribution)
-DEVELOPER_ID="Developer ID Application: Boldright Inc. (TEAMID)" \
-NOTARY_PROFILE=knit-notary \
-./Scripts/package-dmg.sh
 ```
 
 After running `install.sh`, right-click any file or folder in Finder to find these entries under **Quick Actions**:
@@ -99,22 +91,6 @@ Scripts/
   install.sh              local install
   package-dmg.sh          DMG build + sign + notarize
 ```
-
-## Status
-
-- [x] **M1** Project skeleton + vendored dependencies
-- [x] **M2** ZIP container (ZIP64) + libdeflate + zlib chunk-parallel DEFLATE
-- [x] **M3** Finder right-click integration via Quick Actions
-- [x] **M4** `.knit` format + Reader/Writer + CPU zstd block-parallel compression
-- [x] **M5 (foundation)** Metal device detection, MSL runtime compilation, GPU CRC32 kernel
-- [ ] **M5 (extended)** Full zstd block encoder in Metal — multi-week effort, deferred
-- [x] **M6** DMG packaging + sign + notarize scripts
-
-## Limitations
-
-- **Full GPU compression is not implemented in Phase 1**: compression currently runs on the CPU; the GPU only assists with CRC32. A `.knit` block-compression shader is planned for Phase 2 — see the TODO in `Sources/KnitCore/Engine/MetalKernels/crc32_block.metal`.
-- **`.knit` is internal-only**: only Macs with Knit installed can extract it. Not interoperable with Windows or Linux.
-- **The `knit` CLI is Apple Silicon native**: Intel Macs are not supported.
 
 ## License
 
