@@ -99,6 +99,11 @@ public final class ZipCompressor: Sendable {
         let payload: Data
     }
 
+    private static func dataFromBuffer(_ buf: UnsafeBufferPointer<UInt8>) -> Data {
+        guard let base = buf.baseAddress, buf.count > 0 else { return Data() }
+        return Data(bytes: base, count: buf.count)
+    }
+
     private func prepare(entry: FileEntry) throws -> PreparedEntry {
         let descriptor = ZipWriter.EntryDescriptor(
             name: entry.relativePath,
@@ -129,7 +134,7 @@ public final class ZipCompressor: Sendable {
                 method: .stored,
                 crc: crcVal,
                 uncompressedSize: UInt64(buf.count),
-                payload: Data(bytes: buf.baseAddress!, count: buf.count)
+                payload: Self.dataFromBuffer(buf)
             )
         }
 
@@ -143,7 +148,7 @@ public final class ZipCompressor: Sendable {
                 method: .stored,
                 crc: crcVal,
                 uncompressedSize: UInt64(buf.count),
-                payload: Data(bytes: buf.baseAddress!, count: buf.count)
+                payload: Self.dataFromBuffer(buf)
             )
         }
 

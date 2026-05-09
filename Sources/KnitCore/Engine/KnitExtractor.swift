@@ -17,7 +17,7 @@ public final class KnitExtractor {
         let start = ContinuousClock.now
         var bytesOut: UInt64 = 0
         for entry in reader.archive.entries {
-            let outURL = destDir.appendingPathComponent(entry.name)
+            let outURL = try SafePath.resolve(name: entry.name, into: destDir)
             try reader.extract(entry, to: outURL)
             bytesOut += entry.uncompressedSize
         }

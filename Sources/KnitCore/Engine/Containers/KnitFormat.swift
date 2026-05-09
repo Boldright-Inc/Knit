@@ -43,4 +43,13 @@ public enum KnitFormat {
     public static let footerMarker: UInt32 = 0x4B4E_FFFF
     public static let archiveVersion: UInt32 = 1
     public static let defaultBlockSize: UInt32 = 1 * 1024 * 1024
+
+    /// Hard upper bound on `block_size` accepted by readers. Block sizes
+    /// arrive from the wire and must be capped to prevent OOM via crafted
+    /// headers. 256 MiB comfortably exceeds anything `knit pack` writes today.
+    public static let maxBlockSize: UInt32 = 256 * 1024 * 1024
+
+    /// Per-entry block count cap. With 256 MiB blocks, this allows entries up
+    /// to ~256 PiB while bounding `block_lengths[]` reservation.
+    public static let maxBlocksPerEntry: Int = 1 << 22  // 4 Mi blocks
 }
