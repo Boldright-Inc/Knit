@@ -69,13 +69,26 @@ fi
 echo ">> Installing CLI to ${BIN_DST} (sudo)"
 sudo install -m 0755 -o root -g wheel "${BIN_SRC}" "${BIN_DST}"
 
+LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+
 if [[ -d "${APP_SRC}" ]]; then
     echo ">> Installing Knit.app to ${APP_DST} (sudo)"
     sudo rm -rf "${APP_DST}"
     sudo cp -R "${APP_SRC}" "${APP_DST}"
-    # Register with Launch Services so the .knit UTI/icon picks up immediately.
-    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
-        -f "${APP_DST}" 2>/dev/null || true
+
+    # Verify the copy actually landed.
+    if [[ ! -d "${APP_DST}/Contents/MacOS" ]]; then
+        echo "error: Knit.app did not install correctly to ${APP_DST}" >&2
+        exit 1
+    fi
+
+    # Hard-reset Launch Services so any stale entry from a previous build is
+    # discarded, then re-register Knit.app. Without this step, macOS often
+    # sticks with a cached/inactive UTI registration and .knit files keep the
+    # generic "?" icon.
+    echo ">> Resetting Launch Services + re-registering Knit.app"
+    "${LSREG}" -kill -r -domain local -domain user >/dev/null 2>&1 || true
+    "${LSREG}" -f "${APP_DST}" >/dev/null 2>&1 || true
 fi
 
 echo ">> Installing Quick Actions to ${QA_DST}"
@@ -88,9 +101,11 @@ for wf in "${QA_SRC}"/*.workflow; do
     echo "   installed: ${name}"
 done
 
-# Refresh Services and icon caches.
+# Force Services menu, icon cache, and Finder to pick up the new registrations.
 /System/Library/CoreServices/pbs -update >/dev/null 2>&1 || true
-killall Finder 2>/dev/null || true
+sudo rm -rf /Library/Caches/com.apple.iconservices.store 2>/dev/null || true
+killall iconservicesagent iconservicesd 2>/dev/null || true
+killall Finder Dock 2>/dev/null || true
 
 echo
 echo "Done."

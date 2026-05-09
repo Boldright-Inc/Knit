@@ -85,64 +85,88 @@ func renderToPNG(at pixelSize: Int, drawer: (CGContext, CGFloat) -> Void) -> Dat
 // Document icon synthesis (when doc-icon.png isn't provided)
 // ---------------------------------------------------------------------------
 
+/// macOS-style document page: pure white, subtle drop shadow, small folded
+/// corner in the top-right. Modeled after Apple's stock .zip / .pages icons.
 func drawFoldedPage(in ctx: CGContext, size: CGFloat) -> CGRect {
-    let pad = size * 0.06
-    let pageRect = CGRect(x: pad, y: pad,
-                          width: size - pad * 2,
-                          height: size - pad * 2)
-    let foldSize = size * 0.30
+    // Slim portrait-ish rectangle — wider top/bottom padding than left/right
+    // so the page feels like a sheet of paper, not a square sticker.
+    let padX = size * 0.13
+    let padY = size * 0.06
+    let pageRect = CGRect(x: padX, y: padY,
+                          width: size - padX * 2,
+                          height: size - padY * 2)
+    let foldSize = size * 0.16    // refined fold — Apple uses ~15%
 
-    let path = CGMutablePath()
+    let pathFull = CGMutablePath()
     let pTL = CGPoint(x: pageRect.minX, y: pageRect.maxY)
     let pTRcut = CGPoint(x: pageRect.maxX - foldSize, y: pageRect.maxY)
     let pCorner = CGPoint(x: pageRect.maxX, y: pageRect.maxY - foldSize)
     let pBR = CGPoint(x: pageRect.maxX, y: pageRect.minY)
     let pBL = CGPoint(x: pageRect.minX, y: pageRect.minY)
-    path.move(to: pTL)
-    path.addLine(to: pTRcut)
-    path.addLine(to: pCorner)
-    path.addLine(to: pBR)
-    path.addLine(to: pBL)
-    path.closeSubpath()
+    pathFull.move(to: pTL)
+    pathFull.addLine(to: pTRcut)
+    pathFull.addLine(to: pCorner)
+    pathFull.addLine(to: pBR)
+    pathFull.addLine(to: pBL)
+    pathFull.closeSubpath()
 
-    // Page fill — soft white→light grey gradient
+    // Drop shadow under the page so it lifts off dark backgrounds in Finder.
     ctx.saveGState()
-    ctx.addPath(path)
+    ctx.setShadow(offset: CGSize(width: 0, height: -size * 0.012),
+                  blur: size * 0.025,
+                  color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.25))
+    ctx.setFillColor(CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0))
+    ctx.addPath(pathFull)
+    ctx.fillPath()
+    ctx.restoreGState()
+
+    // Re-paint the page surface with a barely-there top-light gradient so it
+    // doesn't look completely flat at large sizes.
+    ctx.saveGState()
+    ctx.addPath(pathFull)
     ctx.clip()
     let space = CGColorSpaceCreateDeviceRGB()
-    let bg = [
-        CGColor(red: 0.99, green: 0.99, blue: 1.00, alpha: 1.0),
-        CGColor(red: 0.90, green: 0.92, blue: 0.96, alpha: 1.0),
+    let surface = [
+        CGColor(red: 1.00, green: 1.00, blue: 1.00, alpha: 1.0),  // top
+        CGColor(red: 0.96, green: 0.97, blue: 0.99, alpha: 1.0),  // bottom
     ] as CFArray
-    if let grad = CGGradient(colorsSpace: space, colors: bg, locations: [0, 1]) {
+    if let grad = CGGradient(colorsSpace: space, colors: surface, locations: [0, 1]) {
         ctx.drawLinearGradient(grad,
-                               start: CGPoint(x: 0, y: size),
-                               end: CGPoint(x: 0, y: 0),
+                               start: CGPoint(x: 0, y: pageRect.maxY),
+                               end: CGPoint(x: 0, y: pageRect.minY),
                                options: [])
     }
     ctx.restoreGState()
 
-    // Outline
+    // Page outline (very subtle).
     ctx.saveGState()
-    ctx.setLineWidth(max(1.0, size * 0.005))
-    ctx.setStrokeColor(CGColor(red: 0.55, green: 0.60, blue: 0.70, alpha: 1.0))
-    ctx.addPath(path)
+    ctx.setLineWidth(max(1.0, size * 0.0035))
+    ctx.setStrokeColor(CGColor(red: 0.78, green: 0.81, blue: 0.86, alpha: 1.0))
+    ctx.addPath(pathFull)
     ctx.strokePath()
     ctx.restoreGState()
 
-    // Folded corner triangle
+    // Folded corner triangle with its own slight shadow + matte fill.
     let foldPath = CGMutablePath()
     foldPath.move(to: pTRcut)
     foldPath.addLine(to: CGPoint(x: pageRect.maxX, y: pageRect.maxY))
     foldPath.addLine(to: pCorner)
     foldPath.closeSubpath()
+
     ctx.saveGState()
+    ctx.setShadow(offset: CGSize(width: -size * 0.004, height: -size * 0.004),
+                  blur: size * 0.008,
+                  color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.18))
+    ctx.setFillColor(CGColor(red: 0.90, green: 0.92, blue: 0.95, alpha: 1.0))
     ctx.addPath(foldPath)
-    ctx.setFillColor(CGColor(red: 0.78, green: 0.82, blue: 0.90, alpha: 1.0))
     ctx.fillPath()
-    ctx.addPath(foldPath)
-    ctx.setLineWidth(max(1.0, size * 0.005))
-    ctx.setStrokeColor(CGColor(red: 0.55, green: 0.60, blue: 0.70, alpha: 1.0))
+    ctx.restoreGState()
+    // Re-stroke the diagonal edge for crispness
+    ctx.saveGState()
+    ctx.setLineWidth(max(1.0, size * 0.0035))
+    ctx.setStrokeColor(CGColor(red: 0.78, green: 0.81, blue: 0.86, alpha: 1.0))
+    ctx.move(to: pTRcut)
+    ctx.addLine(to: pCorner)
     ctx.strokePath()
     ctx.restoreGState()
 
@@ -151,29 +175,39 @@ func drawFoldedPage(in ctx: CGContext, size: CGFloat) -> CGRect {
 
 func drawDerivedDocIcon(appImage: CGImage, in ctx: CGContext, size: CGFloat) {
     let pageRect = drawFoldedPage(in: ctx, size: size)
-    // Inset the app icon onto the page, centered, ~62% of page width.
-    let logoSide = pageRect.width * 0.62
+
+    // Knit logo, centered in the upper portion of the page so the wordmark
+    // has room below — proportions match Apple's .zip icon where the central
+    // graphic dominates the page.
+    let logoSide = pageRect.width * 0.78
     let logoRect = CGRect(
         x: pageRect.midX - logoSide / 2,
-        y: pageRect.midY - logoSide / 2 + size * 0.04, // nudged up so KNIT label fits below
+        y: pageRect.minY + pageRect.height * 0.22,
         width: logoSide,
         height: logoSide
     )
-    ctx.draw(appImage, in: logoRect)
 
-    // "KNIT" wordmark below the inset image.
+    // Soft drop shadow under the logo for depth.
+    ctx.saveGState()
+    ctx.setShadow(offset: CGSize(width: 0, height: -size * 0.006),
+                  blur: size * 0.015,
+                  color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.18))
+    ctx.draw(appImage, in: logoRect)
+    ctx.restoreGState()
+
+    // "KNIT" wordmark — clean dark gray, modest tracking, low on the page.
     let label = "KNIT"
-    let fontSize = size * 0.10
-    let font = NSFont.systemFont(ofSize: fontSize, weight: .bold)
+    let fontSize = size * 0.095
+    let font = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
     let attrs: [NSAttributedString.Key: Any] = [
         .font: font,
-        .foregroundColor: NSColor(calibratedRed: 0.30, green: 0.36, blue: 0.48, alpha: 1.0),
-        .kern: fontSize * 0.10,
+        .foregroundColor: NSColor(calibratedRed: 0.27, green: 0.31, blue: 0.40, alpha: 1.0),
+        .kern: fontSize * 0.18,
     ]
     let attr = NSAttributedString(string: label, attributes: attrs)
     let strSize = attr.size()
     let labelX = (size - strSize.width) / 2
-    let labelY = pageRect.minY + size * 0.05
+    let labelY = pageRect.minY + pageRect.height * 0.08
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
     attr.draw(at: CGPoint(x: labelX, y: labelY))

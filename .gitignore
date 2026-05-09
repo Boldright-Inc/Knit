@@ -9,10 +9,12 @@ build/
 xcuserdata/
 *.xcuserstate
 
-# Vendor sources (fetched by script)
-Vendor/libdeflate/src/
-Vendor/libdeflate/include/
-Vendor/zstd/src/
+# Vendor working directory (Scripts/fetch-vendor.sh clones here, not for commit)
+Vendor/.work/
+
+# Vendor sources (fetched by script — duplicated in Sources/C*/, kept transient)
+Vendor/libdeflate/
+Vendor/zstd/
 
 # Benchmark artifacts
 Tests/Benchmarks/data/
@@ -21,8 +23,15 @@ Tests/Benchmarks/results/
 # Build / dist
 dist/
 *.dmg
+
+# Sample / scratch archives — never commit produced compressed files
 *.zip
-*.bzx
+*.knit
+!Tests/**/*.zip
+!Tests/**/*.knit
+
+# OS metadata
+.DS_Store
 
 # Local env
 .env
