@@ -38,12 +38,19 @@ public enum FileWalker {
         results.append(try makeEntry(absolute: root, relative: rootName + "/", isDirectoryOverride: true))
 
         for case let rawURL as URL in it {
-            let url = rawURL.resolvingSymlinksInPath()
-            // url.path begins with root.path + "/" — strip that prefix.
-            guard url.path.count > baseLen + 1 else { continue }
-            let suffix = String(url.path.dropFirst(baseLen + 1))
+            // Skip symbolic links: resolving them would (a) potentially read
+            // attacker-placed files outside the input tree (e.g. /etc/passwd)
+            // and (b) corrupt the relative-path computation below if the link
+            // target lives outside `root`.
+            let resourceValues = try? rawURL.resourceValues(forKeys: [.isSymbolicLinkKey])
+            if resourceValues?.isSymbolicLink == true { continue }
+
+            // Relative path is computed from rawURL (pre-link-resolution) so a
+            // hidden symlink inside the tree can't escape the prefix.
+            guard rawURL.path.count > baseLen + 1 else { continue }
+            let suffix = String(rawURL.path.dropFirst(baseLen + 1))
             let rel = rootName + "/" + suffix
-            let entry = try makeEntry(absolute: url, relative: rel)
+            let entry = try makeEntry(absolute: rawURL, relative: rel)
             results.append(entry)
         }
         return results

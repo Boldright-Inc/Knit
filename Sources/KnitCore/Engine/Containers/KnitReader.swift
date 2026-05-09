@@ -56,16 +56,32 @@ public final class KnitReader {
             let modUnix = try cursor.readUInt64()
             let isDir = try cursor.readUInt8() != 0
             let blockSize = try cursor.readUInt32()
+            guard blockSize == 0 || (blockSize > 0 && blockSize <= KnitFormat.maxBlockSize) else {
+                throw KnitError.formatError(
+                    ".knit: block_size out of range (\(blockSize), max \(KnitFormat.maxBlockSize))"
+                )
+            }
             let uncompressed = try cursor.readUInt64()
             let compressed = try cursor.readUInt64()
             let crc = try cursor.readUInt32()
             let numBlocks = try cursor.readUInt32()
+            // numBlocks is bounded both by the per-archive block_lengths array
+            // (4 bytes each) and the cursor's `ensure` check below; cap it here
+            // so we don't reserve gigabytes for a hostile UInt32.
+            guard numBlocks <= UInt32(KnitFormat.maxBlocksPerEntry) else {
+                throw KnitError.formatError(".knit: num_blocks too large (\(numBlocks))")
+            }
             var blockLens: [UInt32] = []
             blockLens.reserveCapacity(Int(numBlocks))
             for _ in 0..<numBlocks {
                 blockLens.append(try cursor.readUInt32())
             }
             let dataOff = UInt64(cursor.offset)
+            // `compressed` is wire-supplied UInt64. Reject anything that can't
+            // fit in Int to avoid `Int(_:)` trapping on hostile input.
+            guard compressed <= UInt64(Int.max) else {
+                throw KnitError.formatError(".knit: compressed size out of range")
+            }
             try cursor.skip(Int(compressed))
 
             entries.append(KnitEntry(
@@ -110,6 +126,7 @@ public final class KnitReader {
         var srcOffset = Int(entry.dataOffset)
         var totalDecompressed: UInt64 = 0
 
+        let blockCap = max(Int(entry.blockSize), 1)
         for blockLen in entry.blockLengths {
             let inLen = Int(blockLen)
             let inPtr = mapped.pointer.advanced(by: srcOffset)
@@ -119,12 +136,19 @@ public final class KnitReader {
             if frameSize == ZSTD_CONTENTSIZE_ERROR {
                 throw KnitError.codecFailure("zstd: frame content size error")
             }
-            // Allocate output buffer; bzx writers always emit known-size frames.
+            // Allocate output buffer. Cap to block_size so a hostile frame
+            // header can't trigger a multi-GB allocation (DoS).
             let outCapacity: Int
             if frameSize == ZSTD_CONTENTSIZE_UNKNOWN {
-                outCapacity = max(Int(entry.blockSize), 1)
+                outCapacity = blockCap
             } else {
-                outCapacity = Int(frameSize)
+                let declared = Int(clamping: frameSize)
+                guard declared <= blockCap else {
+                    throw KnitError.formatError(
+                        ".knit: block frame too large (\(declared) > \(blockCap))"
+                    )
+                }
+                outCapacity = declared
             }
             var outBuf = Data(count: outCapacity)
             let produced: Int = outBuf.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) -> Int in
@@ -137,9 +161,18 @@ public final class KnitReader {
                 throw KnitError.codecFailure("zstd decode: \(msg)")
             }
             outBuf.removeSubrange(produced..<outBuf.count)
-            try outHandle.write(contentsOf: outBuf)
 
+            // Defense in depth: if a malformed entry claims a small
+            // `uncompressedSize` but the frames decompress to more, abort
+            // before we keep writing to disk.
             totalDecompressed += UInt64(produced)
+            if totalDecompressed > entry.uncompressedSize {
+                throw KnitError.integrity(
+                    "size overrun in \(entry.name): exceeded declared \(entry.uncompressedSize) bytes"
+                )
+            }
+
+            try outHandle.write(contentsOf: outBuf)
             srcOffset += inLen
         }
 

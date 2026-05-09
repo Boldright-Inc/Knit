@@ -1,0 +1,74 @@
+import XCTest
+import Foundation
+@testable import KnitCore
+
+/// Verifies the GPU CRC32 path matches CPU output and that the bytesNoCopy
+/// optimization correctly falls back when alignment isn't satisfied.
+final class MetalCRC32Tests: XCTestCase {
+
+    private func makeBuffer(size: Int, seed: UInt8 = 0) -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: size)
+        for i in 0..<size {
+            bytes[i] = UInt8((i &+ Int(seed)) & 0xFF)
+        }
+        return bytes
+    }
+
+    /// CRC32 must match libdeflate's CPU implementation across a range of
+    /// sizes, including ones not divisible by the slice size.
+    func testGPUMatchesCPUAcrossSizes() throws {
+        guard let gpu = MetalCRC32(sliceSize: 1 * 1024 * 1024) else {
+            throw XCTSkip("No Metal device on this host")
+        }
+        let cpu = CPUDeflate()
+
+        // Mix of aligned and unaligned sizes.
+        let sizes = [
+            1,
+            1023,
+            1024,
+            1024 * 1024,
+            1024 * 1024 + 7,
+            5 * 1024 * 1024 + 13,
+            16 * 1024 * 1024,
+        ]
+        for size in sizes {
+            let bytes = makeBuffer(size: size, seed: UInt8(size & 0xFF))
+            let cpuVal = bytes.withUnsafeBufferPointer { cpu.crc32($0, seed: 0) }
+            let gpuVal = try bytes.withUnsafeBufferPointer { try gpu.crc32($0) }
+            XCTAssertEqual(cpuVal, gpuVal, "CRC mismatch at size=\(size)")
+        }
+    }
+
+    /// `bytesNoCopy:` requires page alignment. When a non-aligned pointer is
+    /// passed (the common case for `[UInt8]` storage), the implementation
+    /// must transparently fall back to the copying path and still produce
+    /// the correct CRC.
+    func testUnalignedFallback() throws {
+        guard let gpu = MetalCRC32(sliceSize: 64 * 1024) else {
+            throw XCTSkip("No Metal device on this host")
+        }
+        let cpu = CPUDeflate()
+
+        // Allocate an oversized buffer and offset by 1 to force misalignment.
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: 256 * 1024 + 16,
+                                                   alignment: 16)
+        defer { raw.deallocate() }
+        let p = raw.advanced(by: 1).assumingMemoryBound(to: UInt8.self)
+        for i in 0..<(256 * 1024) { p[i] = UInt8((i * 31 + 7) & 0xFF) }
+
+        let buf = UnsafeBufferPointer(start: p, count: 256 * 1024)
+        let cpuVal = cpu.crc32(buf, seed: 0)
+        let gpuVal = try gpu.crc32(buf)
+        XCTAssertEqual(cpuVal, gpuVal)
+    }
+
+    func testZeroLength() throws {
+        guard let gpu = MetalCRC32() else {
+            throw XCTSkip("No Metal device on this host")
+        }
+        let empty = [UInt8]()
+        let result = try empty.withUnsafeBufferPointer { try gpu.crc32($0) }
+        XCTAssertEqual(result, 0)
+    }
+}
