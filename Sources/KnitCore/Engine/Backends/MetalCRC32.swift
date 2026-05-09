@@ -25,16 +25,41 @@ public final class MetalCRC32: @unchecked Sendable {
     public func crc32(_ buffer: UnsafeBufferPointer<UInt8>) throws -> UInt32 {
         let total = buffer.count
         if total == 0 { return 0 }
+        guard let basePtr = buffer.baseAddress else { return 0 }
 
         let numSlices = (total + sliceSize - 1) / sliceSize
 
-        // Input: zero-copy buffer if length and alignment are friendly.
-        guard let inBuf = context.device.makeBuffer(
-            bytes: buffer.baseAddress!,
-            length: total,
-            options: .storageModeShared
-        ) else {
-            throw KnitError.allocationFailure("Metal input buffer")
+        // On Apple Silicon (unified memory), alias the caller's buffer directly
+        // into a Metal buffer to skip a host->device memcpy. Metal's
+        // `bytesNoCopy:` form requires a page-aligned address and length;
+        // otherwise we fall back to the copying `bytes:` path.
+        let pageSize = UInt(getpagesize())
+        let pageMask = pageSize &- 1
+        let rawBase = UnsafeRawPointer(basePtr)
+        let addrAligned = (UInt(bitPattern: rawBase) & pageMask) == 0
+        let lengthAligned = (UInt(total) & pageMask) == 0
+
+        let inBuf: MTLBuffer
+        if addrAligned && lengthAligned {
+            let mutablePtr = UnsafeMutableRawPointer(mutating: rawBase)
+            guard let b = context.device.makeBuffer(
+                bytesNoCopy: mutablePtr,
+                length: total,
+                options: .storageModeShared,
+                deallocator: nil  // caller owns the underlying memory
+            ) else {
+                throw KnitError.allocationFailure("Metal input buffer (bytesNoCopy)")
+            }
+            inBuf = b
+        } else {
+            guard let b = context.device.makeBuffer(
+                bytes: basePtr,
+                length: total,
+                options: .storageModeShared
+            ) else {
+                throw KnitError.allocationFailure("Metal input buffer")
+            }
+            inBuf = b
         }
         guard let outBuf = context.device.makeBuffer(
             length: numSlices * MemoryLayout<UInt32>.stride,
