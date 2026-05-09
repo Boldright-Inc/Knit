@@ -1,0 +1,29 @@
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+build/
+*.xcodeproj/
+!project.yml
+*.xcworkspace/
+xcuserdata/
+*.xcuserstate
+
+# Vendor sources (fetched by script)
+Vendor/libdeflate/src/
+Vendor/libdeflate/include/
+Vendor/zstd/src/
+
+# Benchmark artifacts
+Tests/Benchmarks/data/
+Tests/Benchmarks/results/
+
+# Build / dist
+dist/
+*.dmg
+*.zip
+*.bzx
+
+# Local env
+.env
+.env.local
