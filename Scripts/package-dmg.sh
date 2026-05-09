@@ -30,10 +30,14 @@ BIN="${ROOT_DIR}/.build/release/knit"
 # 2. Build Quick Actions
 "${SCRIPT_DIR}/build-quick-actions.sh" >/dev/null
 
-# 3. Stage files
+# 3. Build Knit.app (icons + UTI registration bundle)
+"${SCRIPT_DIR}/build-app.sh" >/dev/null
+
+# 4. Stage files
 rm -rf "${STAGING}"
 mkdir -p "${STAGING}/bin" "${STAGING}/QuickActions"
 cp "${BIN}" "${STAGING}/bin/knit"
+cp -R "${DIST}/Knit.app" "${STAGING}/Knit.app"
 cp -R "${DIST}/QuickActions/"*.workflow "${STAGING}/QuickActions/"
 cp "${SCRIPT_DIR}/install.sh"   "${STAGING}/install.sh"
 cp "${SCRIPT_DIR}/uninstall.sh" "${STAGING}/uninstall.sh"
@@ -46,25 +50,31 @@ To install:
     open Terminal.app, cd to this volume, then run:
         ./install.sh
 
-This places /usr/local/bin/knit and three Quick Actions in your
-Services menu (right-click in Finder).
+This installs:
+    /Applications/Knit.app          (registers .knit icon + UTI)
+    /usr/local/bin/knit             (CLI)
+    ~/Library/Services/Knit *.workflow (Finder right-click items)
 
 Right-click any file or folder in Finder -> Quick Actions:
     Knit Compress (ZIP)    standard .zip output
-    Knit Compress (.knit)   high-speed internal format
+    Knit Compress (.knit)  high-speed format
     Knit Extract           handles both formats
 
 To uninstall:
     ./uninstall.sh
 EOF
 
-# 4. Sign binary if credentials provided
+# 5. Sign binary + app if credentials provided
 if [[ -n "${DEVELOPER_ID}" ]]; then
     echo ">> codesign with: ${DEVELOPER_ID}"
     codesign --force --options runtime --timestamp \
         --sign "${DEVELOPER_ID}" \
         "${STAGING}/bin/knit"
     codesign --verify --strict --verbose=2 "${STAGING}/bin/knit"
+    codesign --force --options runtime --timestamp --deep \
+        --sign "${DEVELOPER_ID}" \
+        "${STAGING}/Knit.app"
+    codesign --verify --strict --verbose=2 "${STAGING}/Knit.app"
 fi
 
 # 5. Build DMG
