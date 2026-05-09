@@ -32,3 +32,4 @@ Tests/Benchmarks/results/
 # Local env
 .env
 .env.local
+/dist
