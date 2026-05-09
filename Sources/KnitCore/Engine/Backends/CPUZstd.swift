@@ -63,6 +63,18 @@ public struct ParallelBlockCompressor {
     }
 
     public func compress(_ input: UnsafeBufferPointer<UInt8>, level: Int32) throws -> Output {
+        try compress(input, level: level, perBlockLevels: nil)
+    }
+
+    /// Compress with optional per-block compression-level overrides.
+    ///
+    /// When `perBlockLevels` is supplied (one entry per block), each block is
+    /// compressed at its own level — typically used to downgrade
+    /// already-incompressible blocks to lvl=1 since lvl≥3's match search is
+    /// pure overhead on high-entropy data.
+    public func compress(_ input: UnsafeBufferPointer<UInt8>,
+                         level: Int32,
+                         perBlockLevels: [Int32]?) throws -> Output {
         if input.count == 0 {
             return Output(combined: Data(), blockSizes: [], totalIn: 0, totalOut: 0)
         }
@@ -75,12 +87,27 @@ public struct ParallelBlockCompressor {
             off += len
         }
 
+        if let pbl = perBlockLevels, pbl.count != slices.count {
+            throw KnitError.codecFailure(
+                "perBlockLevels count (\(pbl.count)) != slice count (\(slices.count))"
+            )
+        }
+
         let basePtr = SendableRawPointer(input.baseAddress!)
         let backend = self.backend
+        let pbl = perBlockLevels
 
-        let frames: [Data] = try concurrentMap(slices, concurrency: concurrency) { slice in
+        let frames: [Data] = try concurrentMap(
+            Array(slices.enumerated()),
+            concurrency: concurrency
+        ) { item in
+            let (idx, slice) = item
             let p = basePtr.value.advanced(by: slice.0)
-            return try backend.compressBlock(UnsafeBufferPointer(start: p, count: slice.1), level: level)
+            let lvl = pbl?[idx] ?? level
+            return try backend.compressBlock(
+                UnsafeBufferPointer(start: p, count: slice.1),
+                level: lvl
+            )
         }
 
         var combined = Data()
