@@ -75,10 +75,11 @@ let package = Package(
             ],
             path: "Sources/KnitCLI"
         ),
-        .testTarget(
-            name: "KnitCoreTests",
-            dependencies: ["KnitCore"],
-            path: "Tests/KnitCoreTests"
-        ),
+        // Note: tests are intentionally not declared as a SwiftPM target.
+        // The Tests/ directory may or may not be present in distribution
+        // clones, and SwiftPM caches package evaluation in a way that makes
+        // dynamic test-target inclusion unreliable. To run tests during
+        // development, see Package.dev.swift (loaded via the helper script
+        // Scripts/run-tests.sh).
     ]
 )
