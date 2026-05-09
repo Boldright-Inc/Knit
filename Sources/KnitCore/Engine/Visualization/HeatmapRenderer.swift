@@ -76,7 +76,7 @@ public struct HeatmapRenderer {
         var colours = [(UInt8, UInt8, UInt8)](repeating: (0,0,0), count: cols * rows)
         for (i, sample) in heatmap.samples.enumerated() {
             let (r, g, b) = colourRamp(entropy: sample.entropy,
-                                       brightness: 1.0 - 0.55 * (1.0 - sample.ratio))
+                                       brightness: 1.0 - 0.55 * (1.0 - Double(sample.ratio)))
             colours[i] = (r, g, b)
         }
 
