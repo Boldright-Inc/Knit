@@ -37,16 +37,8 @@ Right-click integration is included: installing Knit adds three Finder Quick Act
 # Release build
 swift build -c release
 
-# Tests
-swift test
-
 # Install Finder right-click menu items + /usr/local/bin/knit
 ./Scripts/install.sh        # asks for sudo password
-
-# Build a redistributable DMG (for internal distribution)
-DEVELOPER_ID="Developer ID Application: Boldright Inc. (TEAMID)" \
-NOTARY_PROFILE=knit-notary \
-./Scripts/package-dmg.sh
 ```
 
 After running `install.sh`, right-click any file or folder in Finder to find these entries under **Quick Actions**:
