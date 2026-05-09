@@ -1,5 +1,6 @@
 import Foundation
 import CZstd
+import CDeflate
 
 public struct KnitArchive {
     public let entries: [KnitEntry]
@@ -109,8 +110,17 @@ public final class KnitReader {
         self.archive = KnitArchive(entries: entries)
     }
 
-    /// Decompress an entry into an output URL on disk.
-    public func extract(_ entry: KnitEntry, to outURL: URL) throws {
+    /// Decompress an entry into an output URL on disk and verify its CRC32
+    /// against the value recorded in the archive header.
+    ///
+    /// The verifier accepts an optional `MetalCRC32` instance: when supplied
+    /// and the entry is large enough to amortize a Metal dispatch, the
+    /// post-write verification re-reads the freshly-written file via
+    /// `MappedFile` (page-cache hot, effectively free) and runs the CRC on
+    /// the GPU. Smaller entries fall through to libdeflate's CPU CRC32.
+    public func extract(_ entry: KnitEntry,
+                        to outURL: URL,
+                        gpuCRC: MetalCRC32? = nil) throws {
         if entry.isDirectory {
             try FileManager.default.createDirectory(at: outURL,
                                                     withIntermediateDirectories: true)
@@ -179,6 +189,48 @@ public final class KnitReader {
         if totalDecompressed != entry.uncompressedSize {
             throw KnitError.integrity(
                 "size mismatch for \(entry.name): expected \(entry.uncompressedSize), got \(totalDecompressed)"
+            )
+        }
+
+        // Flush kernel buffers so the verification mmap sees the bytes we
+        // just wrote (page cache will satisfy the read without hitting NAND).
+        try outHandle.synchronize()
+
+        try verifyCRC(entry: entry, outURL: outURL, gpuCRC: gpuCRC)
+    }
+
+    /// Recompute the CRC32 of the just-written file and compare against
+    /// the value baked into the archive header. Routes large entries to the
+    /// optional GPU implementation.
+    private func verifyCRC(entry: KnitEntry,
+                           outURL: URL,
+                           gpuCRC: MetalCRC32?) throws {
+        guard entry.uncompressedSize > 0 else {
+            // Empty file: by .knit convention the stored CRC is 0.
+            if entry.crc32 != 0 {
+                throw KnitError.integrity(
+                    "CRC mismatch for \(entry.name): expected 0x\(String(entry.crc32, radix: 16)), file is empty"
+                )
+            }
+            return
+        }
+
+        let outMap = try MappedFile(url: outURL)
+        let buf = outMap.buffer
+
+        // Threshold mirrors MetalCRC32's documented amortization point —
+        // dispatch overhead dominates for small buffers.
+        let gpuMin = 4 * 1024 * 1024
+        let computed: UInt32
+        if let gpu = gpuCRC, buf.count >= gpuMin {
+            computed = try gpu.crc32(buf)
+        } else {
+            computed = UInt32(libdeflate_crc32(0, buf.baseAddress, buf.count))
+        }
+
+        if computed != entry.crc32 {
+            throw KnitError.integrity(
+                "CRC mismatch for \(entry.name): expected 0x\(String(entry.crc32, radix: 16)), got 0x\(String(computed, radix: 16))"
             )
         }
     }

@@ -51,14 +51,30 @@ extension KnitCommand {
         @Option(help: "Chunk size in KB for --parallel backend.")
         var chunkKb: Int = 1024
 
+        @Flag(name: .long,
+              help: "Render a GPU-accelerated compressibility heatmap after the run.")
+        var heatmap: Bool = false
+
+        @Option(name: .long,
+                help: "Also save the heatmap as a PPM image (open with Preview.app).")
+        var heatmapImage: String?
+
+        @Flag(name: .long,
+              help: "Disable the entropy pre-screening pass (debugging).")
+        var noEntropyProbe: Bool = false
+
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
             let outputURL = URL(fileURLWithPath: output ?? "\(input).zip").standardizedFileURL
 
             let cores = jobs ?? ProcessInfo.processInfo.activeProcessorCount
+            let recorder: HeatmapRecorder? = (heatmap || heatmapImage != nil)
+                ? HeatmapRecorder() : nil
             let opts = ZipCompressor.Options(
                 level: CompressionLevel(level),
-                concurrency: cores
+                concurrency: cores,
+                heatmapRecorder: recorder,
+                entropyProbeEnabled: !noEntropyProbe
             )
             let backend: DeflateBackend & CRC32Computing = parallel
                 ? ParallelDeflate(chunkSize: chunkKb * 1024, concurrency: cores)
@@ -73,6 +89,11 @@ extension KnitCommand {
             print(String(format: "  ratio: %10.2f%%", stats.ratio * 100))
             print(String(format: "  time:  %10.3f s", stats.elapsed))
             print(String(format: "  speed: %10.2f MB/s", stats.inputThroughputMBPerSec))
+
+            try emitHeatmap(recorder: recorder,
+                            archiveURL: outputURL,
+                            elapsed: stats.elapsed,
+                            sizeMB: mb)
         }
     }
 
@@ -97,15 +118,31 @@ extension KnitCommand {
         @Option(help: "Block size in KB (each block is one zstd frame).")
         var blockKb: Int = 1024
 
+        @Flag(name: .long,
+              help: "Render a GPU-accelerated compressibility heatmap after the run.")
+        var heatmap: Bool = false
+
+        @Option(name: .long,
+                help: "Also save the heatmap as a PPM image (open with Preview.app).")
+        var heatmapImage: String?
+
+        @Flag(name: .long,
+              help: "Disable the entropy pre-screening pass (debugging).")
+        var noEntropyProbe: Bool = false
+
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
             let outputURL = URL(fileURLWithPath: output ?? "\(input).knit").standardizedFileURL
             let cores = jobs ?? ProcessInfo.processInfo.activeProcessorCount
 
+            let recorder: HeatmapRecorder? = (heatmap || heatmapImage != nil)
+                ? HeatmapRecorder() : nil
             let opts = KnitCompressor.Options(
                 level: CompressionLevel(level),
                 concurrency: cores,
-                blockSize: blockKb * 1024
+                blockSize: blockKb * 1024,
+                heatmapRecorder: recorder,
+                entropyProbeEnabled: !noEntropyProbe
             )
             let compressor = KnitCompressor(backend: CPUZstd(), options: opts)
             let stats = try compressor.compress(input: inputURL, to: outputURL)
@@ -117,6 +154,11 @@ extension KnitCommand {
             print(String(format: "  ratio: %10.2f%%", stats.ratio * 100))
             print(String(format: "  time:  %10.3f s", stats.elapsed))
             print(String(format: "  speed: %10.2f MB/s", stats.inputThroughputMBPerSec))
+
+            try emitHeatmap(recorder: recorder,
+                            archiveURL: outputURL,
+                            elapsed: stats.elapsed,
+                            sizeMB: mb)
         }
     }
 
@@ -190,13 +232,85 @@ extension KnitCommand {
         @Option(name: .shortAndLong, help: "Output directory. Defaults to current directory.")
         var output: String = "."
 
+        @Flag(name: .long,
+              help: "Disable GPU-accelerated CRC32 verification (forces CPU verify).")
+        var noGpuVerify: Bool = false
+
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
             let outURL = URL(fileURLWithPath: output).standardizedFileURL
-            let stats = try KnitExtractor().extract(archive: inputURL, to: outURL)
+            let extractor = KnitExtractor(useGPUVerify: !noGpuVerify)
+            let stats = try extractor.extract(archive: inputURL, to: outURL)
             print(String(format: "  entries: %d", stats.entries))
             print(String(format: "  out:   %10.2f MB", Double(stats.bytesOut) / 1_000_000))
             print(String(format: "  time:  %10.3f s", stats.elapsed))
+            let verifier = stats.gpuVerifyUsed ? "GPU (Metal)" : "CPU (libdeflate)"
+            print("  verify: \(verifier)")
+        }
+    }
+}
+
+// MARK: - Heatmap output helper
+
+extension KnitCommand {
+    /// Render the captured heatmap to stdout (and optionally a PPM file).
+    /// Shared between the `zip` and `pack` subcommands.
+    fileprivate static func emitHeatmap(recorder: HeatmapRecorder?,
+                                        archiveURL: URL,
+                                        elapsed: TimeInterval,
+                                        sizeMB: Double) throws {
+        guard let recorder = recorder, recorder.count > 0 else { return }
+        let snapshot = recorder.snapshot()
+
+        var rendererOpts = HeatmapRenderer.Options()
+        rendererOpts.elapsedSeconds = elapsed
+        rendererOpts.headerLines = [
+            archiveURL.lastPathComponent,
+            String(format: "%.2f MB  •  %d block samples", sizeMB, snapshot.samples.count),
+        ]
+        if let ctx = MetalContext() {
+            let unified = ctx.device.hasUnifiedMemory ? "unified" : "discrete"
+            rendererOpts.gpuDeviceLabel = "\(ctx.device.name)  (\(unified) memory)"
+        }
+
+        let renderer = HeatmapRenderer(heatmap: snapshot, options: rendererOpts)
+        FileHandle.standardOutput.write(Data("\n".utf8))
+        FileHandle.standardOutput.write(Data(renderer.renderANSI().utf8))
+    }
+}
+
+extension KnitCommand.Zip {
+    fileprivate func emitHeatmap(recorder: HeatmapRecorder?,
+                                 archiveURL: URL,
+                                 elapsed: TimeInterval,
+                                 sizeMB: Double) throws {
+        try KnitCommand.emitHeatmap(recorder: recorder,
+                                    archiveURL: archiveURL,
+                                    elapsed: elapsed,
+                                    sizeMB: sizeMB)
+        if let path = heatmapImage, let recorder = recorder, recorder.count > 0 {
+            let url = URL(fileURLWithPath: path).standardizedFileURL
+            let renderer = HeatmapRenderer(heatmap: recorder.snapshot())
+            try renderer.writePPM(to: url)
+            print("  heatmap image saved: \(url.path)")
+        }
+    }
+}
+
+extension KnitCommand.Pack {
+    fileprivate func emitHeatmap(recorder: HeatmapRecorder?,
+                                 archiveURL: URL,
+                                 elapsed: TimeInterval,
+                                 sizeMB: Double) throws {
+        try KnitCommand.emitHeatmap(recorder: recorder,
+                                    archiveURL: archiveURL,
+                                    elapsed: elapsed,
+                                    sizeMB: sizeMB)
+        if let path = heatmapImage, let recorder = recorder, recorder.count > 0 {
+            let url = URL(fileURLWithPath: path).standardizedFileURL
+            let renderer = HeatmapRenderer(heatmap: recorder.snapshot())
+            try renderer.writePPM(to: url)
+            print("  heatmap image saved: \(url.path)")
         }
     }
 }
