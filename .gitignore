@@ -20,10 +20,6 @@ Vendor/zstd/
 Tests/Benchmarks/data/
 Tests/Benchmarks/results/
 
-# Build / dist
-dist/
-*.dmg
-
 # Sample / scratch archives — never commit produced compressed files
 *.zip
 *.knit
