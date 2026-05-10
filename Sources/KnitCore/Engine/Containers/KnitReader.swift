@@ -169,7 +169,21 @@ public final class KnitReader: @unchecked Sendable {
                                         outHandle: outHandle,
                                         decoder: staged,
                                         progressReporter: progressReporter)
-            try outHandle.synchronize()
+            // No `outHandle.synchronize()` here. Two reasons:
+            //   1. macOS's unified buffer cache makes write↔mmap
+            //      coherent on the same file without `fsync` —
+            //      `verifyCRC` mmaps `outURL` on a fresh fd and the
+            //      pages are visible regardless of whether dirty
+            //      pages have hit NAND yet.
+            //   2. `KnitReader.extract` has already set `F_NOCACHE`
+            //      on `outHandle.fileDescriptor` (PR #17), so the
+            //      writes go straight to the NVMe controller's
+            //      DRAM cache rather than accumulating in the page
+            //      cache. There is nothing for `fsync` to flush.
+            // Each per-entry `synchronize()` cost ~30 µs of syscall
+            // overhead — at 100 k tiny entries that's ~3 s of wall
+            // time on the 9 GB github corpus, all spent waiting on
+            // a no-op flush. Removed.
             try verifyCRC(entry: entry, outURL: outURL, gpuCRC: gpuCRC)
             return
         }
@@ -236,10 +250,9 @@ public final class KnitReader: @unchecked Sendable {
             )
         }
 
-        // Flush kernel buffers so the verification mmap sees the bytes we
-        // just wrote (page cache will satisfy the read without hitting NAND).
-        try outHandle.synchronize()
-
+        // No `outHandle.synchronize()` — see commentary on the staged
+        // path above for the rationale (macOS unified buffer cache
+        // makes write↔mmap coherent on the same file without fsync).
         try verifyCRC(entry: entry, outURL: outURL, gpuCRC: gpuCRC)
     }
 

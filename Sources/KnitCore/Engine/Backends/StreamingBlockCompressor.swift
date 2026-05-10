@@ -169,19 +169,45 @@ public struct StreamingBlockCompressor: Sendable {
                 let batchByteStart = firstSlice.offset
                 let batchByteEnd = lastSlice.offset + lastSlice.length
                 let batchBufferLen = batchByteEnd - batchByteStart
-                let batchBufPtr = basePtr.value.advanced(by: batchByteStart)
-                let batchBuf = UnsafeBufferPointer(start: batchBufPtr,
-                                                   count: batchBufferLen)
-                do {
-                    entropies = try entropyProbe.probe(batchBuf, blockSize: blockSize)
-                } catch {
-                    // Fail-soft: if the GPU probe throws (kernel error,
-                    // out-of-memory, etc.) we'd rather skip the
-                    // downgrade decision than abort the whole compress.
-                    // Default to "compressible" so the user-requested
-                    // level is honoured.
+                // Skip the probe entirely for batches below
+                // `MetalEntropyProbe.minBufferForGPU` (256 KiB). Below
+                // that size the GPU dispatch is unprofitable, so the
+                // probe falls back to `CPUEntropyProbe` — but the CPU
+                // histogram for a 100 KB block costs ~85 µs, while
+                // the lvl=N → lvl=1 downgrade savings on a single
+                // 100 KB block are ~µs (zstd is fast on short
+                // inputs). The probe overhead exceeds what it saves.
+                //
+                // Defaulting to `entropy = 0` (compressible) means
+                // workers honour the user-requested level on small
+                // batches. Worst case (incompressible 100 KB file at
+                // lvl=N): a few hundred µs of extra match-search work
+                // per file. Best case (compressible — the typical
+                // case for a github source tree): zero change.
+                //
+                // On the user's 9 GB / 100 k-entry github corpus this
+                // dropped pack `entropy.probe` cumulative wall from
+                // ~7.7 s to ~0 s, single biggest pack-side lever
+                // remaining.
+                if batchBufferLen < MetalEntropyProbe.minBufferForGPU {
                     entropies = (0..<batchIndices.count).map { i in
                         EntropyResult(entropy: 0, byteCount: slices[batchStart + i].length)
+                    }
+                } else {
+                    let batchBufPtr = basePtr.value.advanced(by: batchByteStart)
+                    let batchBuf = UnsafeBufferPointer(start: batchBufPtr,
+                                                       count: batchBufferLen)
+                    do {
+                        entropies = try entropyProbe.probe(batchBuf, blockSize: blockSize)
+                    } catch {
+                        // Fail-soft: if the GPU probe throws (kernel
+                        // error, out-of-memory, etc.) we'd rather skip
+                        // the downgrade decision than abort the whole
+                        // compress. Default to "compressible" so the
+                        // user-requested level is honoured.
+                        entropies = (0..<batchIndices.count).map { i in
+                            EntropyResult(entropy: 0, byteCount: slices[batchStart + i].length)
+                        }
                     }
                 }
             } else {
