@@ -45,10 +45,38 @@ extension EntropyProbing {
 
 /// CPU implementation: pure Swift histogram + Shannon entropy. Always
 /// available; the fallback when no Metal device is present and the path
-/// taken for buffers too small to amortize a GPU dispatch.
+/// `MetalEntropyProbe` itself takes for buffers below its
+/// dispatch-amortisation threshold (256 KiB).
+///
+/// Internally parallel: when the input has multiple blocks, blocks are
+/// scored across worker threads via `concurrentMap` instead of a serial
+/// loop. The serial implementation that lived here through PR #19 was a
+/// real regression vector once `StreamingBlockCompressor` (PR #23) moved
+/// the entropy work *out* of per-worker closures and onto the
+/// orchestrator thread: a 32-block batch that fell back to the CPU
+/// probe would suddenly take 32× the time it did before, because the
+/// 16-way parallelism the per-worker version had was gone. Parallelising
+/// the probe internally restores parity for that fallback path while
+/// preserving the GPU-amortisation win for large batches.
 public struct CPUEntropyProbe: EntropyProbing {
     public let name = "cpu-entropy"
-    public init() {}
+
+    /// Concurrency cap for `concurrentMap`. Defaults to the host's
+    /// active processor count; callers running tests or already-
+    /// parallel-elsewhere code can pass `1` to force serial.
+    public let concurrency: Int
+
+    public init(concurrency: Int = ProcessInfo.processInfo.activeProcessorCount) {
+        self.concurrency = max(1, concurrency)
+    }
+
+    /// Below this many blocks the dispatch overhead of `concurrentMap`
+    /// dominates the wins from parallelism, so we run serial. The
+    /// per-block histogram is ~0.4 ms on a P-core for 1 MiB; dispatch
+    /// + lock acquisition costs ~10 µs each. Crossing over above
+    /// 4 blocks keeps the serial path for tiny batches (which is most
+    /// of the small-file workload's batches anyway).
+    private static let parallelThreshold: Int = 4
 
     public func probe(_ buffer: UnsafeBufferPointer<UInt8>,
                       blockSize: Int) throws -> [EntropyResult] {
@@ -56,6 +84,42 @@ public struct CPUEntropyProbe: EntropyProbing {
             return []
         }
         let total = buffer.count
+        let numBlocks = (total + blockSize - 1) / blockSize
+
+        // Trivial fast path: 1-3 blocks just run serially. Keeps the
+        // single-block / small-batch case identical to the historical
+        // implementation so nothing latent depends on a specific Float
+        // computation order.
+        if numBlocks < Self.parallelThreshold || concurrency <= 1 {
+            return serialProbe(base: base, total: total, blockSize: blockSize)
+        }
+
+        // Parallel path. Block N's input slice doesn't overlap with any
+        // other's so workers don't need synchronization on the input
+        // buffer; results are gathered in input order by `concurrentMap`.
+        let basePtr = SendableRawPointer(base)
+        let totalLen = total
+        let blockLen = blockSize
+        let indices = Array(0..<numBlocks)
+        let results: [EntropyResult] = try concurrentMap(
+            indices,
+            concurrency: concurrency
+        ) { i in
+            let off = i * blockLen
+            let len = min(blockLen, totalLen - off)
+            let p = basePtr.value.advanced(by: off)
+            let entropy = EntropyMath.shannonEntropy(of: p, count: len)
+            return EntropyResult(entropy: entropy, byteCount: len)
+        }
+        return results
+    }
+
+    /// The historical serial implementation, kept as the small-batch
+    /// path. Identical math to the parallel branch — just the same loop
+    /// the file shipped with through PR #19.
+    private func serialProbe(base: UnsafePointer<UInt8>,
+                             total: Int,
+                             blockSize: Int) -> [EntropyResult] {
         let numBlocks = (total + blockSize - 1) / blockSize
         var out: [EntropyResult] = []
         out.reserveCapacity(numBlocks)
