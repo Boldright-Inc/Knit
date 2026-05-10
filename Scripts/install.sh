@@ -93,13 +93,38 @@ fi
 
 echo ">> Installing Quick Actions to ${QA_DST}"
 mkdir -p "${QA_DST}"
+
+# Cleanup pass: remove every previously-installed Knit Quick Action
+# *before* dropping the new bundles in. Without this, renaming a workflow
+# (or installing across versions whose filenames drifted by a space, a
+# dot, or unicode) leaves the old bundles behind and the Services menu
+# duplicates every entry.
+#
+# We deliberately also touch /Library/Services (system-wide) in case an
+# earlier install ran with sudo — those copies are otherwise invisible
+# to the user-scope rm below and silently take precedence.
+echo "   cleaning previous Knit workflows from ${QA_DST}"
+find "${QA_DST}" -maxdepth 1 -type d -name "Knit *.workflow" \
+    -exec rm -rf {} + 2>/dev/null || true
+
+if [[ -d "/Library/Services" ]] && \
+   ls /Library/Services/Knit\ *.workflow >/dev/null 2>&1; then
+    echo "   cleaning previous Knit workflows from /Library/Services (sudo)"
+    sudo find /Library/Services -maxdepth 1 -type d -name "Knit *.workflow" \
+        -exec rm -rf {} + 2>/dev/null || true
+fi
+
 for wf in "${QA_SRC}"/*.workflow; do
     [[ -d "${wf}" ]] || continue
     name="$(basename "${wf}")"
-    rm -rf "${QA_DST}/${name}"
     cp -R "${wf}" "${QA_DST}/${name}"
     echo "   installed: ${name}"
 done
+
+# Force the Services menu to forget any cached registrations from the
+# now-removed workflows. Without `pbs -flush` the duplicates can linger
+# in the menu until the next login even though the files are gone.
+/System/Library/CoreServices/pbs -flush >/dev/null 2>&1 || true
 
 # Force Services menu, icon cache, and Finder to pick up the new registrations.
 /System/Library/CoreServices/pbs -update >/dev/null 2>&1 || true

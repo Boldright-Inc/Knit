@@ -108,6 +108,14 @@ extension KnitCommand {
             let compressor = ZipCompressor(backend: backend, options: opts)
 
             let stats = try compressor.compress(input: inputURL, to: outputURL)
+            // Stop the printer thread BEFORE the result `print(...)`s so its
+            // progress line and the result summary don't interleave (otherwise
+            // the printer's last poll fires after the summary, painting a
+            // stale 100% bar below the result block). `finish` + `wait` are
+            // both idempotent, so the `defer` further up still works as a
+            // safety net for the throw path.
+            reporter?.finish()
+            printer?.waitUntilFlushed()
             let mb = Double(stats.bytesIn) / 1_000_000
             print(String(format: "  entries: %d", stats.entriesWritten))
             print(String(format: "  in:    %10.2f MB", mb))
@@ -186,6 +194,10 @@ extension KnitCommand {
             )
             let compressor = KnitCompressor(backend: CPUZstd(), options: opts)
             let stats = try compressor.compress(input: inputURL, to: outputURL)
+            // Drain the printer thread before the result summary — see the
+            // matching comment in the `Zip` subcommand for rationale.
+            reporter?.finish()
+            printer?.waitUntilFlushed()
 
             let mb = Double(stats.bytesIn) / 1_000_000
             print(String(format: "  entries: %d", stats.entriesWritten))
@@ -302,6 +314,10 @@ extension KnitCommand {
             let extractor = KnitExtractor(useGPUVerify: !noGpuVerify,
                                           progressReporter: reporter)
             let stats = try extractor.extract(archive: inputURL, to: outURL)
+            // Drain the printer thread before the result summary — see the
+            // matching comment in the `Zip` subcommand for rationale.
+            reporter?.finish()
+            printer?.waitUntilFlushed()
             print(String(format: "  entries: %d", stats.entries))
             print(String(format: "  out:   %10.2f MB", Double(stats.bytesOut) / 1_000_000))
             print(String(format: "  time:  %10.3f s", stats.elapsed))
