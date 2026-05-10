@@ -498,6 +498,237 @@ months", PR description for "review me now".
 
 ---
 
+## Recent landed work (PRs #29–#39)
+
+Complements the rule sections above with the narrative of what
+shipped *after* CLAUDE.md was first written. Read here for "why is
+the codebase like this"; read the rules above for "what to do
+about it".
+
+| PR | Title | What it taught / what landed |
+|---|---|---|
+| #29, #30 | docs: add CLAUDE.md | This document |
+| #31, #32 | unpack entry-level parallelism + regression fix | Mirroring PR #27's mixed-granularity pattern on the unpack side initially regressed by 16 s — APFS directory b-tree contention from 16-way `createFile` on same parent dir. Fix: serial pre-create of parent directories before parallel extract; `concurrency=1` fast-path inside `concurrentMap` |
+| #33 | skip per-entry fsync + skip entropy probe for tiny batches | Foundation's `FileHandle.close()` already syncs metadata; explicit `fsync()` was redundant. Tiny batches (< `MetalEntropyProbe.minBufferForGPU`) skip probe altogether — synthesise zero entropy |
+| #34, #35 | shard StageAnalytics across 32 stripes | Single NSLock in `StageAnalytics.record()` was contended across 16 workers; `compute.crc` measurement inflated 12×. Fix: 32 shards selected by Knuth multiplicative hash. Critically, use the *high bits* of the hash — low bits are zero for object-pointer-derived hashes |
+| #36, #37 | adaptive probe-skip lock for incompressible big files **(reverted)** | Removing the per-batch ~18 ms probe wall accidentally also removed the thermal "settling" pacing — M5 Max throttled, GCD oversubscribed. 37 % pack regression on VM, 49 % on GitHub. Reverted; replaced by PR #38's pipelining approach |
+| #38 | pipeline entropy probe with worker compress | Per-batch probe dispatched on `DispatchQueue.global` *before* workers start the current batch — async resolve via `ProbeFuture` (DispatchSemaphore + NSLock). Workers still consume entropy from `EntropyResult` arrays; probe wall hides behind worker work |
+| #39 | chunk pipelined probe into ~256 MiB | One GPU dispatch per ~8 batches instead of per batch; 2 291 dispatches × 18 ms → ~320 dispatches × 30 ms. Bootstrap-resolves chunk 0; thereafter chunks resolve at transitions with the worker-loop wall already covering the dispatch wall |
+
+## Current bench reference (M5 Max, post-PR-#39, 2026-05-10)
+
+The reference walls we're working against. Use `--analyze` to refresh
+after every codec/orchestrator change. Numbers ≠ baselines if they
+came from a different build of `main`.
+
+**Pack — 80 GB Windows-VM `.pvm.knit`** (29 entries, ratio 99.7 %):
+- total: 74.3 s — encoder wall 74.3 s
+- stage wall: entropy.probe 0.2 s, parallel.compress 65.5 s, archive.write 8.5 s
+- cumulative CPU: **compute.crc 1141.7 s (498 ms/batch)**, compute.compress 15.8 s
+- **next lever per Rule 4.1**: wire `MetalCRC32` into the per-block worker pipeline
+
+**Pack — 9 GB GitHub folder** (100 817 small files):
+- total: 10.6 s, batches 89 653, avg 0.1 MiB, ratio 83.1 %
+- stage wall: entropy.probe 7.0 s, parallel.compress 15.3 s, archive.write 0.4 s
+- cumulative CPU: compute.crc 31.7 s, compute.compress 5.9 s
+- bottleneck: per-entry FS overhead; further wins require batched CRC dispatch and/or `KnitWriter` syscall reduction
+
+**Unpack — 80 GB VM**: total 101.8 s; parallel.decode 61.2 s (47 ms/batch); sink 7.8 s
+**Unpack — 9 GB GitHub**: total 19.2 s; parallel.decode 2.1 s; sink 6.3 s — sink-bound
+
+Raw analyze output is reproducible from `Tests/Benchmarks/data/external/`
+(see "Bench corpus directory convention" below).
+
+## Phase 1b — GPU Huffman literal decode (next major phase)
+
+Detail-heavy section so a fresh agent can pick this up cold.
+
+### Why this is "next"
+
+Unpack-side, `parallel.decode` is the dominant stage on every
+corpus large enough to be GPU-relevant: 61 s on the 80 GB VM,
+30 % of the GitHub-corpus decoder wall. Per Rule 4.1 the
+intervention is "GPU Huffman literal decoder".
+
+Pack-side, the dominant lever is `MetalCRC32` (see bench
+reference above). The Huffman work below is the larger /
+higher-impact piece, but a pack-side GPU CRC PR is a natural
+smaller stepping stone if Phase 1b risk feels too large
+upfront. Either order is fine; Phase 1b *first* gives the next
+agent a chance to validate the differential-fuzz harness
+against a smaller surface before scaling it to Phase 2.
+
+### Goal
+
+Decode the **Huffman_4Stream literal section** of each `.knit`
+zstd block in parallel on Metal; hand the decoded literals back
+to the CPU for sequence execution; produce bit-identical output
+to `ZSTD_decompress`. Target on the VM unpack:
+~0.83 GB/s → ≥ 2.5 GB/s on M3 Max; ≥ 3.5 GB/s on M5 Max.
+
+### Codec scope
+
+In-scope literal block types:
+- `Compressed_Literals_Block` with `Huffman_4Stream` (the
+  common case for ≥ 256-byte literal sections)
+
+Out-of-scope (fall back to CPU; track rate as a metric):
+- `Compressed_1Stream` (single-stream Huffman — parallelism is
+  per-symbol-bitstream, harder; Phase 2 candidate)
+- `Raw_Literals_Block`, `RLE_Literals_Block` — no compression
+  work to offload
+- `Treeless_Literals_Block` — uses repeat table; tractable but
+  ordering constraints across blocks add bookkeeping. Defer
+- FSE/sequence decoding — Phase 2
+
+### File layout to add
+
+```
+Sources/KnitCore/Engine/MetalKernels/
+    zstd_huffman_decode.metal        ← per-stream Huffman bit reader
+    zstd_block_parse.metal           ← (optional, stretch) GPU-side parse
+Sources/KnitCore/Engine/Backends/
+    MetalZstdLiteralDecoder.swift    ← BlockDecoding conformer
+    MetalZstdContext.swift           ← persistent buffers + pipeline
+Tests/KnitCoreTests/
+    HybridZstdDecodeTests.swift      ← differential vs ZSTD_decompress
+    HybridZstdDecodeFuzzTests.swift  ← bit-flip + property fuzz
+    HuffmanLiteralFallbackTests.swift ← exercises non-4Stream paths
+```
+
+The existing `HybridZstdBatchDecoder` already has a `gpuPath:
+BlockDecoding?` slot (see file header doc). The new decoder
+plugs in there; the orchestration / safety wrapper does not
+change.
+
+### Architecture (concrete)
+
+For each batch of N blocks (input to `MetalZstdLiteralDecoder.decodeBlock`):
+
+1. **CPU pre-parse** (≤ 50 µs target per block): walk each zstd
+   frame header to (a) sniff `Literals_Section_Header` and
+   classify, (b) extract Huffman tree description offset/length,
+   (c) record the four stream offsets relative to the literal
+   section start, (d) record `regenerated_size`. Blocks that
+   classify as out-of-scope are short-circuited to the CPU path
+   (`cpuPath.decodeBlock(...)`).
+2. **CPU → GPU staging** (per batch, not per block): build a
+   contiguous MTLBuffer containing every in-scope block's
+   literal section. For page-aligned, mmap-backed inputs use
+   `bytesNoCopy:` (see `MetalCRC32` for the exact aliasing
+   pattern; same Rule 3.1 caveats apply). Build a parallel
+   table of per-block descriptors (offsets, sizes, Huffman tree
+   pointer).
+3. **GPU dispatch** — one threadgroup per block, 4 threads per
+   threadgroup, one thread per stream. Each thread decodes its
+   stream by walking the Huffman codes from its bitstream tail
+   forward. Output is written to a contiguous per-batch literal
+   buffer at the block's pre-computed slot. **Defensive bounds
+   checks every write** (output buffer length vs `regenerated_size`).
+4. **CPU sequence execution**: for each in-scope block, run the
+   FSE+sequence stage of libzstd using the GPU-decoded literals
+   as input. **Implementation note**: there is no public libzstd
+   API to inject pre-decoded literals. Easiest correct path:
+   re-decode the entire frame on CPU into a separate buffer and
+   `memcmp` against the GPU literal output (= per-block
+   correctness oracle); on mismatch route the block through the
+   CPU fallback. This sacrifices 50 % of the literal-decode
+   wall-time gain but is the safest first step. A
+   skip-the-oracle optimisation is a later PR once the GPU path
+   is trusted (months of TestFlight time).
+5. **Per-batch CRC fold and commit** — unchanged from existing
+   `HybridZstdBatchDecoder.decodeBatch` flow.
+
+### Safety contract (mandatory on day one)
+
+All of these already exist in `HybridZstdBatchDecoder` as the
+orchestration layer; the new decoder must respect them:
+
+- `MetalContext()` returns nil → silently fall back to CPU.
+  Construct the decoder with `MetalZstdLiteralDecoder(...)? = nil`
+  and route everything through `cpuPath`.
+- **Eager pipeline compile at construction** — never first-dispatch
+  surprise. If `makePipeline("zstd_huffman_decode")` throws, the
+  factory returns nil and `HybridZstdBatchDecoder` constructs
+  with `gpuPath: nil`.
+- **Per-block CPU fallback** is already wired in
+  `parallelDecodeBlocks(... perBlockFallback:)`; any GPU throw
+  routes that single block to CPU without poisoning the batch.
+- **Whole-batch CPU fallback** on the rare case of a non-block-
+  scoped error.
+- **Bounds-check assertions on every kernel write** stay on in
+  debug + TestFlight.
+- **Watchdog adaptive batch size** is already there; new decoder
+  inherits it.
+- **Differential vs libzstd** is the *correctness oracle* for
+  Phase 1b (see step 4 above).
+
+### Performance budget
+
+| Stage | Target | Why |
+|---|---|---|
+| CPU pre-parse | ≤ 50 µs/block | Otherwise the CPU parse becomes the serial bottleneck — defeats the purpose |
+| GPU dispatch | 30–60 ms/batch (64 blocks × ~64 MiB literals) | One commit per batch; aim to hide behind the previous batch's CPU sequence-execute work |
+| Per-block fallback rate | ≤ 15 % on Silesia/enwik9/VM | > 30 % means the in-scope classifier is wrong |
+| End-to-end unpack wall (M5 Max VM) | 102 s → ≤ 50 s | Halving the dominant stage; rest is sink-write and per-entry overhead |
+
+### Differential fuzz harness (must be automated end-to-end)
+
+The local agent runs the test suite itself; no manual
+intervention should be needed. Targets:
+
+```
+swift test --filter HybridZstdDecodeTests              # ~30 s
+swift test --filter HybridZstdDecodeFuzzTests          # ~10 min (1e5 inputs)
+./Scripts/diff-fuzz-decode.sh 1e6                      # ~1 hour (1e6 inputs)
+./Scripts/diff-fuzz-decode.sh 1e9                      # overnight (1e9 inputs)
+./Scripts/bench-corpora.sh                             # corpus replay (see below)
+```
+
+Fuzz assertion: for any input byte sequence the CPU
+`ZSTD_decompress` accepts, the hybrid path either produces
+byte-identical output **or** throws cleanly and falls back to
+CPU (the orchestrator's existing mechanism produces correct
+output regardless). Track fallback rate as a metric; reject
+fuzz inputs that fall back > 50 % (suggests the test corpus
+isn't exercising the GPU path).
+
+10⁹ inputs is the same scale as nvCOMP's pre-release; see the
+codec roadmap plan (`/root/.claude/plans/...puffin.md`) for the
+reasoning.
+
+## Bench corpus directory convention
+
+The local agent has real input data. Standard locations:
+
+```
+Tests/Benchmarks/data/external/      ← real-world inputs; gitignored
+    github/                          ← real GitHub repo checkout (~9 GB, 100k files)
+    pvm/                             ← Windows VM .pvm files (~80 GB, 29 files)
+    silesia/                         ← Silesia benchmark suite (~210 MB)
+    enwik9                           ← Wikipedia text corpus (~1 GB)
+```
+
+The local agent has read access to these. They are
+**gitignored** (large + non-redistributable); do not check them
+in. Bench scripts source from this directory:
+
+- `./Scripts/bench-corpora.sh` — pack and unpack each subdirectory
+  with `--analyze`, dump stage breakdowns to
+  `Tests/Benchmarks/results/<timestamp>/`. If this script does
+  not exist yet, the next agent's first concrete task is to
+  write it — convention above is the canonical layout.
+- `./Scripts/diff-fuzz-decode.sh <iterations>` — Phase 1b
+  differential fuzzer. Same shape: source data from
+  `data/external/`, write fuzz seeds to
+  `Tests/Benchmarks/results/fuzz/<timestamp>/`.
+
+Reference results from before any Phase 1b work are in
+`Tests/Benchmarks/results/baseline-2026-05-10.tsv` (or will be
+once the next agent runs `bench-corpora.sh` on post-#39 main —
+the analyze numbers in the "Current bench reference" section
+above are the expected output).
+
 ## Open backlog
 
 Tracked in PR descriptions; consolidated here for ease of
@@ -505,9 +736,9 @@ prioritisation. Most-recent first.
 
 | Item | Why | Sketch |
 |---|---|---|
-| **CI release-mode build** | PRs #26 and #28 both broke `package-dmg.sh` because `swift build` (debug) didn't run strict-concurrency to completion | add `swift build -c release` + `swift test -c release` jobs to CI |
-| **Unpack entry-level parallelism** | Same shape as PR #27 on the decode side. Analyse showed 32 s of "unaccounted" wall on the github corpus, all per-entry FS syscalls | apply Rule 5.2 to `KnitExtractor.extract` |
-| **Phase 1b — GPU Huffman literal decode** | `parallel.decode` is 60 s on the 80 GB Windows-VM unpack. Only remaining lever for large-file unpack | MSL kernel, plug into `HybridZstdBatchDecoder.gpuPath` |
+| **Phase 1b — GPU Huffman literal decode** | see "Phase 1b" section above; dominant unpack lever (61 s of 102 s on VM) | MSL kernel, plug into `HybridZstdBatchDecoder.gpuPath` |
+| **Pack-side GPU CRC** | `compute.crc` is 1141 s cumulative on VM pack (Rule 4.1 next intervention for the pack side). `MetalCRC32` exists but is not wired into the per-block worker pipeline | replace `libdeflate_crc32` call in `StreamingBlockCompressor` worker with a batched MetalCRC32 path; falls back to CPU when `MetalContext()` is nil |
+| **CI release-mode build** | PRs #26 and #28 both broke `package-dmg.sh` because debug `swift build` didn't run strict-concurrency to completion | add `swift build -c release` + `swift test -c release` jobs to CI |
 | **Atomic-on-success commit for `unpack`** | Streaming write + final-CRC mismatch leaves a partial output file on disk | write to `.tmp`, rename on CRC pass |
 | **Per-block CRCs in `.knit` v2** | Allows per-batch verify-before-commit instead of end-of-entry only | format version bump |
 | **Symlink preservation** | Currently always skipped; tar/zip preserve them | `.knit` v2 entry type, plus `--preserve-symlinks` flag |
