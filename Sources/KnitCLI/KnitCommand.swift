@@ -75,6 +75,10 @@ extension KnitCommand {
               help: "Disable the entropy pre-screening pass (debugging).")
         var noEntropyProbe: Bool = false
 
+        @Flag(name: .long,
+              help: "Print live progress to stderr every 500 ms (single-line, \\r-overwrite).")
+        var progress: Bool = false
+
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
             let outputURL = URL(fileURLWithPath: output ?? "\(input).zip").standardizedFileURL
@@ -82,11 +86,21 @@ extension KnitCommand {
             let cores = jobs ?? ProcessInfo.processInfo.activeProcessorCount
             let recorder: HeatmapRecorder? = (heatmap || heatmapImage != nil)
                 ? HeatmapRecorder() : nil
+            let totalBytes = progress ? (try? CLIProgress.totalUncompressedBytes(at: inputURL)) ?? 0 : 0
+            let reporter: ProgressReporter? = progress
+                ? ProgressReporter(totalBytes: totalBytes, phase: .zipping) : nil
+            let printer = reporter.map { CLIProgress.Printer(reporter: $0) }
+            printer?.start()
+            defer {
+                reporter?.finish()
+                printer?.waitUntilFlushed()
+            }
             let opts = ZipCompressor.Options(
                 level: CompressionLevel(level),
                 concurrency: cores,
                 heatmapRecorder: recorder,
-                entropyProbeEnabled: !noEntropyProbe
+                entropyProbeEnabled: !noEntropyProbe,
+                progressReporter: reporter
             )
             let backend: DeflateBackend & CRC32Computing = parallel
                 ? ParallelDeflate(chunkSize: chunkKb * 1024, concurrency: cores)
@@ -142,6 +156,10 @@ extension KnitCommand {
               help: "Disable the entropy pre-screening pass (debugging).")
         var noEntropyProbe: Bool = false
 
+        @Flag(name: .long,
+              help: "Print live progress to stderr every 500 ms (single-line, \\r-overwrite).")
+        var progress: Bool = false
+
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
             let outputURL = URL(fileURLWithPath: output ?? "\(input).knit").standardizedFileURL
@@ -149,12 +167,22 @@ extension KnitCommand {
 
             let recorder: HeatmapRecorder? = (heatmap || heatmapImage != nil)
                 ? HeatmapRecorder() : nil
+            let totalBytes = progress ? (try? CLIProgress.totalUncompressedBytes(at: inputURL)) ?? 0 : 0
+            let reporter: ProgressReporter? = progress
+                ? ProgressReporter(totalBytes: totalBytes, phase: .packing) : nil
+            let printer = reporter.map { CLIProgress.Printer(reporter: $0) }
+            printer?.start()
+            defer {
+                reporter?.finish()
+                printer?.waitUntilFlushed()
+            }
             let opts = KnitCompressor.Options(
                 level: CompressionLevel(level),
                 concurrency: cores,
                 blockSize: blockKb * 1024,
                 heatmapRecorder: recorder,
-                entropyProbeEnabled: !noEntropyProbe
+                entropyProbeEnabled: !noEntropyProbe,
+                progressReporter: reporter
             )
             let compressor = KnitCompressor(backend: CPUZstd(), options: opts)
             let stats = try compressor.compress(input: inputURL, to: outputURL)
@@ -248,10 +276,31 @@ extension KnitCommand {
               help: "Disable GPU-accelerated CRC32 verification (forces CPU verify).")
         var noGpuVerify: Bool = false
 
+        @Flag(name: .long,
+              help: "Print live progress to stderr every 500 ms (single-line, \\r-overwrite).")
+        var progress: Bool = false
+
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
             let outURL = URL(fileURLWithPath: output).standardizedFileURL
-            let extractor = KnitExtractor(useGPUVerify: !noGpuVerify)
+            // Total uncompressed bytes for the progress bar are read out
+            // of the .knit footer so we don't need a second SSD pass.
+            let totalBytes: UInt64
+            if progress {
+                totalBytes = (try? CLIProgress.totalUncompressedBytesInKnit(at: inputURL)) ?? 0
+            } else {
+                totalBytes = 0
+            }
+            let reporter: ProgressReporter? = progress
+                ? ProgressReporter(totalBytes: totalBytes, phase: .extracting) : nil
+            let printer = reporter.map { CLIProgress.Printer(reporter: $0) }
+            printer?.start()
+            defer {
+                reporter?.finish()
+                printer?.waitUntilFlushed()
+            }
+            let extractor = KnitExtractor(useGPUVerify: !noGpuVerify,
+                                          progressReporter: reporter)
             let stats = try extractor.extract(archive: inputURL, to: outURL)
             print(String(format: "  entries: %d", stats.entries))
             print(String(format: "  out:   %10.2f MB", Double(stats.bytesOut) / 1_000_000))

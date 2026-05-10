@@ -118,9 +118,14 @@ public final class KnitReader {
     /// post-write verification re-reads the freshly-written file via
     /// `MappedFile` (page-cache hot, effectively free) and runs the CRC on
     /// the GPU. Smaller entries fall through to libdeflate's CPU CRC32.
+    ///
+    /// `progressReporter`, if supplied, has `advance(by:)` called with the
+    /// number of *uncompressed* bytes after each block is decompressed and
+    /// written to disk.
     public func extract(_ entry: KnitEntry,
                         to outURL: URL,
-                        gpuCRC: MetalCRC32? = nil) throws {
+                        gpuCRC: MetalCRC32? = nil,
+                        progressReporter: ProgressReporter? = nil) throws {
         if entry.isDirectory {
             try FileManager.default.createDirectory(at: outURL,
                                                     withIntermediateDirectories: true)
@@ -184,6 +189,9 @@ public final class KnitReader {
 
             try outHandle.write(contentsOf: outBuf)
             srcOffset += inLen
+            // One progress tick per block so the printer thread sees
+            // smooth motion even for very large entries.
+            progressReporter?.advance(by: UInt64(produced))
         }
 
         if totalDecompressed != entry.uncompressedSize {

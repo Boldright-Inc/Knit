@@ -4,7 +4,20 @@ import Metal
 /// CRC32 (IEEE / zlib) computed on the GPU. Useful for hiding CRC latency
 /// behind block compression for very large entries; the small-buffer cost
 /// is higher than libdeflate's CPU CRC32 due to dispatch overhead.
+///
+/// **Per-dispatch size limit**: each Metal dispatch is capped at 1 GiB
+/// for two independent reasons. (1) The kernel's slice indexing
+/// (`uint start = gid * slice_size`) overflows the 32-bit `uint` once
+/// the buffer crosses 4 GiB. (2) `MTLDevice.maxBufferLength` on Apple
+/// Silicon is roughly the recommended working-set size (≈ 70-75% of
+/// physical UMA), so a single 100 GiB MTLBuffer cannot be created on
+/// any consumer Mac. Inputs above the limit are sliced into 1-GiB
+/// chunks; per-chunk CRCs are combined via `crc32Combine`.
 public final class MetalCRC32: @unchecked Sendable {
+
+    /// Maximum bytes per single Metal dispatch. Keeps both the kernel's
+    /// `uint` indexing and `MTLDevice.maxBufferLength` happy.
+    public static let perDispatchByteLimit: Int = 1 * 1024 * 1024 * 1024
 
     private let context: MetalContext
     private let pipeline: MTLComputePipelineState
@@ -21,12 +34,59 @@ public final class MetalCRC32: @unchecked Sendable {
         }
     }
 
-    /// Computes CRC-32 of an arbitrary buffer using GPU per-slice + CPU combine.
+    /// Computes CRC-32 of an arbitrary buffer using GPU per-slice + CPU
+    /// combine. Buffers above `perDispatchByteLimit` are sliced into
+    /// `slice-size`-aligned chunks; each chunk runs the original
+    /// single-dispatch path and the chunk CRCs are folded together via
+    /// `crc32Combine`.
     public func crc32(_ buffer: UnsafeBufferPointer<UInt8>) throws -> UInt32 {
         let total = buffer.count
         if total == 0 { return 0 }
         guard let basePtr = buffer.baseAddress else { return 0 }
 
+        // Round the chunk limit down to a multiple of `sliceSize` so the
+        // kernel's per-slice walks don't straddle chunk boundaries —
+        // otherwise the last slice in one chunk and the first slice in
+        // the next would together cover one logical sliceSize, but the
+        // host-side combine would treat them as two slices.
+        let chunkLimit = max(sliceSize, (Self.perDispatchByteLimit / sliceSize) * sliceSize)
+
+        if total <= chunkLimit {
+            // Single-dispatch fast path — preserves the original
+            // behaviour for sub-1-GiB buffers.
+            return try crc32OneDispatch(basePtr: basePtr, total: total)
+        }
+
+        // Multi-dispatch path: per-chunk CRC, combine via crc32_combine.
+        var combined: UInt32 = 0
+        var firstChunk = true
+        var off = 0
+        while off < total {
+            let chunkLen = min(chunkLimit, total - off)
+            let chunkCrc = try crc32OneDispatch(
+                basePtr: basePtr.advanced(by: off),
+                total: chunkLen
+            )
+            if firstChunk {
+                combined = chunkCrc
+                firstChunk = false
+            } else {
+                combined = crc32Combine(
+                    crc1: combined,
+                    crc2: chunkCrc,
+                    len2: UInt(chunkLen)
+                )
+            }
+            off += chunkLen
+        }
+        return combined
+    }
+
+    /// Original single-dispatch implementation. Caller is responsible
+    /// for keeping `total ≤ perDispatchByteLimit` so the kernel's `uint`
+    /// indexing and `MTLDevice.maxBufferLength` both stay in range.
+    private func crc32OneDispatch(basePtr: UnsafePointer<UInt8>,
+                                  total: Int) throws -> UInt32 {
         let numSlices = (total + sliceSize - 1) / sliceSize
 
         // On Apple Silicon (unified memory), alias the caller's buffer directly
@@ -97,11 +157,9 @@ public final class MetalCRC32: @unchecked Sendable {
         // Combine slice CRCs on CPU using zlib's crc32_combine64 math.
         let slicePtr = outBuf.contents().bindMemory(to: UInt32.self, capacity: numSlices)
         var combined: UInt32 = slicePtr[0]
-        var combinedLen = min(sliceSize, total)
         for i in 1..<numSlices {
             let sliceLen = min(sliceSize, total - i * sliceSize)
             combined = crc32Combine(crc1: combined, crc2: slicePtr[i], len2: UInt(sliceLen))
-            combinedLen += sliceLen
         }
         return combined
     }
