@@ -29,6 +29,13 @@ public struct StreamingBlockCompressor {
         let blockCrc: UInt32
         let entropy: Float
         let levelUsed: Int32
+        /// Per-block CPU-time spent in each sub-stage of the worker
+        /// pipeline. Aggregated into `StageAnalytics` by the drain
+        /// loop. Zero when the analytics accumulator is nil (the
+        /// worker skips the per-stage `ContinuousClock.now` reads).
+        let entropyCPU: TimeInterval
+        let crcCPU: TimeInterval
+        let compressCPU: TimeInterval
     }
 
     /// Aggregate output: per-block compressed sizes, total compressed
@@ -72,6 +79,7 @@ public struct StreamingBlockCompressor {
         entropyDowngradeEnabled: Bool = true,
         heatmapRecorder: HeatmapRecorder? = nil,
         progressReporter: ProgressReporter? = nil,
+        analytics: StageAnalytics? = nil,
         sink: (_ blockIdx: Int, _ frame: Data) throws -> Void
     ) throws -> Output {
         if input.count == 0 {
@@ -109,6 +117,8 @@ public struct StreamingBlockCompressor {
 
             // Process this batch in parallel. Each worker does the
             // entire per-block pipeline on cache-warm pages.
+            let measureCPU = analytics != nil
+            let parallelStart = ContinuousClock.now
             let processed: [ProcessedBlock] = try concurrentMap(
                 batchIndices,
                 concurrency: concurrency
@@ -121,11 +131,15 @@ public struct StreamingBlockCompressor {
                 // block on a P-core; the bytes are then resident in L1
                 // cache for the CRC and codec walks that follow.
                 let entropy: Float
+                let entropyCPU: TimeInterval
                 if entropyDowngradeEnabled {
+                    let t0 = measureCPU ? ContinuousClock.now : nil
                     let hist = EntropyMath.histogram(of: bv.baseAddress!, count: bv.count)
                     entropy = EntropyMath.shannonEntropy(histogram: hist, total: bv.count)
+                    entropyCPU = t0.map { (ContinuousClock.now - $0).timeIntervalSeconds } ?? 0
                 } else {
                     entropy = 0
+                    entropyCPU = 0
                 }
 
                 // Step 2: per-block level decision. lvl≥3 match search
@@ -140,10 +154,14 @@ public struct StreamingBlockCompressor {
                 // hits the dedicated arm64 CRC32 instruction, ~5–8 GB/s
                 // per P-core. Same in-cache pages as the histogram and
                 // codec walks, so disk-read amplification is gone.
+                let crcStart = measureCPU ? ContinuousClock.now : nil
                 let blockCrc = UInt32(libdeflate_crc32(0, bv.baseAddress, bv.count))
+                let crcCPU = crcStart.map { (ContinuousClock.now - $0).timeIntervalSeconds } ?? 0
 
                 // Step 4: zstd frame.
+                let compressStart = measureCPU ? ContinuousClock.now : nil
                 let frame = try backend.compressBlock(bv, level: lvl)
+                let compressCPU = compressStart.map { (ContinuousClock.now - $0).timeIntervalSeconds } ?? 0
 
                 return ProcessedBlock(
                     absoluteIdx: absoluteIdx,
@@ -151,13 +169,39 @@ public struct StreamingBlockCompressor {
                     frame: frame,
                     blockCrc: blockCrc,
                     entropy: entropy,
-                    levelUsed: lvl
+                    levelUsed: lvl,
+                    entropyCPU: entropyCPU,
+                    crcCPU: crcCPU,
+                    compressCPU: compressCPU
                 )
+            }
+            analytics?.record(stage: "parallel.compress",
+                              seconds: (ContinuousClock.now - parallelStart).timeIntervalSeconds)
+
+            // Aggregate the batch's per-block CPU times into the
+            // analytics. These sums are *cumulative across workers*,
+            // not wall, so they can exceed `parallel.compress` —
+            // that's the point: they tell us how much CPU work each
+            // sub-stage costs, which is what decides whether GPU
+            // offload of that stage is worth building.
+            if let analytics = analytics {
+                var totalEntropyCPU: TimeInterval = 0
+                var totalCRCCPU: TimeInterval = 0
+                var totalCompressCPU: TimeInterval = 0
+                for pb in processed {
+                    totalEntropyCPU += pb.entropyCPU
+                    totalCRCCPU += pb.crcCPU
+                    totalCompressCPU += pb.compressCPU
+                }
+                analytics.record(stage: "compute.entropy", seconds: totalEntropyCPU)
+                analytics.record(stage: "compute.crc",     seconds: totalCRCCPU)
+                analytics.record(stage: "compute.compress", seconds: totalCompressCPU)
             }
 
             // Drain the batch in order: write to disk, fold CRC, record
             // heatmap. After this loop the batch's `Data` references are
             // released and the worker pool can repopulate.
+            let drainStart = ContinuousClock.now
             var heatmapBatch: [HeatmapSample] = []
             if heatmapRecorder != nil {
                 heatmapBatch.reserveCapacity(processed.count)
@@ -190,6 +234,13 @@ public struct StreamingBlockCompressor {
                 }
             }
             heatmapRecorder?.recordBatch(heatmapBatch)
+            analytics?.record(stage: "archive.write",
+                              seconds: (ContinuousClock.now - drainStart).timeIntervalSeconds)
+            // Per-batch tick: aggregate input bytes for the average-batch-size
+            // line. Fallback count is unused on the encode path (no GPU
+            // fallback yet), passed as 0.
+            let batchInputBytes = processed.reduce(0) { $0 + UInt64($1.originalSize) }
+            analytics?.recordBatch(bytes: batchInputBytes, fallback: 0)
 
             batchStart = batchEnd
         }

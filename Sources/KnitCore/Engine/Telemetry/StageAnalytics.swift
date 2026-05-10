@@ -1,31 +1,50 @@
 import Foundation
 
 /// Lock-protected accumulator for per-stage timings during a `.knit`
-/// extract. Wired through optionally — when nil, callers skip
+/// pack or unpack. Wired through optionally — when nil, callers skip
 /// instrumentation entirely so the hot path pays nothing in
 /// production. When supplied (driven by the CLI's hidden `--analyze`
-/// flag), `HybridZstdBatchDecoder` records the wall time it spends in
-/// each stage of every batch:
+/// flag), the orchestrators record per-stage seconds into a single
+/// snapshot the renderer can dump to stderr.
 ///
+/// The accumulator itself is direction-agnostic: `record(stage:seconds:)`
+/// just maps a string key to a running TimeInterval total. The stage
+/// label set is decided by the caller. Conventional labels:
+///
+///   **Decode (HybridZstdBatchDecoder)**
 ///   * `staging.alloc`        — `[UInt8](repeating: 0, count: …)` per
-///                               batch (zero-fill cost, lazy mmap
-///                               page faults, allocator pressure).
+///                              batch (zero-fill cost, lazy mmap
+///                              page faults, allocator pressure).
 ///   * `parallel.decode`      — `concurrentMap` over per-block libzstd
-///                               (wall, not CPU-time — see commentary
-///                               in `decode()`).
+///                              (wall, not CPU-time).
 ///   * `crc.fold`             — serial libdeflate `crc32` over the
-///                               assembled batch.
-///   * `sink`                 — caller-supplied write callback (the
-///                               `outHandle.write` path under most
-///                               configs).
+///                              assembled batch.
+///   * `sink`                 — caller-supplied write callback.
 ///
-/// The output of a knit unpack run with `--analyze` is what tells us
-/// where the wall-clock time is actually going on the user's host —
-/// the data needed to decide *which* stage the spare GPU should
-/// accelerate next (CRC fold? Huffman literal decode? double-buffered
-/// write overlap?). Without measured numbers, every speed-up plan is
-/// speculation.
-public final class DecodeAnalytics: @unchecked Sendable {
+///   **Encode (StreamingBlockCompressor)**
+///   * `parallel.compress`    — wall time of `concurrentMap` over
+///                              per-block workers (combined entropy +
+///                              CRC + zstd).
+///   * `archive.write`        — wall time of the in-order sink-drain
+///                              loop (write to the archive).
+///   * `compute.entropy`      — cumulative *CPU-time* across all
+///                              workers in the histogram phase.
+///   * `compute.crc`          — cumulative CPU-time across workers
+///                              for libdeflate per-block CRC.
+///   * `compute.compress`     — cumulative CPU-time across workers
+///                              inside libzstd.
+///
+/// Note the wall-vs-CPU-time distinction. Wall-time stages (the
+/// `parallel.*` and `archive.*` ones) sum toward the orchestrator's
+/// total wall. CPU-time stages (the `compute.*` ones) sum across
+/// workers and can therefore exceed total wall — that's intentional,
+/// because what we want to know is *how much CPU work* the GPU could
+/// potentially absorb if it took over that stage.
+///
+/// Without measured numbers from this accumulator, every speed-up
+/// plan is speculation. With them, we know exactly which stage to
+/// hand the spare GPU next.
+public final class StageAnalytics: @unchecked Sendable {
 
     public struct Snapshot: Sendable {
         public struct StageEntry: Sendable {
