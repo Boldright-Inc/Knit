@@ -2,18 +2,36 @@ import Foundation
 
 /// Orchestrator for the `.knit` path.
 ///
-/// Unlike `ZipCompressor`, the entry-level loop here is **serial** because
-/// `KnitWriter` is append-only and we want deterministic on-disk layout.
-/// The parallelism instead happens *inside* each entry: a single large
-/// file is split into many independent zstd-frame blocks, all of which
-/// compress in parallel via `StreamingBlockCompressor`.
+/// Mixed-granularity parallelism (since v3):
 ///
-/// **Memory contract**: peak RSS during compression is bounded by
-/// `concurrency × blockSize`, independent of input file size. This is
-/// what lets the tool handle 100 GB+ single files without OOM.
+///   * **Large entries** (≥ `concurrency × 2 × blockSize` bytes — i.e.
+///     enough blocks to saturate the worker pool on their own) take a
+///     **serial streaming path**: one entry at a time, with
+///     intra-entry block parallelism via
+///     `StreamingBlockCompressor`. Memory stays `O(concurrency × blockSize)`,
+///     so 100 GB+ single files never OOM.
+///   * **Small entries** (the typical "git tree with 100 k tiny files"
+///     workload) are gathered into batches and compressed **across
+///     workers in parallel** via `concurrentMap`. Each worker runs its
+///     own `streamer.compress` end-to-end on a single small entry.
+///     The collected results are then drained into the archive in
+///     entry order so on-disk layout is deterministic.
 ///
-/// This shape suits the `.knit` use-case (often "one or a handful of very
-/// large files") better than the ZIP shape (often "many small files").
+/// This split solves the bottleneck the analyse output flagged on
+/// the github corpus: 76k single-block entries processed serially
+/// left 15 of 16 cores idle, capping pack throughput at ~460 MB/s.
+/// With cross-entry batching we get the same N-way parallelism the
+/// `pack` path already had on big files, just lifted up to entry
+/// granularity.
+///
+/// Memory contract:
+///   * Large-entry path: `O(concurrency × blockSize)` (unchanged).
+///   * Small-entry batch: `O(batchSize × largeEntryThreshold)` —
+///     bounded by `concurrency × 4 entries × concurrency × 2 ×
+///     blockSize / entry` = `concurrency² × 8 × blockSize`. For the
+///     defaults (16, 1 MiB) that's ~2 GiB worst case, but only when
+///     every entry is exactly at the threshold; in practice small
+///     entries are tiny and the batch sits well under 1 GiB.
 public final class KnitCompressor: Sendable {
 
     public struct Options: Sendable {
@@ -78,18 +96,6 @@ public final class KnitCompressor: Sendable {
         self.options = options
     }
 
-    /// Walk the input tree and stream each entry into a `.knit` archive
-    /// without ever buffering an entry's full compressed payload in
-    /// memory. Peak memory is `O(concurrency × blockSize)` regardless of
-    /// total file size, so 100 GB+ inputs no longer trigger the OOM
-    /// killer that the old buffer-then-write design hit on every
-    /// memory-constrained Mac.
-    ///
-    /// Per-block CRC32 and entropy classification happen inside each
-    /// worker on cache-warm pages, then the driver folds CRCs in input
-    /// order via `crc32Combine`. This collapses what used to be three
-    /// passes over the input (CRC → entropy probe → compression) into
-    /// a single cache-warm pass per block.
     public func compress(input: URL, to output: URL) throws -> CompressionStats {
         let entries = try FileWalker.enumerate(
             input,
@@ -110,53 +116,134 @@ public final class KnitCompressor: Sendable {
         options.stageAnalytics?.startWallClock()
         let baseLevel = options.level.clampedForZstd()
 
-        for entry in entries {
-            let header = KnitWriter.EntryHeader(
-                name: entry.relativePath,
-                modificationDate: entry.modificationDate,
-                unixMode: entry.unixMode,
-                isDirectory: entry.isDirectory
-            )
+        // Threshold: an entry that already has enough blocks to
+        // saturate `concurrency` workers via intra-entry block
+        // parallelism gains nothing from cross-entry batching. Below
+        // this size, the entry is effectively serial in the old
+        // streamer path (1 block ≈ 1 worker active) and benefits from
+        // running alongside its siblings.
+        let largeEntryThreshold = UInt64(options.concurrency) * 2 * UInt64(options.blockSize)
 
+        var i = 0
+        while i < entries.count {
+            let entry = entries[i]
+
+            // Directories: emit empty streaming entry; no data work.
             if entry.isDirectory {
-                // Directory entries carry no data; write an empty
-                // streaming entry to keep the on-disk layout uniform.
-                let streamEntry = try writer.beginStreamingEntry(
+                let header = KnitWriter.EntryHeader(
+                    name: entry.relativePath,
+                    modificationDate: entry.modificationDate,
+                    unixMode: entry.unixMode,
+                    isDirectory: true
+                )
+                let se = try writer.beginStreamingEntry(
                     header: header,
                     uncompressedSize: 0,
                     blockSize: 0,
                     numBlocks: 0
                 )
-                try streamEntry.finish(crc32: 0)
+                try se.finish(crc32: 0)
+                i += 1
                 continue
             }
 
-            let mapped = try MappedFile(url: entry.absoluteURL)
-            let buf = mapped.buffer
-
-            let numBlocks = (buf.count + options.blockSize - 1) / options.blockSize
-            let streamEntry = try writer.beginStreamingEntry(
-                header: header,
-                uncompressedSize: UInt64(buf.count),
-                blockSize: UInt32(options.blockSize),
-                numBlocks: UInt32(numBlocks)
-            )
-
-            let result = try streamer.compress(
-                buf,
-                level: baseLevel,
-                entropyDowngradeEnabled: options.entropyProbeEnabled,
-                heatmapRecorder: options.heatmapRecorder,
-                progressReporter: options.progressReporter,
-                analytics: options.stageAnalytics
-            ) { _, frame in
-                try streamEntry.writeBlock(frame)
+            // Large entry: serial streaming path. Compresses block-
+            // by-block and writes frames straight to the archive as
+            // they're produced — keeps memory bounded for
+            // multi-GiB single files.
+            if entry.size >= largeEntryThreshold {
+                let r = try compressLargeEntryStreaming(
+                    entry: entry,
+                    writer: writer,
+                    streamer: streamer,
+                    level: baseLevel
+                )
+                bytesIn += r.totalIn
+                bytesOut += r.totalOut
+                i += 1
+                continue
             }
 
-            try streamEntry.finish(crc32: result.crc32)
+            // Small entry: gather a run of consecutive small entries
+            // and compress them in parallel. The walker emits entries
+            // in deterministic order, so consecutive small runs map
+            // cleanly to a contiguous batch slice — and writing
+            // results in `processed` order preserves the on-disk
+            // entry order.
+            var j = i
+            let maxBatch = max(options.concurrency * 4, 8)
+            while j < entries.count
+                && (j - i) < maxBatch
+                && !entries[j].isDirectory
+                && entries[j].size < largeEntryThreshold {
+                j += 1
+            }
+            let batch = Array(entries[i..<j])
 
-            bytesIn += result.totalIn
-            bytesOut += result.totalOut
+            // Capture the values the parallel closure needs as
+            // immutable lets so the @Sendable check passes without
+            // pulling `self` in.
+            let levelLocal = baseLevel
+            let entropyEnabled = options.entropyProbeEnabled
+            let heatmap = options.heatmapRecorder
+            let reporter = options.progressReporter
+            let analytics = options.stageAnalytics
+            let blockSizeLocal = options.blockSize
+            let streamerLocal = streamer
+
+            let processed: [SmallEntryResult] = try concurrentMap(
+                batch,
+                concurrency: options.concurrency
+            ) { entry in
+                let mapped = try MappedFile(url: entry.absoluteURL)
+                let buf = mapped.buffer
+                var frames: [Data] = []
+                let result = try streamerLocal.compress(
+                    buf,
+                    level: levelLocal,
+                    entropyDowngradeEnabled: entropyEnabled,
+                    heatmapRecorder: heatmap,
+                    progressReporter: reporter,
+                    analytics: analytics
+                ) { _, frame in
+                    frames.append(frame)
+                }
+                return SmallEntryResult(
+                    entry: entry,
+                    frames: frames,
+                    crc32: result.crc32,
+                    totalIn: result.totalIn,
+                    totalOut: result.totalOut,
+                    uncompressedSize: UInt64(buf.count),
+                    blockSize: blockSizeLocal
+                )
+            }
+
+            // Drain in input order — preserves the on-disk entry
+            // sequence and lets `KnitWriter`'s append-only API stay
+            // exactly as-is.
+            for pe in processed {
+                let header = KnitWriter.EntryHeader(
+                    name: pe.entry.relativePath,
+                    modificationDate: pe.entry.modificationDate,
+                    unixMode: pe.entry.unixMode,
+                    isDirectory: false
+                )
+                let se = try writer.beginStreamingEntry(
+                    header: header,
+                    uncompressedSize: pe.uncompressedSize,
+                    blockSize: UInt32(pe.blockSize),
+                    numBlocks: UInt32(pe.frames.count)
+                )
+                for frame in pe.frames {
+                    try se.writeBlock(frame)
+                }
+                try se.finish(crc32: pe.crc32)
+                bytesIn += pe.totalIn
+                bytesOut += pe.totalOut
+            }
+
+            i = j
         }
 
         try writer.close()
@@ -168,4 +255,60 @@ public final class KnitCompressor: Sendable {
             elapsed: elapsed.timeIntervalSeconds
         )
     }
+
+    /// Serial streaming path used for entries large enough to keep
+    /// the worker pool saturated on their own. Identical to the v2
+    /// (pre-entry-parallelism) flow: open the streaming entry, run
+    /// `streamer.compress` with a sink that writes each frame
+    /// straight to the archive as it's produced, then finish with
+    /// the entry CRC.
+    private func compressLargeEntryStreaming(
+        entry: FileEntry,
+        writer: KnitWriter,
+        streamer: StreamingBlockCompressor,
+        level: Int32
+    ) throws -> StreamingBlockCompressor.Output {
+        let header = KnitWriter.EntryHeader(
+            name: entry.relativePath,
+            modificationDate: entry.modificationDate,
+            unixMode: entry.unixMode,
+            isDirectory: false
+        )
+        let mapped = try MappedFile(url: entry.absoluteURL)
+        let buf = mapped.buffer
+        let numBlocks = (buf.count + options.blockSize - 1) / options.blockSize
+        let streamEntry = try writer.beginStreamingEntry(
+            header: header,
+            uncompressedSize: UInt64(buf.count),
+            blockSize: UInt32(options.blockSize),
+            numBlocks: UInt32(numBlocks)
+        )
+        let result = try streamer.compress(
+            buf,
+            level: level,
+            entropyDowngradeEnabled: options.entropyProbeEnabled,
+            heatmapRecorder: options.heatmapRecorder,
+            progressReporter: options.progressReporter,
+            analytics: options.stageAnalytics
+        ) { _, frame in
+            try streamEntry.writeBlock(frame)
+        }
+        try streamEntry.finish(crc32: result.crc32)
+        return result
+    }
+}
+
+/// Buffered result of compressing one small entry under the parallel
+/// batch path. `Sendable` because it crosses the `concurrentMap`
+/// boundary; all fields are value types or already-Sendable
+/// references (`FileEntry` is a Sendable struct, `Data` is a value
+/// type, `[Data]` is Sendable for Sendable Element).
+private struct SmallEntryResult: Sendable {
+    let entry: FileEntry
+    let frames: [Data]
+    let crc32: UInt32
+    let totalIn: UInt64
+    let totalOut: UInt64
+    let uncompressedSize: UInt64
+    let blockSize: Int
 }
