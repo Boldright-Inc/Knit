@@ -258,10 +258,33 @@ guard let appImage = loadCGImage(appPNGURL) else {
     FileHandle.standardError.write("error: couldn't decode \(appPNGURL.path)\n".data(using: .utf8)!)
     exit(1)
 }
-print(">> app-icon source: \(appPNGURL.path) (\(appImage.width)x\(appImage.height))")
+
+// Surface what we actually loaded — most of the "background looks gray
+// in the Dock" reports turn out to be a transparent-background source
+// PNG that visually appeared white in Preview because Preview composites
+// alpha against its own light-mode chrome. Print the alpha presence so
+// the user can sanity-check.
+let alphaInfo = appImage.alphaInfo
+let hasAlpha = (alphaInfo == .first || alphaInfo == .last
+              || alphaInfo == .premultipliedFirst || alphaInfo == .premultipliedLast)
+print(">> app-icon source: \(appPNGURL.path) (\(appImage.width)x\(appImage.height), alpha=\(hasAlpha ? "yes" : "no"))")
+if hasAlpha {
+    print("   note: source has alpha — AppIcon canvas will be pre-filled opaque white")
+    print("         so transparent regions composite against pure white, not the Dock blur.")
+}
 
 print(">> writing AppIcon.iconset (from app-icon.png)")
 try writeIconset(name: "AppIcon", into: outDir) { ctx, size in
+    // Pre-fill opaque white before drawing the PNG. Without this, any
+    // transparent pixels in the source (most user-supplied logo PNGs
+    // have transparent backgrounds) stay alpha=0 in the rendered
+    // iconset, and macOS's Dock blur shows through as a soft gray
+    // gradient halo. Filling white forces those pixels to composite
+    // against pure white instead — matching the "background should
+    // be pure white" intent and the way Preview.app already shows
+    // the source PNG.
+    ctx.setFillColor(CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0))
+    ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
     ctx.draw(appImage, in: CGRect(x: 0, y: 0, width: size, height: size))
 }
 

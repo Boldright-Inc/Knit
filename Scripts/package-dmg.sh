@@ -24,7 +24,17 @@ DEVELOPER_ID="${DEVELOPER_ID:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 
 # 1. Build release binary
-( cd "${ROOT_DIR}" && swift build -c release )
+#    Always wipe `.build/` first. SwiftPM caches `.pcm` modules with the
+#    *absolute* repo path baked in, so anyone who has ever moved the
+#    project directory (rename, clone elsewhere, switch from Xcode to a
+#    fresh checkout, etc.) ends up with an error like:
+#       "precompiled file ... was compiled with module cache path
+#        '/Users/.../old-path/...' but the path is currently
+#        '/Users/.../new-path/...'"
+#    Distribution builds should always be reproducible from a clean
+#    state anyway, so the cost of re-compiling libdeflate / libzstd
+#    here is acceptable.
+( cd "${ROOT_DIR}" && rm -rf .build && swift build -c release )
 BIN="${ROOT_DIR}/.build/release/knit"
 
 # 2. Build Quick Actions
