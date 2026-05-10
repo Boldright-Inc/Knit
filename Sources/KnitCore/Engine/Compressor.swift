@@ -1,24 +1,44 @@
 import Foundation
 
+/// Aggregate result of one compression run. Surfaces both the raw counts
+/// and a derived MB/s figure for the CLI's status print and the bench
+/// harness.
 public struct CompressionStats: Sendable {
     public let entriesWritten: Int
     public let bytesIn: UInt64
     public let bytesOut: UInt64
     public let elapsed: TimeInterval
 
+    /// Throughput measured against *uncompressed* input bytes — the
+    /// number users care about, since it tracks "how fast did the tool
+    /// chew through my data".
     public var inputThroughputMBPerSec: Double {
         guard elapsed > 0 else { return 0 }
         return Double(bytesIn) / 1_000_000.0 / elapsed
     }
 
+    /// Compressed/uncompressed ratio in [0, 1]. Lower is better.
     public var ratio: Double {
         guard bytesIn > 0 else { return 0 }
         return Double(bytesOut) / Double(bytesIn)
     }
 }
 
-/// High-level compression orchestrator. Reads files, fans out to a backend,
-/// writes results into a streaming `ZipWriter`.
+/// High-level orchestrator for the ZIP path. Operates as a two-stage
+/// pipeline:
+///
+///   1. **Concurrent prepare** (fan-out): each entry is mmap'd, optionally
+///      entropy-screened, compressed via the supplied backend, and turned
+///      into a `PreparedEntry` — all in parallel via `concurrentMap`.
+///   2. **Serial write**: the prepared entries are streamed into
+///      `ZipWriter` in walk order so local-header offsets stay
+///      monotonically increasing (a ZIP requirement that simplifies
+///      central-directory construction).
+///
+/// Splitting the pipeline this way means the codec runs N-way parallel
+/// while the I/O writer remains single-threaded, which keeps both the
+/// archive layout deterministic and the file handle's mutation
+/// well-defined.
 public final class ZipCompressor: Sendable {
 
     public struct Options: Sendable {
@@ -262,6 +282,8 @@ public final class ZipCompressor: Sendable {
 
 // MARK: - Concurrent map helper
 
+/// Shared mutable result + error state for `concurrentMap`. `@unchecked
+/// Sendable` is correct because every access goes through `lock`.
 private final class ConcurrentMapState<V: Sendable>: @unchecked Sendable {
     var results: [V?]
     var firstError: Error?
@@ -269,8 +291,16 @@ private final class ConcurrentMapState<V: Sendable>: @unchecked Sendable {
     init(count: Int) { self.results = Array(repeating: nil, count: count) }
 }
 
-/// Apply `transform` to each element of `items` using a concurrent dispatch
-/// queue, preserving input order in the result. Throws the first error seen.
+/// Apply `transform` to each element of `items` concurrently, preserving
+/// input order in the result. Order preservation matters: the ZIP layout
+/// relies on monotonically increasing local-header offsets, so we can't
+/// just append results as workers finish.
+///
+/// On the first thrown error, in-flight tasks complete normally but no
+/// new ones start. The first observed error is rethrown to the caller.
+/// We chose this over a fully cancelling design because the codec calls
+/// are short-lived (1 MiB blocks) and a few extra completions cost less
+/// than wiring cancellation through libdeflate / libzstd.
 func concurrentMap<T: Sendable, U: Sendable>(
     _ items: [T],
     concurrency: Int,
@@ -280,6 +310,8 @@ func concurrentMap<T: Sendable, U: Sendable>(
     let state = ConcurrentMapState<U>(count: items.count)
     let queue = DispatchQueue(label: "co.boldright.knit.concurrent",
                               attributes: .concurrent)
+    // Semaphore caps simultaneous executions to `concurrency` regardless
+    // of how many GCD threads the queue happens to spin up.
     let semaphore = DispatchSemaphore(value: concurrency)
     let group = DispatchGroup()
 

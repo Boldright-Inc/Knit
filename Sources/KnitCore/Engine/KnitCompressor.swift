@@ -1,5 +1,15 @@
 import Foundation
 
+/// Orchestrator for the `.knit` path.
+///
+/// Unlike `ZipCompressor`, the entry-level loop here is **serial** because
+/// `KnitWriter` is append-only and we want deterministic on-disk layout.
+/// The parallelism instead happens *inside* each entry: a single large
+/// file is split into many independent zstd-frame blocks, all of which
+/// compress in parallel via `ParallelBlockCompressor`.
+///
+/// This shape suits the `.knit` use-case (often "one or a handful of very
+/// large files") better than the ZIP shape (often "many small files").
 public final class KnitCompressor: Sendable {
 
     public struct Options: Sendable {

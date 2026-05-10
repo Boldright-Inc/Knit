@@ -1,3 +1,15 @@
+// CLI front-end for KnitCore. Five subcommands:
+//
+//   info        — environment + linked codec versions
+//   metal-info  — Metal device probe and a CRC32 self-test
+//   zip         — produce a standard ZIP (DEFLATE)
+//   pack        — produce a .knit (block-parallel zstd)
+//   unpack      — extract a .knit archive (CRC-verified)
+//
+// Argument parsing is delegated to swift-argument-parser. Each subcommand
+// is responsible only for translating flags into a `KnitCore` invocation
+// and printing the resulting stats — all real work lives in KnitCore.
+
 import Foundation
 import ArgumentParser
 import KnitCore

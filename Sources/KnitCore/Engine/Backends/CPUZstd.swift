@@ -2,10 +2,15 @@ import Foundation
 import CZstd
 import CDeflate
 
-/// A backend that compresses contiguous chunks (blocks) into independent zstd frames.
+/// A backend that compresses contiguous chunks (blocks) into independent
+/// zstd frames. The `.knit` container relies on this property: each block
+/// is a complete, self-describing zstd frame that can be decoded in
+/// isolation, enabling random-access seeking and trivially parallel
+/// decompression.
 ///
-/// Concatenated zstd frames are a valid zstd stream — `zstd -d` will decompress
-/// them as one logical output, exactly like multiple gzip members.
+/// Concatenated zstd frames are also a valid zstd stream, so a `.knit`
+/// payload section can be piped straight into `zstd -d` and will decode as
+/// one logical output (the same way multiple gzip members chain).
 public protocol BlockBackend: Sendable {
     var name: String { get }
 
@@ -13,12 +18,17 @@ public protocol BlockBackend: Sendable {
     func compressBlock(_ input: UnsafeBufferPointer<UInt8>, level: Int32) throws -> Data
 }
 
+/// CPU zstd via the vendored libzstd. CRC32 lives on the same type because
+/// `KnitCompressor` requires both protocols on its backend (the writer
+/// needs per-entry CRC alongside the codec).
 public struct CPUZstd: BlockBackend, CRC32Computing {
     public let name = "cpu-zstd"
     public init() {}
 
     public func compressBlock(_ input: UnsafeBufferPointer<UInt8>, level: Int32) throws -> Data {
         if input.count == 0 { return Data() }
+        // ZSTD_compressBound is tight (input + ~14 bytes), so one-shot
+        // sizing avoids the retry-on-overflow loop that streaming APIs need.
         let bound = ZSTD_compressBound(input.count)
         var out = Data(count: bound)
         let produced: Int = out.withUnsafeMutableBytes { (buf: UnsafeMutableRawBufferPointer) -> Int in
@@ -39,13 +49,20 @@ public struct CPUZstd: BlockBackend, CRC32Computing {
     }
 }
 
-/// Splits an input buffer into fixed-size blocks, compresses each in parallel
-/// using a `BlockBackend`, and returns concatenated frames + per-block sizes.
+/// Splits an input buffer into fixed-size blocks, compresses each in
+/// parallel using a `BlockBackend`, and returns the concatenated frames
+/// plus the per-block compressed sizes.
+///
+/// `blockSizes` is what makes the random-access decode possible: the
+/// `.knit` reader uses it to compute each block's offset inside the
+/// payload section without parsing any zstd frames first.
 public struct ParallelBlockCompressor {
 
     public struct Output {
         public var combined: Data
-        public var blockSizes: [UInt32]   // compressed size of each block, in order
+        /// Compressed bytes per block, in input order. Sum equals
+        /// `combined.count`; written into the `.knit` entry header.
+        public var blockSizes: [UInt32]
         public var totalIn: UInt64
         public var totalOut: UInt64
     }
