@@ -27,17 +27,22 @@ public final class KnitCompressor: Sendable {
         /// lvl=1 even if the user requested higher — match search is pure
         /// overhead on incompressible data.
         public var entropyProbeEnabled: Bool
+        /// Optional progress sink. The compressor calls `advance(by:)`
+        /// once per block written, in input-byte units.
+        public var progressReporter: ProgressReporter?
 
         public init(level: CompressionLevel = .default,
                     concurrency: Int = ProcessInfo.processInfo.activeProcessorCount,
                     blockSize: Int = Int(KnitFormat.defaultBlockSize),
                     heatmapRecorder: HeatmapRecorder? = nil,
-                    entropyProbeEnabled: Bool = true) {
+                    entropyProbeEnabled: Bool = true,
+                    progressReporter: ProgressReporter? = nil) {
             self.level = level
             self.concurrency = max(1, concurrency)
             self.blockSize = blockSize
             self.heatmapRecorder = heatmapRecorder
             self.entropyProbeEnabled = entropyProbeEnabled
+            self.progressReporter = progressReporter
         }
     }
 
@@ -112,7 +117,8 @@ public final class KnitCompressor: Sendable {
                 buf,
                 level: baseLevel,
                 entropyDowngradeEnabled: options.entropyProbeEnabled,
-                heatmapRecorder: options.heatmapRecorder
+                heatmapRecorder: options.heatmapRecorder,
+                progressReporter: options.progressReporter
             ) { _, frame in
                 try streamEntry.writeBlock(frame)
             }

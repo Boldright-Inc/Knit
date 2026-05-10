@@ -55,17 +55,22 @@ public final class ZipCompressor: Sendable {
         /// store the raw bytes when the entry's overall entropy exceeds the
         /// incompressibility threshold.
         public var entropyProbeEnabled: Bool
+        /// Optional progress sink. The compressor calls `advance(by:)`
+        /// once per finished entry, in input-byte units.
+        public var progressReporter: ProgressReporter?
 
         public init(level: CompressionLevel = .default,
                     concurrency: Int = ProcessInfo.processInfo.activeProcessorCount,
                     mmapThreshold: Int = 4 * 1024 * 1024,
                     heatmapRecorder: HeatmapRecorder? = nil,
-                    entropyProbeEnabled: Bool = true) {
+                    entropyProbeEnabled: Bool = true,
+                    progressReporter: ProgressReporter? = nil) {
             self.level = level
             self.concurrency = max(1, concurrency)
             self.mmapThreshold = mmapThreshold
             self.heatmapRecorder = heatmapRecorder
             self.entropyProbeEnabled = entropyProbeEnabled
+            self.progressReporter = progressReporter
         }
     }
 
@@ -92,11 +97,17 @@ public final class ZipCompressor: Sendable {
 
         // Stage 1: concurrently produce per-entry compressed payloads.
         // Stage 2: write to ZIP serially in walk order.
+        let reporter = options.progressReporter
         let prepared: [PreparedEntry] = try concurrentMap(
             entries,
             concurrency: options.concurrency
         ) { entry in
-            try self.prepare(entry: entry)
+            let p = try self.prepare(entry: entry)
+            // ZIP path is per-entry; advance by uncompressed size as
+            // each entry finishes its codec pass. The reporter sees
+            // bumps roughly in walk order modulo concurrency.
+            reporter?.advance(by: p.uncompressedSize)
+            return p
         }
 
         for p in prepared {

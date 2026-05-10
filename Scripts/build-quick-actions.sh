@@ -121,29 +121,67 @@ PYEOF
 TMP="$(mktemp -d)"
 trap 'rm -rf "${TMP}"' EXIT
 
+# Each Quick Action spawns a temporary Terminal window so the user can
+# see Knit's `--progress` bar for long-running operations. The window
+# auto-exits the shell on completion; whether macOS auto-closes the
+# window after that depends on Terminal > Settings > Profiles > Shell
+# ("Close the window — When the shell exits cleanly" or "Always").
+# Either way, the operation runs to completion regardless of the user's
+# Terminal preference.
+
 cat > "${TMP}/zip.sh" <<'BS'
-for f in "$@"; do
-  /usr/local/bin/knit zip "$f" --parallel --level 6 -o "${f}.zip" 2>>/tmp/knit-quickaction.log
-done
-osascript -e "display notification \"Compressed $# item(s) to .zip\" with title \"Knit\"" >/dev/null
+RUNNER="$(mktemp -t knit_zip_runner)"
+{
+  echo '#!/bin/zsh'
+  echo 'set -u'
+  for f in "$@"; do
+    printf '/usr/local/bin/knit zip %q --parallel --level 6 --progress -o %q\n' "$f" "${f}.zip"
+  done
+  echo 'printf "\\n[Done. Press ⌘W to close.]\\n"'
+  echo "rm -f -- '${RUNNER}'"
+  echo 'exit 0'
+} > "${RUNNER}"
+chmod +x "${RUNNER}"
+osascript -e "tell application \"Terminal\" to activate" \
+          -e "tell application \"Terminal\" to do script \"${RUNNER}\"" >/dev/null
 BS
 
 cat > "${TMP}/bzx.sh" <<'BS'
-for f in "$@"; do
-  /usr/local/bin/knit pack "$f" --level 3 -o "${f}.knit" 2>>/tmp/knit-quickaction.log
-done
-osascript -e "display notification \"Compressed $# item(s) to .knit\" with title \"Knit\"" >/dev/null
+RUNNER="$(mktemp -t knit_pack_runner)"
+{
+  echo '#!/bin/zsh'
+  echo 'set -u'
+  for f in "$@"; do
+    printf '/usr/local/bin/knit pack %q --level 3 --progress -o %q\n' "$f" "${f}.knit"
+  done
+  echo 'printf "\\n[Done. Press ⌘W to close.]\\n"'
+  echo "rm -f -- '${RUNNER}'"
+  echo 'exit 0'
+} > "${RUNNER}"
+chmod +x "${RUNNER}"
+osascript -e "tell application \"Terminal\" to activate" \
+          -e "tell application \"Terminal\" to do script \"${RUNNER}\"" >/dev/null
 BS
 
 cat > "${TMP}/extract.sh" <<'BS'
-for f in "$@"; do
-  dir="$(dirname "$f")"
-  case "$f" in
-    *.knit) /usr/local/bin/knit unpack "$f" -o "$dir" 2>>/tmp/knit-quickaction.log ;;
-    *.zip) /usr/bin/unzip -q -o "$f" -d "$dir" 2>>/tmp/knit-quickaction.log ;;
-  esac
-done
-osascript -e "display notification \"Extracted $# item(s)\" with title \"Knit\"" >/dev/null
+RUNNER="$(mktemp -t knit_extract_runner)"
+{
+  echo '#!/bin/zsh'
+  echo 'set -u'
+  for f in "$@"; do
+    dir="$(dirname "$f")"
+    case "$f" in
+      *.knit) printf '/usr/local/bin/knit unpack %q --progress -o %q\n' "$f" "$dir" ;;
+      *.zip)  printf '/usr/bin/unzip -o %q -d %q\n' "$f" "$dir" ;;
+    esac
+  done
+  echo 'printf "\\n[Done. Press ⌘W to close.]\\n"'
+  echo "rm -f -- '${RUNNER}'"
+  echo 'exit 0'
+} > "${RUNNER}"
+chmod +x "${RUNNER}"
+osascript -e "tell application \"Terminal\" to activate" \
+          -e "tell application \"Terminal\" to do script \"${RUNNER}\"" >/dev/null
 BS
 
 emit_workflow "Knit Compress (ZIP)"  "${TMP}/zip.sh"

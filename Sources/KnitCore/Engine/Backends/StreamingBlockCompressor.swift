@@ -71,6 +71,7 @@ public struct StreamingBlockCompressor {
         level: Int32,
         entropyDowngradeEnabled: Bool = true,
         heatmapRecorder: HeatmapRecorder? = nil,
+        progressReporter: ProgressReporter? = nil,
         sink: (_ blockIdx: Int, _ frame: Data) throws -> Void
     ) throws -> Output {
         if input.count == 0 {
@@ -165,6 +166,10 @@ public struct StreamingBlockCompressor {
                 try sink(pb.absoluteIdx, pb.frame)
                 blockSizes[pb.absoluteIdx] = UInt32(pb.frame.count)
                 totalOut += UInt64(pb.frame.count)
+                // Record uncompressed bytes processed — this matches what
+                // the user's mental model of "how much of my file is
+                // done" expects (the input side, not the encoder output).
+                progressReporter?.advance(by: UInt64(pb.originalSize))
                 if firstBlock {
                     combinedCRC = pb.blockCrc
                     firstBlock = false

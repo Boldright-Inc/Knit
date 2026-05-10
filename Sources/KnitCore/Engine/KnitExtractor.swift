@@ -29,8 +29,15 @@ public final class KnitExtractor {
     /// hot so the cost is dominated by the GPU dispatch + compute, not I/O.
     public var useGPUVerify: Bool
 
-    public init(useGPUVerify: Bool = true) {
+    /// Optional progress sink. Receives one `advance(by:)` call per
+    /// decompressed block, plus a final per-entry catch-up so the line
+    /// reaches 100% even when the verify path runs.
+    public var progressReporter: ProgressReporter?
+
+    public init(useGPUVerify: Bool = true,
+                progressReporter: ProgressReporter? = nil) {
         self.useGPUVerify = useGPUVerify
+        self.progressReporter = progressReporter
     }
 
     public func extract(archive: URL, to destDir: URL) throws -> Stats {
@@ -47,7 +54,10 @@ public final class KnitExtractor {
         var bytesOut: UInt64 = 0
         for entry in reader.archive.entries {
             let outURL = try SafePath.resolve(name: entry.name, into: destDir)
-            try reader.extract(entry, to: outURL, gpuCRC: gpuCRC)
+            try reader.extract(entry,
+                               to: outURL,
+                               gpuCRC: gpuCRC,
+                               progressReporter: progressReporter)
             bytesOut += entry.uncompressedSize
             if gpuCRC != nil, entry.uncompressedSize >= 4 * 1024 * 1024 {
                 gpuUsed = true
