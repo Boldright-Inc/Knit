@@ -308,6 +308,11 @@ extension KnitCommand {
               help: "Suppress the live progress bar even when stderr is a terminal.")
         var noProgress: Bool = false
 
+        @Flag(name: .customLong("analyze"),
+              help: ArgumentHelp("Print decode-stage timing breakdown to stderr (internal).",
+                                 visibility: .private))
+        var analyze: Bool = false
+
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
             let outURL = URL(fileURLWithPath: output).standardizedFileURL
@@ -329,8 +334,18 @@ extension KnitCommand {
                 reporter?.finish()
                 printer?.waitUntilFlushed()
             }
+            // `--analyze` is a hidden flag for diagnosing where decode
+            // wall time is going on a user's host. When set, we hand a
+            // `DecodeAnalytics` accumulator to the extractor; after the
+            // extract finishes we render its snapshot to stderr. The
+            // numbers tell us which decode stage the spare GPU should
+            // accelerate next (CRC fold? literal Huffman? write
+            // overlap?). Without this flag the decoder pays no
+            // instrumentation cost.
+            let analytics: DecodeAnalytics? = analyze ? DecodeAnalytics() : nil
             let extractor = KnitExtractor(useGPUVerify: !noGpuVerify,
-                                          progressReporter: reporter)
+                                          progressReporter: reporter,
+                                          analytics: analytics)
             let stats = try extractor.extract(archive: inputURL, to: outURL)
             // Drain the printer thread before the result summary — see the
             // matching comment in the `Zip` subcommand for rationale.
@@ -341,6 +356,14 @@ extension KnitCommand {
             print(String(format: "  time:  %10.3f s", stats.elapsed))
             let verifier = stats.gpuVerifyUsed ? "GPU (Metal)" : "CPU (libdeflate)"
             print("  verify: \(verifier)")
+            if let analytics = analytics {
+                let snap = analytics.snapshot()
+                let report = CLIAnalyze.render(snap,
+                                               extractElapsed: stats.elapsed,
+                                               bytesOut: stats.bytesOut,
+                                               entries: stats.entries)
+                FileHandle.standardError.write(Data(report.utf8))
+            }
         }
     }
 }
