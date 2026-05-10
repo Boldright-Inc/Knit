@@ -332,6 +332,20 @@ func concurrentMap<T: Sendable, U: Sendable>(
     _ transform: @escaping @Sendable (T) throws -> U
 ) throws -> [U] {
     if items.isEmpty { return [] }
+
+    // Serial fast path. With `concurrency <= 1` (or a single item)
+    // the parallel machinery — `DispatchQueue` creation,
+    // `DispatchSemaphore`, `DispatchGroup`, async dispatch — is pure
+    // overhead. The fast path matters in nested-parallel scenarios:
+    // `KnitExtractor`'s parallel-batch unpack constructs per-worker
+    // `HybridZstdBatchDecoder`s with `concurrency: 1` (the outer
+    // entry-level `concurrentMap` is the source of parallelism), so
+    // each of 100 k decode calls would otherwise allocate a brand
+    // new `DispatchQueue` for one task.
+    if concurrency <= 1 || items.count == 1 {
+        return try items.map(transform)
+    }
+
     let state = ConcurrentMapState<U>(count: items.count)
     let queue = DispatchQueue(label: "co.boldright.knit.concurrent",
                               attributes: .concurrent)
