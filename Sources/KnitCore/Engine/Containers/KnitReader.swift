@@ -122,10 +122,21 @@ public final class KnitReader {
     /// `progressReporter`, if supplied, has `advance(by:)` called with the
     /// number of *uncompressed* bytes after each block is decompressed and
     /// written to disk.
+    ///
+    /// `stagedDecoder`, if supplied, routes the per-block decode through a
+    /// `HybridZstdBatchDecoder` — the orchestration layer that the GPU
+    /// codec roadmap (Phase 1b → 2) will plug GPU `BlockDecoding`
+    /// implementations into. With a CPU-only `BlockDecoding` it behaves
+    /// identically to the direct libzstd path apart from staging a batch
+    /// of decoded bytes in RAM and folding their CRC before writing them
+    /// to disk — that staging discipline is what makes the GPU path safe
+    /// later. Pass `nil` (default) to use the existing direct-libzstd
+    /// loop with no batching overhead.
     public func extract(_ entry: KnitEntry,
                         to outURL: URL,
                         gpuCRC: MetalCRC32? = nil,
-                        progressReporter: ProgressReporter? = nil) throws {
+                        progressReporter: ProgressReporter? = nil,
+                        stagedDecoder: HybridZstdBatchDecoder? = nil) throws {
         if entry.isDirectory {
             try FileManager.default.createDirectory(at: outURL,
                                                     withIntermediateDirectories: true)
@@ -137,6 +148,22 @@ public final class KnitReader {
         FileManager.default.createFile(atPath: outURL.path, contents: nil)
         let outHandle = try FileHandle(forWritingTo: outURL)
         defer { try? outHandle.close() }
+
+        // Opt-in staged path: build (frame, uncompressedSize) per block
+        // and hand the whole list to the hybrid decoder, which stages
+        // each batch in RAM, folds CRC against the entry's recorded
+        // value, and only then commits to disk via the sink. The
+        // existing direct-libzstd loop below is the default and behaves
+        // exactly as before.
+        if let staged = stagedDecoder {
+            try extractViaStagedDecoder(entry: entry,
+                                        outHandle: outHandle,
+                                        decoder: staged,
+                                        progressReporter: progressReporter)
+            try outHandle.synchronize()
+            try verifyCRC(entry: entry, outURL: outURL, gpuCRC: gpuCRC)
+            return
+        }
 
         var srcOffset = Int(entry.dataOffset)
         var totalDecompressed: UInt64 = 0
@@ -205,6 +232,63 @@ public final class KnitReader {
         try outHandle.synchronize()
 
         try verifyCRC(entry: entry, outURL: outURL, gpuCRC: gpuCRC)
+    }
+
+    /// Drive the entry's decode through a `HybridZstdBatchDecoder`. The
+    /// staged decoder's sink writes each decoded block to `outHandle`
+    /// in input order, exactly like the direct-libzstd loop, except
+    /// the orchestrator first verifies a per-batch CRC fold and only
+    /// then commits. Identical on-disk output; one RAM-bounded staging
+    /// step extra. The point of this path isn't faster CPU decoding —
+    /// it's that the same orchestration is what plugs GPU
+    /// `BlockDecoding` implementations in safely later.
+    private func extractViaStagedDecoder(entry: KnitEntry,
+                                         outHandle: FileHandle,
+                                         decoder: HybridZstdBatchDecoder,
+                                         progressReporter: ProgressReporter?) throws {
+        // Build the per-block frame slices into the mmap'd archive.
+        // Bounds-check `compressed_size` cumulatively so a hostile
+        // header can't make us walk past the mapped buffer.
+        let blockCap = max(Int(entry.blockSize), 1)
+        var blocks: [UnsafeBufferPointer<UInt8>] = []
+        var sizes: [Int] = []
+        blocks.reserveCapacity(entry.blockLengths.count)
+        sizes.reserveCapacity(entry.blockLengths.count)
+
+        var srcOffset = Int(entry.dataOffset)
+        var declaredRemaining = Int(min(entry.uncompressedSize, UInt64(Int.max)))
+        for blockLen in entry.blockLengths {
+            let inLen = Int(blockLen)
+            let inPtr = mapped.pointer.advanced(by: srcOffset)
+            blocks.append(UnsafeBufferPointer(start: inPtr, count: inLen))
+
+            // Each block's declared uncompressed size is the lesser of
+            // `block_size` and what's left of `uncompressed_size`.
+            let outSize = min(blockCap, declaredRemaining)
+            guard outSize >= 0 else {
+                throw KnitError.formatError(
+                    ".knit: block declared size underflow in \(entry.name)"
+                )
+            }
+            sizes.append(outSize)
+            declaredRemaining -= outSize
+            srcOffset += inLen
+        }
+
+        let stats = try decoder.decode(blocks: blocks,
+                                       blockSizes: sizes,
+                                       expectedCRC32: entry.crc32) { _, bytes in
+            // Defensive: never write past the declared total even if a
+            // future bug shrinks/grows a block under us.
+            try outHandle.write(contentsOf: Data(buffer: bytes))
+            progressReporter?.advance(by: UInt64(bytes.count))
+        }
+
+        if stats.totalBytes != entry.uncompressedSize {
+            throw KnitError.integrity(
+                "size mismatch for \(entry.name): expected \(entry.uncompressedSize), got \(stats.totalBytes)"
+            )
+        }
     }
 
     /// Recompute the CRC32 of the just-written file and compare against
