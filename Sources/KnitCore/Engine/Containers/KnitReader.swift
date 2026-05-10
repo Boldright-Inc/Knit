@@ -275,22 +275,37 @@ public final class KnitReader {
             srcOffset += inLen
         }
 
+        // Bypass the macOS unified buffer cache for this output file.
+        // Without this, an 80 GB unpack accumulates ~64 GB of dirty
+        // page-cache pages before the kernel begins flushing, on top
+        // of the ~50 GB the read-only mmap of the archive holds. On a
+        // 128 GB M5 Max this exceeds RAM, the kernel engages its
+        // page-compressor, and a per-task `cpt_mapcnt` reference
+        // counter on shared compressed pages overflows under high
+        // worker concurrency — kernel panic. With `F_NOCACHE` writes
+        // go straight to the NVMe controller's own write cache, peak
+        // RSS stays bounded, and the panic vector is closed.
+        // Best-effort: a filesystem that doesn't support direct I/O
+        // simply falls back to the cached path (no failure mode worse
+        // than the pre-fix behaviour).
+        _ = fcntl(outHandle.fileDescriptor, F_NOCACHE, 1)
+
         let stats = try decoder.decode(blocks: blocks,
                                        blockSizes: sizes,
                                        expectedCRC32: entry.crc32) { batchBytes in
-            // One write per batch instead of per block. The decoder's
-            // staging buffer is contiguous and lives across the sink
-            // call, so we wrap it via `bytesNoCopy` with a no-op
-            // deallocator — no allocation, no memcpy. With a 64-block
-            // batch this collapses 64 syscalls into 1; on the M5 Max
-            // bench it's the difference between 178 % CPU (workers
-            // idle waiting on syscalls) and saturating the SSD.
-            guard let base = batchBytes.baseAddress else { return }
-            let mut = UnsafeMutableRawPointer(mutating: base)
-            let data = Data(bytesNoCopy: mut,
-                            count: batchBytes.count,
-                            deallocator: .none)
-            try outHandle.write(contentsOf: data)
+            // One write per batch (still ~64× fewer syscalls than the
+            // historical per-block path), but back to `Data(buffer:)`
+            // — i.e. a fresh ARC-managed copy each time. The previous
+            // `Data(bytesNoCopy:..., deallocator: .none)` lets
+            // Foundation alias the staging buffer's pages into kernel
+            // space via vm_remap for "zero-copy" writes; under the
+            // worker-concurrency this code drives, that path raised
+            // the per-page reference count fast enough to trip the
+            // kernel's `cpt_mapcnt` limit and panic the host. A copy
+            // costs ~3 s of memcpy across 80 GB on M5 Max, which is
+            // the safety margin we pay to keep user buffers and
+            // kernel buffers in disjoint physical pages.
+            try outHandle.write(contentsOf: Data(buffer: batchBytes))
             progressReporter?.advance(by: UInt64(batchBytes.count))
         }
 
