@@ -111,12 +111,16 @@ public final class HybridZstdBatchDecoder {
     public init(cpuPath: BlockDecoding = CPUZstdDecoder(),
                 gpuPath: BlockDecoding? = nil,
                 maxBatchBlocks: Int = 64,
-                concurrency: Int = ProcessInfo.processInfo.activeProcessorCount) {
+                concurrency: Int = ProcessInfo.processInfo.activeProcessorCount,
+                analytics: DecodeAnalytics? = nil) {
         self.cpuPath = cpuPath
         self.gpuPath = gpuPath?.supportsGPU == true ? gpuPath : nil
         self.maxBatchBlocks = max(1, maxBatchBlocks)
         self.concurrency = max(1, concurrency)
+        self.analytics = analytics
     }
+
+    private let analytics: DecodeAnalytics?
 
     /// True if the orchestrator will route any block through the GPU
     /// path on this entry. Surfaced for telemetry and the unpack stats
@@ -139,6 +143,8 @@ public final class HybridZstdBatchDecoder {
                        sink: Sink) throws -> Stats {
         precondition(blocks.count == uncompressedSizes.count,
                      "block / size array length mismatch")
+
+        analytics?.startWallClock()
 
         // Reset per-entry adaptive state. The decoder is intended to be
         // shared across an archive's entries (one allocation, many
@@ -237,13 +243,17 @@ public final class HybridZstdBatchDecoder {
         // this peaks at ~64 MiB — bounded irrespective of file size.
         let stagedTotal = (range.lowerBound..<range.upperBound)
             .reduce(0) { $0 + uncompressedSizes[$1] }
+        let allocStart = ContinuousClock.now
         var staging = [UInt8](repeating: 0, count: stagedTotal)
+        analytics?.record(stage: "staging.alloc",
+                          seconds: (ContinuousClock.now - allocStart).timeIntervalSeconds)
 
         let useGPU = !poisonedThisEntry && gpuPath != nil
         var fallbackThisBatch = 0
         let primary = useGPU ? gpuPath! : cpuPath
 
         do {
+            let decodeStart = ContinuousClock.now
             try staging.withUnsafeMutableBufferPointer { stage in
                 fallbackThisBatch = try parallelDecodeBlocks(
                     blocks: blocks,
@@ -254,6 +264,8 @@ public final class HybridZstdBatchDecoder {
                     staging: stage
                 )
             }
+            analytics?.record(stage: "parallel.decode",
+                              seconds: (ContinuousClock.now - decodeStart).timeIntervalSeconds)
         } catch {
             // Whole-batch failure path: re-decode the entire batch
             // through CPU and try again. If that also fails, propagate.
@@ -267,18 +279,27 @@ public final class HybridZstdBatchDecoder {
 
         // Fold the batch's CRC against the running entry CRC.
         var nextRollingCRC = rollingCRC
+        let crcStart = ContinuousClock.now
         staging.withUnsafeBufferPointer { buf in
             nextRollingCRC = UInt32(libdeflate_crc32(UInt32(nextRollingCRC),
                                                     buf.baseAddress,
                                                     buf.count))
         }
+        analytics?.record(stage: "crc.fold",
+                          seconds: (ContinuousClock.now - crcStart).timeIntervalSeconds)
 
         // Commit: hand the entire staged batch to the sink as one
         // contiguous slice. Per-batch (not per-block) — see the Sink
         // typealias commentary for why.
+        let sinkStart = ContinuousClock.now
         try staging.withUnsafeBufferPointer { stage in
             try sink(stage)
         }
+        analytics?.record(stage: "sink",
+                          seconds: (ContinuousClock.now - sinkStart).timeIntervalSeconds)
+
+        analytics?.recordBatch(bytes: UInt64(stagedTotal),
+                               fallback: fallbackThisBatch)
 
         return BatchResult(
             bytesWritten: UInt64(stagedTotal),

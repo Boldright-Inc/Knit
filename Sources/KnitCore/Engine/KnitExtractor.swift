@@ -45,12 +45,20 @@ public final class KnitExtractor {
     /// serial decode (mostly useful in tests).
     public var concurrency: Int
 
+    /// Optional per-stage timing accumulator. Wired through to the
+    /// staged decoder; nil = no instrumentation overhead. Driven by
+    /// the CLI's hidden `--analyze` flag, which renders the snapshot
+    /// after extract finishes.
+    public var analytics: DecodeAnalytics?
+
     public init(useGPUVerify: Bool = true,
                 progressReporter: ProgressReporter? = nil,
-                concurrency: Int = ProcessInfo.processInfo.activeProcessorCount) {
+                concurrency: Int = ProcessInfo.processInfo.activeProcessorCount,
+                analytics: DecodeAnalytics? = nil) {
         self.useGPUVerify = useGPUVerify
         self.progressReporter = progressReporter
         self.concurrency = max(1, concurrency)
+        self.analytics = analytics
     }
 
     public func extract(archive: URL, to destDir: URL) throws -> Stats {
@@ -68,7 +76,8 @@ public final class KnitExtractor {
         // resets implicitly between entries. CPU-only at the moment;
         // future GPU `BlockDecoding` implementations slot into the
         // `gpuPath:` parameter.
-        let stagedDecoder = HybridZstdBatchDecoder(concurrency: concurrency)
+        let stagedDecoder = HybridZstdBatchDecoder(concurrency: concurrency,
+                                                   analytics: analytics)
 
         let start = ContinuousClock.now
         var bytesOut: UInt64 = 0
