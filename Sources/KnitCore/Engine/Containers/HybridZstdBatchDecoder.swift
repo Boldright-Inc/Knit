@@ -60,11 +60,21 @@ import CDeflate
 /// decoder (Phase 2) into the `gpuPath` slot.
 public final class HybridZstdBatchDecoder {
 
-    /// Output sink: receives one decoded block in input order. The sink
-    /// is responsible for writing the bytes to the destination handle
-    /// and bumping any progress reporters. Block bytes are released
-    /// after the sink returns, so the sink must not retain the buffer.
-    public typealias Sink = (_ blockIdx: Int, _ bytes: UnsafeBufferPointer<UInt8>) throws -> Void
+    /// Output sink: receives one decoded *batch* (a contiguous slice
+    /// covering every block in the batch in input order). The sink is
+    /// responsible for writing the bytes to the destination handle and
+    /// advancing any progress reporters by `bytes.count`.
+    ///
+    /// Per-batch (not per-block) was a deliberate decision: with
+    /// per-block sinks an 80 GB Windows-VM `.pvm.knit` issued ~1 M
+    /// `write()` syscalls plus ~1 M `Data(buffer:)` allocations,
+    /// which leaves 14 of 16 P-cores idle waiting for the serial
+    /// commit phase to drain. One write per batch reduces both by
+    /// `maxBatchBlocks`× (default 64) and lets the parallel decode
+    /// of the next batch overlap real work instead of syscall stalls.
+    /// The buffer is owned by the orchestrator and freed after the
+    /// sink returns, so the sink must not retain it past its call.
+    public typealias Sink = (_ batchBytes: UnsafeBufferPointer<UInt8>) throws -> Void
 
     /// Result returned to the caller after a full entry has been
     /// streamed through the decoder.
@@ -263,20 +273,11 @@ public final class HybridZstdBatchDecoder {
                                                     buf.count))
         }
 
-        // Commit: the batch survived its CRC check (well — the entry
-        // CRC is checked at the end; here we're just folding the
-        // running value). Hand the bytes to the sink in input order.
-        var offset = 0
+        // Commit: hand the entire staged batch to the sink as one
+        // contiguous slice. Per-batch (not per-block) — see the Sink
+        // typealias commentary for why.
         try staging.withUnsafeBufferPointer { stage in
-            for idx in range {
-                let size = uncompressedSizes[idx]
-                let slice = UnsafeBufferPointer(
-                    start: stage.baseAddress!.advanced(by: offset),
-                    count: size
-                )
-                try sink(idx, slice)
-                offset += size
-            }
+            try sink(stage)
         }
 
         return BatchResult(
@@ -318,17 +319,8 @@ public final class HybridZstdBatchDecoder {
                                                     buf.count))
         }
 
-        var offset = 0
         try staging.withUnsafeBufferPointer { stage in
-            for idx in range {
-                let size = uncompressedSizes[idx]
-                let slice = UnsafeBufferPointer(
-                    start: stage.baseAddress!.advanced(by: offset),
-                    count: size
-                )
-                try sink(idx, slice)
-                offset += size
-            }
+            try sink(stage)
         }
 
         return BatchResult(
