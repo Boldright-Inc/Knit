@@ -265,4 +265,114 @@ enum CLIAnalyze {
         }
         return String(format: "%.0f", mbps) + " MB/s"
     }
+
+    // MARK: - Phase 1b.0 spike: literal-section distribution
+
+    /// Render the zstd literal-section classifier output appended after
+    /// the existing `renderUnpack` stage table. The "Phase 1b GPU
+    /// target" annotation marks the bucket the planned MSL kernel
+    /// would accelerate. The headline gate is the
+    /// `Compressed_4Stream` byte share of the zstd-block-level
+    /// distribution — ≥ 70 % means the kernel work has enough blast
+    /// radius to be worth doing; below that we pause Phase 1b and
+    /// pivot to pack-side `MetalCRC32` wiring (per CLAUDE.md
+    /// § "Phase 1b → pivot fallback").
+    static func renderUnpackLiteralTypes(_ snap: LiteralTypeAnalytics.Snapshot) -> String {
+        var out = ""
+        out += "\n=== analyze: literal-section classifier (Phase 1b.0 spike) ===\n"
+        out += "  .knit blocks classified:    \(snap.totalKnitBlocksSeen)\n"
+        out += "  unparseable frames:         \(snap.unparseableKnitBlocks)"
+        if snap.totalKnitBlocksSeen > 0 {
+            let pct = Double(snap.unparseableKnitBlocks)
+                / Double(snap.totalKnitBlocksSeen) * 100
+            out += "  (\(String(format: "%.2f", pct)) %)"
+        }
+        out += "\n"
+
+        out += "\n  zstd-block distribution (one row per inner zstd block):\n"
+        out += renderBlockTypeCounts(snap.zstdBlockCounts)
+
+        out += "\n  .knit-block distribution (one row per .knit block, byte-weighted dominant):\n"
+        out += renderBlockTypeCounts(snap.knitBlockCounts)
+
+        // Headline gate. Two denominators tell different stories:
+        //
+        //   * Literal-bearing denominator: Compressed_4Stream bytes /
+        //     bytes-in-blocks-that-actually-have-a-literals-section.
+        //     This is the right denominator for the Phase 1b gate
+        //     because Raw_Block / RLE_Block payloads can't be GPU
+        //     Huffman-decoded (there's no Huffman tree). If 70 % of
+        //     literal-bearing bytes are 4-stream, the kernel will
+        //     handle 70 % of the decode work it can touch.
+        //
+        //   * Total-decoded-bytes denominator: Compressed_4Stream
+        //     bytes / *all* bytes seen (incl. raw-block payloads).
+        //     This is the worst-case blast radius — how much of the
+        //     entire decode the kernel touches. A corpus where most
+        //     bytes come from Raw_Block stored payloads (e.g. a
+        //     binary blob libzstd refused to compress) has a low
+        //     value here even if every literal-bearing block is
+        //     4-stream.
+        //
+        // Render both, but the headline pass/fail is the literal-
+        // bearing share (the actionable number for the kernel-work
+        // decision).
+        let zstd = snap.zstdBlockCounts
+        let target4StreamBytes = zstd.regeneratedBytes[.compressed4Stream] ?? 0
+        var literalBearingBytes: UInt64 = 0
+        for b in ZstdLiteralClassifier.LiteralBucket.allCases where b != .noLiterals {
+            literalBearingBytes += zstd.regeneratedBytes[b] ?? 0
+        }
+        let totalAllBytes = zstd.totalRegeneratedBytes
+        let litSharePct = literalBearingBytes > 0
+            ? Double(target4StreamBytes) / Double(literalBearingBytes) * 100
+            : 0
+        let totalSharePct = totalAllBytes > 0
+            ? Double(target4StreamBytes) / Double(totalAllBytes) * 100
+            : 0
+        let gate = litSharePct >= 70 ? "PASS" : "FAIL"
+        out += "\n  Phase 1b GPU-target share — literal-bearing denominator: " +
+               "\(String(format: "%.2f", litSharePct)) %  [\(gate) ≥ 70 %]\n"
+        out += "  Phase 1b GPU-target share — all-bytes denominator     : " +
+               "\(String(format: "%.2f", totalSharePct)) %  (informational)\n"
+        return out
+    }
+
+    /// Format one `BlockTypeCounts` as a five-column table:
+    /// `bucket-name`, `count`, `count %`, `bytes`, `bytes %`.
+    private static func renderBlockTypeCounts(
+        _ counts: ZstdLiteralClassifier.BlockTypeCounts
+    ) -> String {
+        let totalBlocks = counts.totalBlocks
+        let totalBytes = counts.totalRegeneratedBytes
+        let denomBlocks = max(1, totalBlocks)
+        let denomBytes = max(UInt64(1), totalBytes)
+
+        // Fixed bucket order for diff-friendliness across runs.
+        let ordered: [(ZstdLiteralClassifier.LiteralBucket, String)] = [
+            (.noLiterals,         "Raw/RLE (no-literals)"),
+            (.rawLiterals,        "Raw_Literals_Block"),
+            (.rleLiterals,        "RLE_Literals_Block"),
+            (.compressed1Stream,  "Compressed_1Stream"),
+            (.compressed4Stream,  "Compressed_4Stream      <-- Phase 1b GPU target"),
+            (.treeless,           "Treeless_Literals_Block"),
+        ]
+
+        var rows = ""
+        for (bucket, label) in ordered {
+            let n = counts.counts[bucket] ?? 0
+            let b = counts.regeneratedBytes[bucket] ?? 0
+            // Pad the label to a consistent column width so the
+            // count + percent columns line up across buckets.
+            let labelPadded = label.padding(toLength: 48, withPad: " ", startingAt: 0)
+            let countPct = Double(n) / Double(denomBlocks) * 100
+            let bytePct = Double(b) / Double(denomBytes) * 100
+            rows += "    " + labelPadded +
+                "  " + String(format: "%9d", n) +
+                "  (" + String(format: "%5.1f", countPct) + " %)" +
+                "  " + formatBytesDecimal(b).padding(toLength: 9, withPad: " ", startingAt: 0) +
+                "  (" + String(format: "%5.1f", bytePct) + " %)\n"
+        }
+        return rows
+    }
 }

@@ -112,15 +112,28 @@ public final class HybridZstdBatchDecoder {
                 gpuPath: BlockDecoding? = nil,
                 maxBatchBlocks: Int = 64,
                 concurrency: Int = ProcessInfo.processInfo.activeProcessorCount,
-                analytics: StageAnalytics? = nil) {
+                analytics: StageAnalytics? = nil,
+                literalTypeAnalytics: LiteralTypeAnalytics? = nil) {
         self.cpuPath = cpuPath
         self.gpuPath = gpuPath?.supportsGPU == true ? gpuPath : nil
         self.maxBatchBlocks = max(1, maxBatchBlocks)
         self.concurrency = max(1, concurrency)
         self.analytics = analytics
+        self.literalTypeAnalytics = literalTypeAnalytics
     }
 
     private let analytics: StageAnalytics?
+    /// Phase 1b.0 spike accumulator. Nil = no instrumentation
+    /// overhead (the worker's classify call is gated on
+    /// `literalTypeAnalytics != nil`). When wired in by the CLI's
+    /// hidden `--analyze` flag, every block's zstd frame is walked by
+    /// `ZstdLiteralClassifier.classify(frame:)` in the parallel decode
+    /// worker — never throws, never mutates the decode path, just
+    /// records the classification. The output is rendered as a
+    /// post-decode section so we can decide whether the Phase 1b
+    /// GPU Huffman kernel work has enough blast radius on real
+    /// corpora to be worth doing.
+    private let literalTypeAnalytics: LiteralTypeAnalytics?
 
     /// True if the orchestrator will route any block through the GPU
     /// path on this entry. Surfaced for telemetry and the unpack stats
@@ -408,6 +421,7 @@ public final class HybridZstdBatchDecoder {
 
         let primaryDecoder = primary
         let fallbackDecoder = perBlockFallback
+        let classifierAccumulator = self.literalTypeAnalytics
 
         let results: [PerBlockOutcome] = try concurrentMap(
             jobs,
@@ -415,6 +429,20 @@ public final class HybridZstdBatchDecoder {
         ) { job in
             let frame = UnsafeBufferPointer(start: job.frameStart, count: job.frameLen)
             let slot = UnsafeMutableBufferPointer(start: job.slotStart, count: job.slotLen)
+
+            // Phase 1b.0 spike: classify the literal sections of this
+            // block's zstd frame before the decode. The classifier is
+            // header-only (no payload reads, never throws), and runs
+            // inside the parallel worker so its CPU cost overlaps the
+            // libzstd decode below — not stacked on top of it. The
+            // result is recorded into the sharded analytics
+            // accumulator; if `literalTypeAnalytics` is nil (no
+            // `--analyze`) the whole branch is skipped.
+            if let acc = classifierAccumulator {
+                let classification = ZstdLiteralClassifier.classify(frame: frame)
+                acc.recordKnitBlock(classification)
+            }
+
             do {
                 let produced = try primaryDecoder.decodeBlock(frame, into: slot)
                 if produced != job.slotLen {
