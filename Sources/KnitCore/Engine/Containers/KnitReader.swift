@@ -20,7 +20,16 @@ public struct KnitEntry: Sendable {
 }
 
 /// Reader for .knit files. Parses headers via mmap, decompresses entries lazily.
-public final class KnitReader {
+///
+/// `@unchecked Sendable` because every stored field is `let` and behaviourally
+/// read-only after `init`: `mapped` is `MappedFile`'s `@unchecked Sendable`
+/// view of `PROT_READ` mmap pages (no data races on read-only memory), and
+/// `archive` is a Sendable-by-fields struct. `extract(...)` opens its own
+/// per-call `FileHandle` and writes only to the caller-supplied output URL —
+/// no shared mutable state, so `KnitExtractor` can call it concurrently from
+/// multiple workers when running entry-level parallelism (PR equivalent of
+/// PR #27 on the unpack side).
+public final class KnitReader: @unchecked Sendable {
     private let mapped: MappedFile
     public let archive: KnitArchive
 

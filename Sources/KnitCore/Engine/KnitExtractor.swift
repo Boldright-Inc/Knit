@@ -5,17 +5,30 @@ import Foundation
 /// Sits between the CLI and `KnitReader`: opens the archive, validates
 /// each entry name with `SafePath` (zip-slip defence), and routes large
 /// entries through the optional GPU CRC32 verifier. Decompression itself
-/// happens inside `KnitReader.extract`, driven by a shared
-/// `HybridZstdBatchDecoder` that parallelises per-block libzstd calls
-/// across `concurrency` worker threads — the same pattern that gives
-/// `pack` its 8 GB/s ceiling. Without this, decode is a single-threaded
-/// `ZSTD_decompress` loop and tops out at ~750 MB/s on M5 Max even
-/// though SSD write bandwidth is ten times higher.
+/// happens inside `KnitReader.extract`, driven by `HybridZstdBatchDecoder`
+/// which parallelises per-block libzstd calls across worker threads.
 ///
-/// Cross-entry parallelism isn't done here because real archives often
-/// have one giant entry that dominates total decode time (e.g. a single
-/// VM disk image inside a `.pvm.knit`); intra-entry block parallelism
-/// is what closes the gap to the SSD ceiling on those workloads.
+/// Mixed-granularity parallelism (mirrors `KnitCompressor` / PR #27):
+///
+///   * **Large entries** (≥ 16 MiB — enough blocks to saturate the
+///     worker pool on their own) take a **serial-across-entries
+///     path** with intra-entry block-level parallelism inside the
+///     decoder. Memory stays bounded for 100 GB+ single files.
+///   * **Small entries** (the typical "git tree with 100 k tiny files"
+///     workload) are gathered into batches and extracted **across
+///     workers in parallel** via `concurrentMap`. Each worker opens
+///     its own `FileHandle`, decodes its entry, and runs CRC verify
+///     end-to-end — no archive-write order to preserve since each
+///     entry has its own output URL.
+///
+/// This split solved the bottleneck the unpack `--analyze` data
+/// flagged on the github corpus: ~32 s of "unaccounted" wall (per-entry
+/// `createDirectory` + `createFile` + `FileHandle` open + decode +
+/// `synchronize` + `verifyCRC` × 100 k entries) processed serially
+/// left 15 of 16 cores idle, capping unpack throughput at ~250 MB/s
+/// on a 9 GB / 100 k-entry corpus. With cross-entry batching we get
+/// the same N-way parallelism the unpack path already had on big
+/// files, just lifted up to entry granularity.
 public final class KnitExtractor {
 
     /// Aggregate result returned to the CLI / callers. `gpuVerifyUsed`
@@ -40,9 +53,11 @@ public final class KnitExtractor {
     /// reaches 100% even when the verify path runs.
     public var progressReporter: ProgressReporter?
 
-    /// Number of worker threads the `HybridZstdBatchDecoder` runs per
-    /// batch. Defaults to `activeProcessorCount`; pass 1 to force
-    /// serial decode (mostly useful in tests).
+    /// Number of worker threads. Used both for cross-entry parallelism
+    /// (this orchestrator's `concurrentMap`) and intra-entry block
+    /// parallelism (the staged decoder's own `concurrentMap`). Defaults
+    /// to `activeProcessorCount`; pass 1 to force fully serial extract
+    /// (mostly useful in tests).
     public var concurrency: Int
 
     /// Optional per-stage timing accumulator. Wired through to the
@@ -61,6 +76,12 @@ public final class KnitExtractor {
         self.analytics = analytics
     }
 
+    /// Threshold above which an entry takes the serial-across-entries
+    /// path. Below this size, intra-entry block parallelism gains
+    /// little (entries this small typically have 1-2 blocks) and
+    /// cross-entry parallelism is the only lever.
+    private static let largeEntryThreshold: UInt64 = 16 * 1024 * 1024
+
     public func extract(archive: URL, to destDir: URL) throws -> Stats {
         let reader = try KnitReader(url: archive)
         try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
@@ -71,31 +92,105 @@ public final class KnitExtractor {
         let gpuCRC: MetalCRC32? = useGPUVerify ? MetalCRC32() : nil
         var gpuUsed = false
 
-        // One staged decoder shared across all entries: its only mutable
-        // state is per-entry watchdog tracking, which the call-site loop
-        // resets implicitly between entries. CPU-only at the moment;
-        // future GPU `BlockDecoding` implementations slot into the
-        // `gpuPath:` parameter.
-        let stagedDecoder = HybridZstdBatchDecoder(concurrency: concurrency,
-                                                   analytics: analytics)
-
+        let entries = reader.archive.entries
         let start = ContinuousClock.now
         var bytesOut: UInt64 = 0
-        for entry in reader.archive.entries {
-            let outURL = try SafePath.resolve(name: entry.name, into: destDir)
-            try reader.extract(entry,
-                               to: outURL,
-                               gpuCRC: gpuCRC,
-                               progressReporter: progressReporter,
-                               stagedDecoder: stagedDecoder)
-            bytesOut += entry.uncompressedSize
-            if gpuCRC != nil, entry.uncompressedSize >= 4 * 1024 * 1024 {
-                gpuUsed = true
+
+        // Capture values for the @Sendable closure without pulling
+        // `self` in. Each parallel worker uses its own decoder
+        // instance because `HybridZstdBatchDecoder` carries
+        // per-entry mutable state (watchdog poisoning + slow-batch
+        // counters) that would race if shared across concurrent
+        // `decode` calls.
+        let analyticsLocal = analytics
+        let reporter = progressReporter
+        let gpuCRCLocal = gpuCRC
+        let readerLocal = reader
+        let destDirLocal = destDir
+        // Inner-decoder concurrency = 1 in the parallel-batch path:
+        // outer entry-level parallelism already saturates the worker
+        // pool, and nested 16-way × 16-way `concurrentMap` would just
+        // queue 256 tasks on GCD. Large-entry serial path uses
+        // `self.concurrency` for intra-entry block parallelism.
+        let innerConcurrency = 1
+        let outerConcurrency = self.concurrency
+
+        // For the serial path, share one decoder across consecutive
+        // large entries (its per-entry state resets at the top of
+        // `decode`). Cheap to hold across the whole loop.
+        let serialDecoder = HybridZstdBatchDecoder(
+            concurrency: outerConcurrency,
+            analytics: analytics
+        )
+
+        var i = 0
+        while i < entries.count {
+            let entry = entries[i]
+
+            // Large entry: serial across entries, parallel within.
+            if entry.uncompressedSize >= Self.largeEntryThreshold {
+                let outURL = try SafePath.resolve(name: entry.name, into: destDir)
+                try reader.extract(
+                    entry,
+                    to: outURL,
+                    gpuCRC: gpuCRC,
+                    progressReporter: progressReporter,
+                    stagedDecoder: serialDecoder
+                )
+                bytesOut += entry.uncompressedSize
+                if gpuCRC != nil, entry.uncompressedSize >= 4 * 1024 * 1024 {
+                    gpuUsed = true
+                }
+                i += 1
+                continue
             }
+
+            // Run of small entries: gather a batch and decompress in
+            // parallel. There's no archive-write ordering to preserve
+            // (unlike pack) — each entry has its own output URL.
+            var j = i
+            let maxBatch = max(outerConcurrency * 4, 8)
+            while j < entries.count
+                && (j - i) < maxBatch
+                && entries[j].uncompressedSize < Self.largeEntryThreshold {
+                j += 1
+            }
+            let batch = Array(entries[i..<j])
+
+            let _: [UInt64] = try concurrentMap(
+                batch,
+                concurrency: outerConcurrency
+            ) { entry in
+                let outURL = try SafePath.resolve(name: entry.name, into: destDirLocal)
+                // Per-worker decoder: cheap to construct (just stores
+                // refs), avoids racing on shared
+                // `consecutiveSlowBatches` / `poisonedThisEntry` state.
+                let perWorkerDecoder = HybridZstdBatchDecoder(
+                    concurrency: innerConcurrency,
+                    analytics: analyticsLocal
+                )
+                try readerLocal.extract(
+                    entry,
+                    to: outURL,
+                    gpuCRC: gpuCRCLocal,
+                    progressReporter: reporter,
+                    stagedDecoder: perWorkerDecoder
+                )
+                return entry.uncompressedSize
+            }
+
+            for entry in batch {
+                bytesOut += entry.uncompressedSize
+                if gpuCRC != nil, entry.uncompressedSize >= 4 * 1024 * 1024 {
+                    gpuUsed = true
+                }
+            }
+            i = j
         }
+
         let elapsed = ContinuousClock.now - start
         return Stats(
-            entries: reader.archive.entries.count,
+            entries: entries.count,
             bytesOut: bytesOut,
             elapsed: elapsed.timeIntervalSeconds,
             gpuVerifyUsed: gpuUsed
