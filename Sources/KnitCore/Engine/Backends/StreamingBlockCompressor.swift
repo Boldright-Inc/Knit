@@ -50,13 +50,33 @@ public struct StreamingBlockCompressor {
     public let backend: BlockBackend
     public let blockSize: Int
     public let concurrency: Int
+    /// Entropy probe used to decide per-block lvl=1 downgrade. Defaults
+    /// to `MetalEntropyProbe` when constructible, with `CPUEntropyProbe`
+    /// as fallback for hosts with no Metal device or for buffers below
+    /// the GPU dispatch-amortisation threshold.
+    ///
+    /// **Why this is its own field, not inline in the worker**: pack
+    /// analyse on a 80 GB Windows-VM `.pvm.knit` showed
+    /// `compute.entropy` at 826 s (97.6 %) of cumulative worker CPU
+    /// time — the per-block CPU histogram was almost the entire pack
+    /// workload because the input was incompressible (ratio 99.7 %)
+    /// and the workers' zstd phase was negligible. Batched GPU
+    /// probing dispatches one Metal kernel per batch instead of N
+    /// CPU histograms per worker, dropping 826 s of CPU work to
+    /// ~few seconds of GPU work and unblocking the SSD-write path.
+    public let entropyProbe: any EntropyProbing
 
     public init(backend: BlockBackend,
                 blockSize: Int = 1 * 1024 * 1024,
-                concurrency: Int = ProcessInfo.processInfo.activeProcessorCount) {
+                concurrency: Int = ProcessInfo.processInfo.activeProcessorCount,
+                entropyProbe: (any EntropyProbing)? = nil) {
         self.backend = backend
         self.blockSize = blockSize
         self.concurrency = max(1, concurrency)
+        // Resolve the probe: explicit override wins, otherwise pick
+        // GPU-when-available via AutoEntropyProbe (which falls back to
+        // CPU internally on hosts with no Metal device).
+        self.entropyProbe = entropyProbe ?? AutoEntropyProbe()
     }
 
     /// Compress `input` block-by-block, calling `sink` with each
@@ -111,12 +131,73 @@ public struct StreamingBlockCompressor {
         var firstBlock = true
         var batchStart = 0
 
+        let entropyProbe = self.entropyProbe
+
         while batchStart < slices.count {
             let batchEnd = min(batchStart + batchSize, slices.count)
             let batchIndices = Array(batchStart..<batchEnd)
 
+            // Step 0: batch-level entropy probe. We hand the probe the
+            // whole batch's contiguous input slice, getting back one
+            // `EntropyResult` per block. On Apple Silicon UMA the GPU
+            // path (`MetalEntropyProbe`) walks 64 × 1 MiB blocks in a
+            // single dispatch (~1 ms) instead of 64 separate per-worker
+            // CPU histograms (~12 ms wall on 16 cores). Below the
+            // dispatch-amortisation threshold, `MetalEntropyProbe`
+            // falls through to `CPUEntropyProbe` automatically — so
+            // small batches still take the fast inline path.
+            //
+            // Workers receive the pre-computed entropy via the
+            // `entropies` array captured below, so the per-block worker
+            // closure shrinks to: pick level → libdeflate CRC → zstd
+            // frame. That's where the wall-time shrinkage on
+            // incompressible inputs comes from.
+            let entropies: [EntropyResult]
+            let entropyWallStart = ContinuousClock.now
+            if entropyDowngradeEnabled {
+                let firstSlice = slices[batchStart]
+                let lastSlice = slices[batchEnd - 1]
+                let batchByteStart = firstSlice.offset
+                let batchByteEnd = lastSlice.offset + lastSlice.length
+                let batchBufferLen = batchByteEnd - batchByteStart
+                let batchBufPtr = basePtr.value.advanced(by: batchByteStart)
+                let batchBuf = UnsafeBufferPointer(start: batchBufPtr,
+                                                   count: batchBufferLen)
+                do {
+                    entropies = try entropyProbe.probe(batchBuf, blockSize: blockSize)
+                } catch {
+                    // Fail-soft: if the GPU probe throws (kernel error,
+                    // out-of-memory, etc.) we'd rather skip the
+                    // downgrade decision than abort the whole compress.
+                    // Default to "compressible" so the user-requested
+                    // level is honoured.
+                    entropies = (0..<batchIndices.count).map { i in
+                        EntropyResult(entropy: 0, byteCount: slices[batchStart + i].length)
+                    }
+                }
+            } else {
+                // Probe disabled: fabricate zero-entropy results so the
+                // worker's downgrade test stays simple (it still checks
+                // `entropyDowngradeEnabled` first, but having a value
+                // available keeps the per-block code path uniform).
+                entropies = (0..<batchIndices.count).map { i in
+                    EntropyResult(entropy: 0, byteCount: slices[batchStart + i].length)
+                }
+            }
+            let entropyWallSeconds = (ContinuousClock.now - entropyWallStart).timeIntervalSeconds
+            analytics?.record(stage: "entropy.probe", seconds: entropyWallSeconds)
+
+            // Pre-compute decisions on the orchestrator thread so the
+            // worker closure stays minimal. `EntropyResult.entropy` is
+            // a `Float`, so the array is trivially Sendable for the
+            // concurrentMap closure.
+            let perBlockEntropy: [Float] = (0..<batchIndices.count).map { i in
+                i < entropies.count ? entropies[i].entropy : 0
+            }
+
             // Process this batch in parallel. Each worker does the
-            // entire per-block pipeline on cache-warm pages.
+            // remaining per-block pipeline (level decision, CRC, zstd)
+            // on cache-warm pages.
             let measureCPU = analytics != nil
             let parallelStart = ContinuousClock.now
             let processed: [ProcessedBlock] = try concurrentMap(
@@ -127,20 +208,14 @@ public struct StreamingBlockCompressor {
                 let p = basePtr.value.advanced(by: slice.offset)
                 let bv = UnsafeBufferPointer(start: p, count: slice.length)
 
-                // Step 1: byte histogram on CPU. ~0.5 ms for a 1 MiB
-                // block on a P-core; the bytes are then resident in L1
-                // cache for the CRC and codec walks that follow.
-                let entropy: Float
-                let entropyCPU: TimeInterval
-                if entropyDowngradeEnabled {
-                    let t0 = measureCPU ? ContinuousClock.now : nil
-                    let hist = EntropyMath.histogram(of: bv.baseAddress!, count: bv.count)
-                    entropy = EntropyMath.shannonEntropy(histogram: hist, total: bv.count)
-                    entropyCPU = t0.map { (ContinuousClock.now - $0).timeIntervalSeconds } ?? 0
-                } else {
-                    entropy = 0
-                    entropyCPU = 0
-                }
+                // Step 1: pre-computed entropy from the batch probe.
+                // Per-worker `entropyCPU` is now zero — that line is
+                // batch-level wall, recorded once below as
+                // `entropy.probe`. We keep the field on
+                // `ProcessedBlock` for compatibility with the analyse
+                // aggregation but it stays 0.
+                let entropy: Float = perBlockEntropy[absoluteIdx - batchStart]
+                let entropyCPU: TimeInterval = 0
 
                 // Step 2: per-block level decision. lvl≥3 match search
                 // is overhead on incompressible blocks; downgrade to

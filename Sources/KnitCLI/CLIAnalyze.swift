@@ -110,7 +110,11 @@ enum CLIAnalyze {
 
         // Stable partition: wall stages first (sum toward encoder wall),
         // CPU stages second (sum across workers, exceed wall by design).
-        let wallStageNames: Set<String> = ["parallel.compress", "archive.write"]
+        // `entropy.probe` is wall-time at the orchestrator thread (one
+        // GPU dispatch per batch — see `StreamingBlockCompressor`).
+        let wallStageNames: Set<String> = [
+            "entropy.probe", "parallel.compress", "archive.write",
+        ]
         let wallStages = snap.stages.filter { wallStageNames.contains($0.name) }
         let cpuStages  = snap.stages.filter { !wallStageNames.contains($0.name) }
 
