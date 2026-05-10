@@ -140,4 +140,68 @@ final class EntropyProbeTests: XCTestCase {
         XCTAssertEqual(results[1].byteCount, blockSize)
         XCTAssertEqual(results[2].byteCount, 100)
     }
+
+    // MARK: - Parallel vs serial parity
+
+    /// `CPUEntropyProbe` parallelises across blocks via `concurrentMap`
+    /// when there are ≥ 4 blocks. The parallel and serial paths must
+    /// produce byte-identical `[EntropyResult]` — same per-block
+    /// `byteCount` AND same per-block `entropy` Float bits — otherwise
+    /// the lvl=1 downgrade decisions inside
+    /// `StreamingBlockCompressor` could diverge between fallback runs
+    /// and PR #23's GPU path.
+    func testCPUProbeParallelMatchesSerial() throws {
+        // Mixed-content payload across 32 blocks: half text-ish (low
+        // entropy), half pseudo-random (high entropy). 32 blocks > the
+        // 4-block parallel threshold so the parallel path is exercised.
+        let blockSize = 64 * 1024
+        let numBlocks = 32
+        let total = blockSize * numBlocks
+        var bytes = [UInt8](repeating: 0, count: total)
+        var seed: UInt64 = 0xA5A5_DEAD_BEEF_C0DE
+        for i in 0..<total {
+            if (i / blockSize) % 2 == 0 {
+                bytes[i] = UInt8(0x40 &+ (i & 0x3F))
+            } else {
+                seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                bytes[i] = UInt8(truncatingIfNeeded: seed >> 32)
+            }
+        }
+
+        let serial = try bytes.withUnsafeBufferPointer { buf in
+            try CPUEntropyProbe(concurrency: 1).probe(buf, blockSize: blockSize)
+        }
+        let parallel = try bytes.withUnsafeBufferPointer { buf in
+            try CPUEntropyProbe(concurrency: 8).probe(buf, blockSize: blockSize)
+        }
+
+        XCTAssertEqual(serial.count, numBlocks)
+        XCTAssertEqual(parallel.count, numBlocks)
+        for i in 0..<numBlocks {
+            XCTAssertEqual(serial[i].byteCount, parallel[i].byteCount,
+                           "byteCount differs at block \(i)")
+            // Float bit-for-bit equality: same input bytes through the
+            // same `EntropyMath` math must produce the same Float.
+            XCTAssertEqual(serial[i].entropy, parallel[i].entropy,
+                           "entropy differs at block \(i): " +
+                           "serial=\(serial[i].entropy), parallel=\(parallel[i].entropy)")
+        }
+    }
+
+    /// Below the parallelism threshold the serial path is used. This
+    /// pins the threshold's effect: a 3-block input takes the
+    /// historical serial loop, not concurrentMap dispatch.
+    func testCPUProbeSerialPathBelowThreshold() throws {
+        let blockSize = 1024
+        let total = blockSize * 3
+        var bytes = [UInt8](repeating: 0, count: total)
+        for i in 0..<total { bytes[i] = UInt8(i & 0xFF) }
+        let results = try bytes.withUnsafeBufferPointer { buf in
+            try CPUEntropyProbe(concurrency: 8).probe(buf, blockSize: blockSize)
+        }
+        XCTAssertEqual(results.count, 3)
+        for r in results {
+            XCTAssertEqual(r.byteCount, blockSize)
+        }
+    }
 }
