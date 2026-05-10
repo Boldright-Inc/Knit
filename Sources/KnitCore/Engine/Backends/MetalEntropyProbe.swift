@@ -44,6 +44,40 @@ public final class MetalEntropyProbe: EntropyProbing, @unchecked Sendable {
             return try CPUEntropyProbe().probe(buffer, blockSize: blockSize)
         }
 
+        // Cap each Metal dispatch at a fraction of the device's
+        // `maxBufferLength`. On Apple Silicon this is roughly the
+        // recommended working-set size (≈ 70–75% of the unified-memory
+        // physical size on M3 Max), so a 100 GB input absolutely cannot
+        // be made into a single MTLBuffer on any consumer Mac. We slice
+        // input-aligned to `blockSize` so probe results line up with the
+        // CPU equivalent regardless of chunk boundaries.
+        //
+        // Headroom factor (3/4) leaves room for the histogram output
+        // buffer plus any other Metal allocations the system has live.
+        let deviceMax = max(blockSize, Int(context.device.maxBufferLength))
+        let safeChunkLimit = max(blockSize, (deviceMax / 4) * 3)
+        var chunkSize = (safeChunkLimit / blockSize) * blockSize
+        if chunkSize < blockSize { chunkSize = blockSize }
+
+        var allResults: [EntropyResult] = []
+        allResults.reserveCapacity((buffer.count + blockSize - 1) / blockSize)
+        var off = 0
+        while off < buffer.count {
+            let chunkLen = min(chunkSize, buffer.count - off)
+            let chunkPtr = base.advanced(by: off)
+            let chunkBuf = UnsafeBufferPointer(start: chunkPtr, count: chunkLen)
+            let chunkResults = try probeOneDispatch(chunkBuf, blockSize: blockSize)
+            allResults.append(contentsOf: chunkResults)
+            off += chunkLen
+        }
+        return allResults
+    }
+
+    /// Run the kernel once over a buffer that's small enough to live in
+    /// a single `MTLBuffer`. The caller is responsible for chunking.
+    private func probeOneDispatch(_ buffer: UnsafeBufferPointer<UInt8>,
+                                  blockSize: Int) throws -> [EntropyResult] {
+        guard let base = buffer.baseAddress else { return [] }
         let total = buffer.count
         let numBlocks = (total + blockSize - 1) / blockSize
 
