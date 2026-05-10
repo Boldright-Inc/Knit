@@ -10,6 +10,30 @@ import KnitCore
 /// counter; the renderer just polls and formats.
 enum CLIProgress {
 
+    /// True iff stderr is currently attached to a terminal. Drives the
+    /// CLI's default progress-bar policy: when the user runs
+    /// `knit unpack big.knit` in a terminal we render the bar
+    /// automatically (90 s of silence is bad UX); when stderr is piped
+    /// into a log file or another process we stay quiet so the
+    /// `\r`-overwriting line doesn't pollute the recipient. `--progress`
+    /// and `--no-progress` flags override this.
+    static var isInteractiveStderr: Bool {
+        return isatty(FileHandle.standardError.fileDescriptor) != 0
+    }
+
+    /// Resolve whether a subcommand should display a live progress bar.
+    /// Precedence (most specific wins):
+    ///   1. `--no-progress`            → off (forced)
+    ///   2. `--progress`               → on  (forced, even when piped)
+    ///   3. neither                    → on iff stderr is a TTY
+    /// Mutually-exclusive flags would be surprising, so when both are
+    /// passed `--no-progress` wins and we silently honour it.
+    static func shouldShowProgress(progress: Bool, noProgress: Bool) -> Bool {
+        if noProgress { return false }
+        if progress { return true }
+        return isInteractiveStderr
+    }
+
     /// Recursively sum file sizes under `inputURL`. Used as the
     /// denominator for the `pack` and `zip` progress bars. Skips
     /// symlinks, matching `FileWalker`'s policy. Errors during the walk

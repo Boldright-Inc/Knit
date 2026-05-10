@@ -76,8 +76,12 @@ extension KnitCommand {
         var noEntropyProbe: Bool = false
 
         @Flag(name: .long,
-              help: "Print live progress to stderr every 500 ms (single-line, \\r-overwrite).")
+              help: "Force the live progress bar on (overrides the default TTY-based detection).")
         var progress: Bool = false
+
+        @Flag(name: .customLong("no-progress"),
+              help: "Suppress the live progress bar even when stderr is a terminal.")
+        var noProgress: Bool = false
 
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
@@ -86,8 +90,10 @@ extension KnitCommand {
             let cores = jobs ?? ProcessInfo.processInfo.activeProcessorCount
             let recorder: HeatmapRecorder? = (heatmap || heatmapImage != nil)
                 ? HeatmapRecorder() : nil
-            let totalBytes = progress ? (try? CLIProgress.totalUncompressedBytes(at: inputURL)) ?? 0 : 0
-            let reporter: ProgressReporter? = progress
+            let showProgress = CLIProgress.shouldShowProgress(progress: progress,
+                                                              noProgress: noProgress)
+            let totalBytes = showProgress ? (try? CLIProgress.totalUncompressedBytes(at: inputURL)) ?? 0 : 0
+            let reporter: ProgressReporter? = showProgress
                 ? ProgressReporter(totalBytes: totalBytes, phase: .zipping) : nil
             let printer = reporter.map { CLIProgress.Printer(reporter: $0) }
             printer?.start()
@@ -165,8 +171,12 @@ extension KnitCommand {
         var noEntropyProbe: Bool = false
 
         @Flag(name: .long,
-              help: "Print live progress to stderr every 500 ms (single-line, \\r-overwrite).")
+              help: "Force the live progress bar on (overrides the default TTY-based detection).")
         var progress: Bool = false
+
+        @Flag(name: .customLong("no-progress"),
+              help: "Suppress the live progress bar even when stderr is a terminal.")
+        var noProgress: Bool = false
 
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
@@ -175,8 +185,10 @@ extension KnitCommand {
 
             let recorder: HeatmapRecorder? = (heatmap || heatmapImage != nil)
                 ? HeatmapRecorder() : nil
-            let totalBytes = progress ? (try? CLIProgress.totalUncompressedBytes(at: inputURL)) ?? 0 : 0
-            let reporter: ProgressReporter? = progress
+            let showProgress = CLIProgress.shouldShowProgress(progress: progress,
+                                                              noProgress: noProgress)
+            let totalBytes = showProgress ? (try? CLIProgress.totalUncompressedBytes(at: inputURL)) ?? 0 : 0
+            let reporter: ProgressReporter? = showProgress
                 ? ProgressReporter(totalBytes: totalBytes, phase: .packing) : nil
             let printer = reporter.map { CLIProgress.Printer(reporter: $0) }
             printer?.start()
@@ -289,21 +301,27 @@ extension KnitCommand {
         var noGpuVerify: Bool = false
 
         @Flag(name: .long,
-              help: "Print live progress to stderr every 500 ms (single-line, \\r-overwrite).")
+              help: "Force the live progress bar on (overrides the default TTY-based detection).")
         var progress: Bool = false
+
+        @Flag(name: .customLong("no-progress"),
+              help: "Suppress the live progress bar even when stderr is a terminal.")
+        var noProgress: Bool = false
 
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
             let outURL = URL(fileURLWithPath: output).standardizedFileURL
+            let showProgress = CLIProgress.shouldShowProgress(progress: progress,
+                                                              noProgress: noProgress)
             // Total uncompressed bytes for the progress bar are read out
             // of the .knit footer so we don't need a second SSD pass.
             let totalBytes: UInt64
-            if progress {
+            if showProgress {
                 totalBytes = (try? CLIProgress.totalUncompressedBytesInKnit(at: inputURL)) ?? 0
             } else {
                 totalBytes = 0
             }
-            let reporter: ProgressReporter? = progress
+            let reporter: ProgressReporter? = showProgress
                 ? ProgressReporter(totalBytes: totalBytes, phase: .extracting) : nil
             let printer = reporter.map { CLIProgress.Printer(reporter: $0) }
             printer?.start()
