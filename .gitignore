@@ -20,6 +20,10 @@ Vendor/zstd/
 Tests/Benchmarks/data/
 Tests/Benchmarks/results/
 
+# Real-world bench corpora (large, non-redistributable — staged locally).
+# Default root that Scripts/bench-corpora.sh discovers from.
+Tests/TestData/
+
 # Sample / scratch archives — never commit produced compressed files
 *.zip
 *.knit
