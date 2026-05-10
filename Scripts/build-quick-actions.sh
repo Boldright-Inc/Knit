@@ -133,6 +133,22 @@ trap 'rm -rf "${TMP}"' EXIT
 # thing — otherwise Finder's Quick Action spinner would stay up for
 # the whole run.
 
+# The runner script:
+#   1. Runs the actual knit command(s) so the user sees `--progress`.
+#   2. Prints "[Done.]" and then `sleep 3` — the sleep keeps the tab
+#      "busy" for three more seconds so the user can read the result
+#      summary before the window vanishes.
+#   3. Removes itself and exits.
+#
+# The `do script` invocation appends `; exit` to the runner path so the
+# *outer* interactive zsh that Terminal opened also exits when the
+# runner is done. Without that step, Terminal's "Ask before closing"
+# preference still considers the tab to be running processes (the
+# interactive shell + the just-ran knit binary) and pops up a
+# confirmation dialog when AppleScript tries to close the window. With
+# the outer shell exited, the tab has no processes and `close … saving
+# no` succeeds silently regardless of the user's preference.
+
 cat > "${TMP}/zip.sh" <<'BS'
 RUNNER="$(mktemp -t knit_zip_runner)"
 {
@@ -142,6 +158,7 @@ RUNNER="$(mktemp -t knit_zip_runner)"
     printf '/usr/local/bin/knit zip %q --parallel --level 6 --progress -o %q\n' "$f" "${f}.zip"
   done
   echo 'printf "\\n[Done.]\\n"'
+  echo 'sleep 3'
   echo "rm -f -- '${RUNNER}'"
   echo 'exit 0'
 } > "${RUNNER}"
@@ -150,14 +167,17 @@ chmod +x "${RUNNER}"
   osascript <<APPLESCRIPT
 tell application "Terminal"
     activate
-    set theTab to do script "${RUNNER}"
+    set theTab to do script "${RUNNER}; exit"
     -- `do script` without an `in` clause always opens a fresh window,
     -- so the front window right after the call is ours to close later.
     set theWindowID to id of front window
     repeat while busy of theTab
         delay 0.5
     end repeat
-    delay 3.0
+    -- Brief grace period so the outer zsh's `exit` finishes processing
+    -- before we send the close request — otherwise Terminal still sees
+    -- the shell as a "running process" and prompts the user.
+    delay 0.3
     repeat with w in windows
         if id of w is theWindowID then
             close w saving no
@@ -179,6 +199,7 @@ RUNNER="$(mktemp -t knit_pack_runner)"
     printf '/usr/local/bin/knit pack %q --level 3 --progress -o %q\n' "$f" "${f}.knit"
   done
   echo 'printf "\\n[Done.]\\n"'
+  echo 'sleep 3'
   echo "rm -f -- '${RUNNER}'"
   echo 'exit 0'
 } > "${RUNNER}"
@@ -187,12 +208,12 @@ chmod +x "${RUNNER}"
   osascript <<APPLESCRIPT
 tell application "Terminal"
     activate
-    set theTab to do script "${RUNNER}"
+    set theTab to do script "${RUNNER}; exit"
     set theWindowID to id of front window
     repeat while busy of theTab
         delay 0.5
     end repeat
-    delay 3.0
+    delay 0.3
     repeat with w in windows
         if id of w is theWindowID then
             close w saving no
@@ -218,6 +239,7 @@ RUNNER="$(mktemp -t knit_extract_runner)"
     esac
   done
   echo 'printf "\\n[Done.]\\n"'
+  echo 'sleep 3'
   echo "rm -f -- '${RUNNER}'"
   echo 'exit 0'
 } > "${RUNNER}"
@@ -226,12 +248,12 @@ chmod +x "${RUNNER}"
   osascript <<APPLESCRIPT
 tell application "Terminal"
     activate
-    set theTab to do script "${RUNNER}"
+    set theTab to do script "${RUNNER}; exit"
     set theWindowID to id of front window
     repeat while busy of theTab
         delay 0.5
     end repeat
-    delay 3.0
+    delay 0.3
     repeat with w in windows
         if id of w is theWindowID then
             close w saving no
