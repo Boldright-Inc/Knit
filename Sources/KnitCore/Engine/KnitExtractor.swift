@@ -49,12 +49,12 @@ public final class KnitExtractor {
     /// staged decoder; nil = no instrumentation overhead. Driven by
     /// the CLI's hidden `--analyze` flag, which renders the snapshot
     /// after extract finishes.
-    public var analytics: DecodeAnalytics?
+    public var analytics: StageAnalytics?
 
     public init(useGPUVerify: Bool = true,
                 progressReporter: ProgressReporter? = nil,
                 concurrency: Int = ProcessInfo.processInfo.activeProcessorCount,
-                analytics: DecodeAnalytics? = nil) {
+                analytics: StageAnalytics? = nil) {
         self.useGPUVerify = useGPUVerify
         self.progressReporter = progressReporter
         self.concurrency = max(1, concurrency)

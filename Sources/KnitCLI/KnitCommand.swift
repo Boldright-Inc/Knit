@@ -178,6 +178,11 @@ extension KnitCommand {
               help: "Suppress the live progress bar even when stderr is a terminal.")
         var noProgress: Bool = false
 
+        @Flag(name: .customLong("analyze"),
+              help: ArgumentHelp("Print encoder per-stage timing breakdown to stderr (internal).",
+                                 visibility: .private))
+        var analyze: Bool = false
+
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
             let outputURL = URL(fileURLWithPath: output ?? "\(input).knit").standardizedFileURL
@@ -196,13 +201,19 @@ extension KnitCommand {
                 reporter?.finish()
                 printer?.waitUntilFlushed()
             }
+            // `--analyze` instruments the encoder. Same accumulator
+            // type as `unpack --analyze`; the renderer separates wall
+            // stages from cumulative-CPU stages so the % column has a
+            // meaningful denominator for each. See `CLIAnalyze.renderPack`.
+            let analytics: StageAnalytics? = analyze ? StageAnalytics() : nil
             let opts = KnitCompressor.Options(
                 level: CompressionLevel(level),
                 concurrency: cores,
                 blockSize: blockKb * 1024,
                 heatmapRecorder: recorder,
                 entropyProbeEnabled: !noEntropyProbe,
-                progressReporter: reporter
+                progressReporter: reporter,
+                stageAnalytics: analytics
             )
             let compressor = KnitCompressor(backend: CPUZstd(), options: opts)
             let stats = try compressor.compress(input: inputURL, to: outputURL)
@@ -223,6 +234,16 @@ extension KnitCommand {
                             archiveURL: outputURL,
                             elapsed: stats.elapsed,
                             sizeMB: mb)
+
+            if let analytics = analytics {
+                let snap = analytics.snapshot()
+                let report = CLIAnalyze.renderPack(snap,
+                                                   packElapsed: stats.elapsed,
+                                                   bytesIn: stats.bytesIn,
+                                                   bytesOut: stats.bytesOut,
+                                                   entries: stats.entriesWritten)
+                FileHandle.standardError.write(Data(report.utf8))
+            }
         }
     }
 
@@ -336,13 +357,13 @@ extension KnitCommand {
             }
             // `--analyze` is a hidden flag for diagnosing where decode
             // wall time is going on a user's host. When set, we hand a
-            // `DecodeAnalytics` accumulator to the extractor; after the
+            // `StageAnalytics` accumulator to the extractor; after the
             // extract finishes we render its snapshot to stderr. The
             // numbers tell us which decode stage the spare GPU should
             // accelerate next (CRC fold? literal Huffman? write
             // overlap?). Without this flag the decoder pays no
             // instrumentation cost.
-            let analytics: DecodeAnalytics? = analyze ? DecodeAnalytics() : nil
+            let analytics: StageAnalytics? = analyze ? StageAnalytics() : nil
             let extractor = KnitExtractor(useGPUVerify: !noGpuVerify,
                                           progressReporter: reporter,
                                           analytics: analytics)
@@ -358,10 +379,10 @@ extension KnitCommand {
             print("  verify: \(verifier)")
             if let analytics = analytics {
                 let snap = analytics.snapshot()
-                let report = CLIAnalyze.render(snap,
-                                               extractElapsed: stats.elapsed,
-                                               bytesOut: stats.bytesOut,
-                                               entries: stats.entries)
+                let report = CLIAnalyze.renderUnpack(snap,
+                                                     extractElapsed: stats.elapsed,
+                                                     bytesOut: stats.bytesOut,
+                                                     entries: stats.entries)
                 FileHandle.standardError.write(Data(report.utf8))
             }
         }

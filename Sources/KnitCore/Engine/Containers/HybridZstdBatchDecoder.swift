@@ -112,7 +112,7 @@ public final class HybridZstdBatchDecoder {
                 gpuPath: BlockDecoding? = nil,
                 maxBatchBlocks: Int = 64,
                 concurrency: Int = ProcessInfo.processInfo.activeProcessorCount,
-                analytics: DecodeAnalytics? = nil) {
+                analytics: StageAnalytics? = nil) {
         self.cpuPath = cpuPath
         self.gpuPath = gpuPath?.supportsGPU == true ? gpuPath : nil
         self.maxBatchBlocks = max(1, maxBatchBlocks)
@@ -120,7 +120,7 @@ public final class HybridZstdBatchDecoder {
         self.analytics = analytics
     }
 
-    private let analytics: DecodeAnalytics?
+    private let analytics: StageAnalytics?
 
     /// True if the orchestrator will route any block through the GPU
     /// path on this entry. Surfaced for telemetry and the unpack stats

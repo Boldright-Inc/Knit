@@ -30,19 +30,27 @@ public final class KnitCompressor: Sendable {
         /// Optional progress sink. The compressor calls `advance(by:)`
         /// once per block written, in input-byte units.
         public var progressReporter: ProgressReporter?
+        /// Optional per-stage timing accumulator (driven by the CLI's
+        /// hidden `--analyze` flag on `pack`). When non-nil the
+        /// streamer records per-batch wall times and per-block CPU
+        /// times — the data needed to decide which encode stage to
+        /// hand off to the GPU. Nil in production: zero overhead.
+        public var stageAnalytics: StageAnalytics?
 
         public init(level: CompressionLevel = .default,
                     concurrency: Int = ProcessInfo.processInfo.activeProcessorCount,
                     blockSize: Int = Int(KnitFormat.defaultBlockSize),
                     heatmapRecorder: HeatmapRecorder? = nil,
                     entropyProbeEnabled: Bool = true,
-                    progressReporter: ProgressReporter? = nil) {
+                    progressReporter: ProgressReporter? = nil,
+                    stageAnalytics: StageAnalytics? = nil) {
             self.level = level
             self.concurrency = max(1, concurrency)
             self.blockSize = blockSize
             self.heatmapRecorder = heatmapRecorder
             self.entropyProbeEnabled = entropyProbeEnabled
             self.progressReporter = progressReporter
+            self.stageAnalytics = stageAnalytics
         }
     }
 
@@ -79,6 +87,7 @@ public final class KnitCompressor: Sendable {
             blockSize: options.blockSize,
             concurrency: options.concurrency
         )
+        options.stageAnalytics?.startWallClock()
         let baseLevel = options.level.clampedForZstd()
 
         for entry in entries {
@@ -118,7 +127,8 @@ public final class KnitCompressor: Sendable {
                 level: baseLevel,
                 entropyDowngradeEnabled: options.entropyProbeEnabled,
                 heatmapRecorder: options.heatmapRecorder,
-                progressReporter: options.progressReporter
+                progressReporter: options.progressReporter,
+                analytics: options.stageAnalytics
             ) { _, frame in
                 try streamEntry.writeBlock(frame)
             }
