@@ -93,6 +93,41 @@ public final class KnitExtractor {
         var gpuUsed = false
 
         let entries = reader.archive.entries
+
+        // Pre-create every parent directory in a single serial pass
+        // before kicking off the parallel-extract phase. Without this,
+        // 16 workers concurrently call `createDirectory` and
+        // `createFile` on the same parent inodes — APFS serialises on
+        // the parent's b-tree lock, so concurrent calls effectively
+        // queue inside the kernel. On a 100 k-entry github tree where
+        // many entries share a parent (`node_modules/foo/...`), the
+        // contention dominated the parallel-extract win and produced
+        // a wall-time *regression* relative to the serial path the
+        // PR #31 work replaced. Doing the dir creates up front is
+        // O(distinct parents) and runs single-threaded so APFS sees
+        // a clean queue depth of 1 — fast and contention-free. The
+        // per-entry `createDirectory(withIntermediateDirectories:
+        // true)` calls inside `KnitReader.extract` then become cheap
+        // already-exists no-ops.
+        var parentPaths: Set<String> = []
+        for entry in entries {
+            let outURL = try SafePath.resolve(name: entry.name, into: destDir)
+            if entry.isDirectory {
+                parentPaths.insert(outURL.path)
+            }
+            parentPaths.insert(outURL.deletingLastPathComponent().path)
+        }
+        for parentPath in parentPaths {
+            // Best-effort: any individual create failure (e.g. EEXIST
+            // race with the user touching the tree mid-extract) is
+            // ignored here and re-attempted lazily inside
+            // `KnitReader.extract`. We only care about the bulk-of-the-
+            // tree case where pre-creating eliminates contention.
+            try? FileManager.default.createDirectory(
+                atPath: parentPath,
+                withIntermediateDirectories: true
+            )
+        }
         let start = ContinuousClock.now
         var bytesOut: UInt64 = 0
 
