@@ -22,6 +22,8 @@ import Foundation
 ///   * `sink`                 — caller-supplied write callback.
 ///
 ///   **Encode (StreamingBlockCompressor)**
+///   * `entropy.probe`        — orchestrator-thread wall of the
+///                              per-batch entropy probe (or its skip).
 ///   * `parallel.compress`    — wall time of `concurrentMap` over
 ///                              per-block workers (combined entropy +
 ///                              CRC + zstd).
@@ -41,9 +43,31 @@ import Foundation
 /// because what we want to know is *how much CPU work* the GPU could
 /// potentially absorb if it took over that stage.
 ///
+/// **Sharding (since the post-#33 measurement-quality work):**
+/// `record(stage:seconds:)` is in the inner-most hot path of any
+/// parallel-batch pack or unpack run. With a single shared `NSLock`
+/// and 16 worker threads each calling `record` 5+ times per batch
+/// (~89 k batches on the github corpus), the lock became the
+/// dominant wall cost on `--analyze` runs — short tasks → frequent
+/// lock acquisitions → contention storm → `ContinuousClock.now`
+/// readings inside other stages got *inflated* by waiting for the
+/// analytics lock. The per-block `compute.crc` measurement jumped
+/// 12× post-#33 even though the CRC code was unchanged, because
+/// the time interval it was measuring now contained more lock-wait
+/// time at its end.
+///
+/// Fix: stripe the accumulator across N shards (currently 32). A
+/// caller's `pthread_self()` mod N picks one shard, and only that
+/// shard's lock is touched on `record`. With 16 workers and 32
+/// shards the steady-state collision probability is small, so the
+/// hot path approaches lock-free. `snapshot()` locks every shard,
+/// merges them into a single result, then unlocks — done once at
+/// extract end so the contention there is irrelevant.
+///
 /// Without measured numbers from this accumulator, every speed-up
-/// plan is speculation. With them, we know exactly which stage to
-/// hand the spare GPU next.
+/// plan is speculation. With them — and with the measurement
+/// itself not artificially inflating other stages — we know
+/// exactly which stage to hand the spare GPU next.
 public final class StageAnalytics: @unchecked Sendable {
 
     public struct Snapshot: Sendable {
@@ -59,57 +83,120 @@ public final class StageAnalytics: @unchecked Sendable {
         public let totalWall: TimeInterval
     }
 
-    private let lock = NSLock()
-    private var stagesDict: [String: TimeInterval] = [:]
-    private var orderedKeys: [String] = []
-    private var batches: Int = 0
-    private var totalBytes: UInt64 = 0
-    private var fallbackCount: Int = 0
-    private var startInstant: ContinuousClock.Instant?
-
-    public init() {}
-
-    /// Mark the start of the timed window. Called once at the top of
-    /// `decode()`; the snapshot's `totalWall` is computed from this.
-    public func startWallClock() {
-        lock.lock()
-        startInstant = .now
-        lock.unlock()
+    /// One shard's mutable state. Each shard has its own NSLock so
+    /// the typical case (one worker, one shard) is uncontested.
+    private final class Shard {
+        let lock = NSLock()
+        var stagesDict: [String: TimeInterval] = [:]
+        var orderedKeys: [String] = []
+        var batches: Int = 0
+        var totalBytes: UInt64 = 0
+        var fallbackCount: Int = 0
     }
 
-    /// Add `seconds` to a stage's running total. Lock-guarded so it's
-    /// safe to call from `concurrentMap` workers, although in practice
-    /// the orchestrator only records from its own thread (workers do
-    /// the work; orchestrator times the whole call).
+    /// Number of shards. 32 is large enough that 16 worker threads
+    /// distribute over them with low collision probability, but
+    /// small enough that `snapshot()`'s merge stays cheap. Must be a
+    /// power of two so the shard-index reduction can use `& mask`
+    /// instead of `%`.
+    private static let shardCount = 32
+    private static let shardMask: UInt = UInt(shardCount - 1)
+
+    private let shards: [Shard]
+
+    /// Wall-window start. Single value protected by its own lock —
+    /// it's only touched once per entry on the orchestrator thread,
+    /// so contention here is negligible. Kept separate from the
+    /// shards so `snapshot()` can read it without unlocking the
+    /// shard locks first.
+    private let wallLock = NSLock()
+    private var startInstant: ContinuousClock.Instant?
+
+    public init() {
+        self.shards = (0..<Self.shardCount).map { _ in Shard() }
+    }
+
+    public func startWallClock() {
+        wallLock.lock()
+        startInstant = .now
+        wallLock.unlock()
+    }
+
     public func record(stage: String, seconds: TimeInterval) {
-        lock.lock()
-        if stagesDict[stage] == nil { orderedKeys.append(stage) }
-        stagesDict[stage, default: 0] += seconds
-        lock.unlock()
+        let shard = currentShard()
+        shard.lock.lock()
+        if shard.stagesDict[stage] == nil { shard.orderedKeys.append(stage) }
+        shard.stagesDict[stage, default: 0] += seconds
+        shard.lock.unlock()
     }
 
     public func recordBatch(bytes: UInt64, fallback: Int) {
-        lock.lock()
-        batches += 1
-        totalBytes += bytes
-        fallbackCount += fallback
-        lock.unlock()
+        let shard = currentShard()
+        shard.lock.lock()
+        shard.batches += 1
+        shard.totalBytes += bytes
+        shard.fallbackCount += fallback
+        shard.lock.unlock()
     }
 
     public func snapshot() -> Snapshot {
-        lock.lock()
+        // Lock every shard in index order to merge a consistent view.
+        // Snapshot is called once per extract from the orchestrator
+        // thread, so this serial fan-in cost is negligible.
+        for shard in shards { shard.lock.lock() }
+        defer {
+            for shard in shards { shard.lock.unlock() }
+        }
+        wallLock.lock()
         let totalWall: TimeInterval = startInstant.map {
             (ContinuousClock.now - $0).timeIntervalSeconds
         } ?? 0
-        let stages = orderedKeys.map {
-            Snapshot.StageEntry(name: $0, seconds: stagesDict[$0] ?? 0)
+        wallLock.unlock()
+
+        // Merge: preserve first-insertion order across shards. We
+        // walk shards in index order and append new stage names as
+        // we encounter them, accumulating their seconds.
+        var mergedDict: [String: TimeInterval] = [:]
+        var mergedOrder: [String] = []
+        var totalBatches = 0
+        var totalBytes: UInt64 = 0
+        var totalFallback = 0
+        for shard in shards {
+            for key in shard.orderedKeys {
+                if mergedDict[key] == nil {
+                    mergedOrder.append(key)
+                }
+                mergedDict[key, default: 0] += shard.stagesDict[key] ?? 0
+            }
+            totalBatches += shard.batches
+            totalBytes &+= shard.totalBytes
+            totalFallback += shard.fallbackCount
         }
-        let snap = Snapshot(stages: stages,
-                            batchCount: batches,
-                            totalBatchBytes: totalBytes,
-                            fallbackBlocks: fallbackCount,
-                            totalWall: totalWall)
-        lock.unlock()
-        return snap
+        let stages = mergedOrder.map {
+            Snapshot.StageEntry(name: $0, seconds: mergedDict[$0] ?? 0)
+        }
+        return Snapshot(
+            stages: stages,
+            batchCount: totalBatches,
+            totalBatchBytes: totalBytes,
+            fallbackBlocks: totalFallback,
+            totalWall: totalWall
+        )
+    }
+
+    /// Pick the shard for the calling thread. `Thread.current` is
+    /// thread-local-storage backed on Apple platforms (effectively a
+    /// register read), and its `ObjectIdentifier` is stable for the
+    /// lifetime of the thread — so this is effectively thread-
+    /// affinity routing without us managing TLS by hand.
+    private func currentShard() -> Shard {
+        // The hash distribution doesn't have to be cryptographically
+        // uniform — we just need different worker threads to land on
+        // different shards most of the time. The Knuth multiplicative
+        // mixer below pushes the low bits of `ObjectIdentifier.hashValue`
+        // around so consecutive thread allocations don't collide.
+        let raw = UInt(bitPattern: ObjectIdentifier(Thread.current).hashValue)
+        let idx = Int((raw &* 11400714819323198485) & Self.shardMask)
+        return shards[idx]
     }
 }
