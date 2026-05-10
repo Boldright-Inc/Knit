@@ -18,7 +18,16 @@ import CDeflate
 /// Block CRCs are combined into the entry-level CRC32 via the GF(2)
 /// matrix-power identity (`crc32Combine`), so we never need a separate
 /// sequential walk over the uncompressed input.
-public struct StreamingBlockCompressor {
+///
+/// `Sendable` is declared explicitly: every stored field is `let` and
+/// of an already-`Sendable` type (`BlockBackend: Sendable`,
+/// `EntropyProbing: Sendable`, `Int`), so the struct is safe to share
+/// across `@Sendable` closure boundaries — which is what the
+/// `KnitCompressor` cross-entry parallel batch path needs to capture
+/// the streamer in `concurrentMap`. Swift 6 strict-concurrency does
+/// *not* auto-infer `Sendable` for `public` structs, so without this
+/// the captured-type diagnostic fires (`#SendableClosureCaptures`).
+public struct StreamingBlockCompressor: Sendable {
 
     /// Result of one block's worth of work, returned from a worker to
     /// the driver.
