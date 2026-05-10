@@ -142,6 +142,27 @@ public struct StreamingBlockCompressor: Sendable {
 
         let entropyProbe = self.entropyProbe
 
+        // Adaptive probe-skip state. Per-`compress()`-call (i.e.
+        // per-entry on the `KnitCompressor.compress` flow): does NOT
+        // carry across entries, so small-file workloads where every
+        // entry is its own `compress()` call see no behaviour change.
+        //
+        // Why this exists: the user's 80 GB Windows-VM `.pvm.knit`
+        // is essentially incompressible (output ratio 99.7 %). Every
+        // 35 MiB batch's GPU entropy probe takes ~18 ms of dispatch
+        // wall, and there are 2 291 of them — so `entropy.probe`
+        // sums to 42 s out of a 54 s pack wall (78 %), all of it
+        // confirming "yes, still incompressible". Once we've seen a
+        // few consecutive all-incompressible batches we can lock the
+        // assumption in and skip the dispatches for the remainder
+        // of the entry. For typical compressible content the lock
+        // never engages — the very first batch with any
+        // sub-threshold entropy resets the counter — so there's no
+        // regression on text-heavy inputs.
+        let probeSkipLockThreshold = 4
+        var consecutiveAllIncompressible = 0
+        var probeLockedToSkip = false
+
         while batchStart < slices.count {
             let batchEnd = min(batchStart + batchSize, slices.count)
             let batchIndices = Array(batchStart..<batchEnd)
@@ -169,27 +190,45 @@ public struct StreamingBlockCompressor: Sendable {
                 let batchByteStart = firstSlice.offset
                 let batchByteEnd = lastSlice.offset + lastSlice.length
                 let batchBufferLen = batchByteEnd - batchByteStart
-                // Skip the probe entirely for batches below
-                // `MetalEntropyProbe.minBufferForGPU` (256 KiB). Below
-                // that size the GPU dispatch is unprofitable, so the
-                // probe falls back to `CPUEntropyProbe` — but the CPU
-                // histogram for a 100 KB block costs ~85 µs, while
-                // the lvl=N → lvl=1 downgrade savings on a single
-                // 100 KB block are ~µs (zstd is fast on short
-                // inputs). The probe overhead exceeds what it saves.
+                // Three skip conditions, each producing a different
+                // assumed entropy:
                 //
-                // Defaulting to `entropy = 0` (compressible) means
-                // workers honour the user-requested level on small
-                // batches. Worst case (incompressible 100 KB file at
-                // lvl=N): a few hundred µs of extra match-search work
-                // per file. Best case (compressible — the typical
-                // case for a github source tree): zero change.
+                //   1. **Adaptive lock** (`probeLockedToSkip`).
+                //      We've seen N consecutive all-incompressible
+                //      batches in this entry, so we stop running
+                //      probes for the rest of it. Assumed
+                //      entropy = 8 (above threshold) → workers
+                //      downgrade to lvl=1, which is what we'd
+                //      do if the probe had run and confirmed
+                //      "still incompressible". On the user's
+                //      80 GB Windows-VM (ratio 99.7 %) this drops
+                //      `entropy.probe` from 42 s to ~70 ms.
                 //
-                // On the user's 9 GB / 100 k-entry github corpus this
-                // dropped pack `entropy.probe` cumulative wall from
-                // ~7.7 s to ~0 s, single biggest pack-side lever
-                // remaining.
-                if batchBufferLen < MetalEntropyProbe.minBufferForGPU {
+                //   2. **Below-GPU-threshold** (`batchBufferLen <
+                //      minBufferForGPU`). The GPU dispatch can't
+                //      amortise here, so the probe would fall back
+                //      to a serial CPU histogram that costs more
+                //      than the downgrade savings. Assumed
+                //      entropy = 0 (below threshold) → workers
+                //      honour the user's requested level. PR #33
+                //      added this; on the github corpus it drops
+                //      `entropy.probe` from 7.7 s to ~0 s.
+                //
+                //   3. **Default**: actually run the probe.
+                //
+                // The two skip paths use *different* assumed entropy
+                // because they're answering different questions:
+                // case 1 has *evidence* that data is incompressible;
+                // case 2 has *no information* and conservatively
+                // declines to downgrade.
+                if probeLockedToSkip {
+                    entropies = (0..<batchIndices.count).map { i in
+                        // Above the incompressible threshold so the
+                        // worker's downgrade test fires.
+                        EntropyResult(entropy: 8.0,
+                                      byteCount: slices[batchStart + i].length)
+                    }
+                } else if batchBufferLen < MetalEntropyProbe.minBufferForGPU {
                     entropies = (0..<batchIndices.count).map { i in
                         EntropyResult(entropy: 0, byteCount: slices[batchStart + i].length)
                     }
@@ -208,6 +247,23 @@ public struct StreamingBlockCompressor: Sendable {
                         entropies = (0..<batchIndices.count).map { i in
                             EntropyResult(entropy: 0, byteCount: slices[batchStart + i].length)
                         }
+                    }
+                    // Adaptive-lock state machine: only updated when
+                    // we *actually ran* the probe. Skip-paths leave
+                    // the counter unchanged (their results are
+                    // synthetic and don't tell us anything new about
+                    // the input).
+                    let allIncompressible = !entropies.isEmpty
+                        && entropies.allSatisfy {
+                            $0.entropy >= EntropyResult.incompressibleThreshold
+                        }
+                    if allIncompressible {
+                        consecutiveAllIncompressible += 1
+                        if consecutiveAllIncompressible >= probeSkipLockThreshold {
+                            probeLockedToSkip = true
+                        }
+                    } else {
+                        consecutiveAllIncompressible = 0
                     }
                 }
             } else {
