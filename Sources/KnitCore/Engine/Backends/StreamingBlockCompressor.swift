@@ -199,6 +199,12 @@ public struct StreamingBlockCompressor {
             // remaining per-block pipeline (level decision, CRC, zstd)
             // on cache-warm pages.
             let measureCPU = analytics != nil
+            // Snapshot the outer-loop var into an immutable `let` for
+            // the concurrentMap closure. Capturing the `var batchStart`
+            // directly trips Swift 6 strict-concurrency
+            // (`#SendableClosureCaptures` — captured mutable variable
+            // in concurrently-executing code).
+            let batchBase = batchStart
             let parallelStart = ContinuousClock.now
             let processed: [ProcessedBlock] = try concurrentMap(
                 batchIndices,
@@ -214,7 +220,7 @@ public struct StreamingBlockCompressor {
                 // `entropy.probe`. We keep the field on
                 // `ProcessedBlock` for compatibility with the analyse
                 // aggregation but it stays 0.
-                let entropy: Float = perBlockEntropy[absoluteIdx - batchStart]
+                let entropy: Float = perBlockEntropy[absoluteIdx - batchBase]
                 let entropyCPU: TimeInterval = 0
 
                 // Step 2: per-block level decision. lvl≥3 match search
