@@ -78,13 +78,13 @@ public struct StreamingBlockCompressor {
         }
 
         // Slice plan up front: deterministic and trivial to chunk.
-        var slices: [(offset: Int, length: Int)] = []
-        slices.reserveCapacity((input.count + blockSize - 1) / blockSize)
-        var off = 0
-        while off < input.count {
-            let len = min(blockSize, input.count - off)
-            slices.append((off, len))
-            off += len
+        // Built into a `let` rather than a `var` so the @Sendable
+        // worker closures below can capture it without tripping Swift 6
+        // strict-concurrency's "captured mutable variable" diagnostic.
+        let slices: [(offset: Int, length: Int)] = stride(
+            from: 0, to: input.count, by: blockSize
+        ).map { off in
+            (offset: off, length: min(blockSize, input.count - off))
         }
 
         let basePtr = SendableRawPointer(input.baseAddress!)
