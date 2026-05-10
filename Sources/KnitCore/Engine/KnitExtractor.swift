@@ -1,12 +1,26 @@
 import Foundation
 
+/// Top-level extractor for `.knit` archives.
+///
+/// Sits between the CLI and `KnitReader`: opens the archive, validates
+/// each entry name with `SafePath` (zip-slip defence), and routes large
+/// entries through the optional GPU CRC32 verifier. Decompression itself
+/// happens inside `KnitReader.extract`.
+///
+/// The extractor is intentionally synchronous and serial — extract speed
+/// is dominated by SSD write bandwidth on every Apple Silicon
+/// configuration we measure, so per-entry parallelism wouldn't help.
 public final class KnitExtractor {
 
+    /// Aggregate result returned to the CLI / callers. `gpuVerifyUsed`
+    /// lets the CLI report which verification path actually ran for the
+    /// archive (the GPU path is conditional on entry size and Metal
+    /// availability).
     public struct Stats: Sendable {
         public let entries: Int
         public let bytesOut: UInt64
         public let elapsed: TimeInterval
-        /// Whether GPU CRC32 verification was used for at least one entry.
+        /// True iff at least one entry was verified on the GPU.
         public let gpuVerifyUsed: Bool
     }
 

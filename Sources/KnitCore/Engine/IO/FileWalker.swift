@@ -1,21 +1,40 @@
 import Foundation
 
+/// Resolved metadata for one entry in the input tree. The same struct is
+/// used by both ZIP and `.knit` writers; `relativePath` is shaped to be
+/// directly usable as an archive entry name (forward slashes, no leading
+/// slash, directories end with "/").
 public struct FileEntry: Sendable {
     public let absoluteURL: URL
-    public let relativePath: String       // forward-slash, used as ZIP entry name
+    /// Forward-slash separated, written as-is into the archive's entry name.
+    public let relativePath: String
     public let size: UInt64
     public let isDirectory: Bool
     public let modificationDate: Date
     public let unixMode: UInt16
 }
 
+/// Walks an input directory tree and produces a deterministic list of
+/// `FileEntry` values for the compressors to consume. The traversal is:
+///
+///   - **Hidden-file-skipping**: dotfiles are excluded by default
+///     (matches `ditto`/Archive Utility behaviour).
+///   - **Symlink-skipping**: symbolic links inside the tree are ignored
+///     entirely. Following them risks (a) reading attacker-placed files
+///     outside the input root and (b) producing entry names that escape
+///     the input prefix when the link target lives elsewhere.
+///   - **Single-file friendly**: passing a regular file returns one entry.
 public enum FileWalker {
 
-    /// Enumerate files under `root`. If `root` is a single file, returns one entry.
+    /// Enumerate files under `root`. If `root` is a single file, returns
+    /// a one-element list rather than complaining about it not being a
+    /// directory.
     public static func enumerate(_ rawRoot: URL) throws -> [FileEntry] {
         let fm = FileManager.default
-        // Resolve symlinks once so the prefix we strip below matches the URLs the
-        // enumerator hands back (on macOS /tmp is a symlink to /private/tmp).
+        // Resolve symlinks on the *root* once so the prefix we strip
+        // below matches the URLs the enumerator hands back (on macOS
+        // /tmp is itself a symlink to /private/tmp). Note: we only
+        // resolve at the root; per-entry symlinks are still skipped.
         let root = rawRoot.resolvingSymlinksInPath()
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: root.path, isDirectory: &isDir) else {
@@ -34,7 +53,8 @@ public enum FileWalker {
                                      options: [.skipsHiddenFiles]) else {
             throw KnitError.ioFailure(path: root.path, message: "cannot enumerate")
         }
-        // Add the root directory itself as a ZIP entry.
+        // Always include the root directory itself as an explicit entry —
+        // ZIP readers expect to see it for proper directory reconstruction.
         results.append(try makeEntry(absolute: root, relative: rootName + "/", isDirectoryOverride: true))
 
         for case let rawURL as URL in it {

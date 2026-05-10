@@ -81,28 +81,41 @@ public final class ZipWriter {
         let offset = currentOffset
         let nameBytes = Array(descriptor.name.utf8)
         let ts = MSDOSTimestamp(date: descriptor.modificationDate)
+        // ZIP64 is required if any size or offset doesn't fit in 32 bits.
+        // We emit ZIP64 selectively per-entry: small entries stay in the
+        // pre-2001 layout for maximum compatibility with older readers.
         let needsZip64 = uncompressedSize >= 0xFFFF_FFFF
                        || UInt64(payload.count) >= 0xFFFF_FFFF
                        || offset >= 0xFFFF_FFFF
 
         var lfh = Data(capacity: 30 + nameBytes.count + (needsZip64 ? 20 : 0))
-        lfh.appendLE(UInt32(0x04034b50))                               // signature
-        lfh.appendLE(UInt16(needsZip64 ? 45 : 20))                     // version needed
-        lfh.appendLE(UInt16(0x0800))                                   // flags: bit 11 = UTF-8 names
+        lfh.appendLE(UInt32(0x04034b50))                               // LFH signature ("PK\x03\x04")
+        // Version needed: 45 for ZIP64, 20 for the pre-2001 baseline.
+        lfh.appendLE(UInt16(needsZip64 ? 45 : 20))
+        // Flags: bit 11 declares the name is UTF-8 encoded. Required by
+        // APPNOTE 6.3.x for any name outside the IBM Code Page 437 set;
+        // we always emit UTF-8 so we always set the bit.
+        lfh.appendLE(UInt16(0x0800))
         lfh.appendLE(method.rawValue)
         lfh.appendLE(ts.time)
         lfh.appendLE(ts.date)
         lfh.appendLE(crc32)
-        // Sizes — ZIP64 sentinels if oversized
+        // Size fields: when ZIP64 applies, both 32-bit fields are filled
+        // with the sentinel 0xFFFF_FFFF and the real values live in the
+        // ZIP64 extra-field that follows the file name.
         let compressedSize32 = needsZip64 ? UInt32(0xFFFF_FFFF) : UInt32(payload.count)
         let uncompressedSize32 = needsZip64 ? UInt32(0xFFFF_FFFF) : UInt32(uncompressedSize)
         lfh.appendLE(compressedSize32)
         lfh.appendLE(uncompressedSize32)
         lfh.appendLE(UInt16(nameBytes.count))
-        lfh.appendLE(UInt16(needsZip64 ? 20 : 0))                      // extra length
+        lfh.appendLE(UInt16(needsZip64 ? 20 : 0))                      // extra-field length
         lfh.append(contentsOf: nameBytes)
         if needsZip64 {
-            // ZIP64 extra: 0x0001, size 16, uncompressed (8), compressed (8)
+            // ZIP64 extended-information extra-field (APPNOTE §4.5.3):
+            //   tag 0x0001, payload 16 bytes = uncompressedSize(8) + compressedSize(8).
+            // Order matters — readers parse positionally based on which
+            // sentinels were set above. Local headers don't carry the
+            // local-header-offset field (that's central-directory only).
             lfh.appendLE(UInt16(0x0001))
             lfh.appendLE(UInt16(16))
             lfh.appendLE(uncompressedSize)
@@ -122,6 +135,11 @@ public final class ZipWriter {
         ))
     }
 
+    /// Finalise the archive: write the Central Directory (CD), the ZIP64
+    /// EOCD record + locator, and the classic EOCD record. ZIP64 records
+    /// are emitted unconditionally — they're harmless for small archives
+    /// and let us avoid a backward-rewind pass for ones that grew large.
+    /// EOCD = "End Of Central Directory record".
     public func close() throws {
         guard !closed else { return }
         let cdStart = currentOffset
@@ -132,10 +150,11 @@ public final class ZipWriter {
         let cdEnd = currentOffset
         let cdSize = cdEnd - cdStart
 
-        // Always emit ZIP64 EOCD record + locator (cheap insurance for archives we
-        // can't predict the size of upfront). Standard EOCD follows.
         try writeRaw(makeZip64EOCDRecord(cdSize: cdSize, cdOffset: cdStart, totalEntries: UInt64(entries.count)))
-        let zip64EocdOffset = currentOffset - 56  // size of zip64 eocd record
+        // 56 = total bytes written by makeZip64EOCDRecord (12 byte fixed
+        // prefix + 44 byte body). Hard-coded rather than derived because
+        // the record format is fixed by spec.
+        let zip64EocdOffset = currentOffset - 56
         try writeRaw(makeZip64EOCDLocator(zip64EocdOffset: zip64EocdOffset))
         try writeRaw(makeEOCDRecord(cdSize: cdSize, cdOffset: cdStart, totalEntries: entries.count))
 

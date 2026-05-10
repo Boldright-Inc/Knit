@@ -2,18 +2,29 @@ import Foundation
 import CZlibBridge
 import CDeflate
 
-/// Sendable wrapper for a raw pointer whose lifetime is managed externally.
+/// Sendable wrapper for a raw pointer whose lifetime is managed by the
+/// caller (typically a `MappedFile` that outlives the parallel work).
+/// `@unchecked` is correct here: the wrapped value is immutable and the
+/// pointee is read-only for the duration of the closures that capture it.
 struct SendableRawPointer: @unchecked Sendable {
     let value: UnsafePointer<UInt8>
     init(_ value: UnsafePointer<UInt8>) { self.value = value }
 }
 
-/// pigz-style parallel DEFLATE: split input into fixed-size chunks, compress
-/// each chunk independently with zlib using `Z_SYNC_FLUSH`, and concatenate
-/// the results. The final chunk uses `Z_FINISH`.
+/// pigz-style parallel DEFLATE: split the input into fixed-size chunks,
+/// compress each chunk independently with zlib using `Z_SYNC_FLUSH`, and
+/// concatenate the results. The final chunk uses `Z_FINISH`.
 ///
-/// The output is a single, valid raw DEFLATE stream that any standard
-/// decoder (zlib, libdeflate, unzip, etc.) can decompress as one logical unit.
+/// **Why this works**: `Z_SYNC_FLUSH` ends a chunk with the four-byte
+/// pattern `00 00 ff ff` (an empty stored block), which is a valid mid-
+/// stream synchronisation point in raw DEFLATE. Concatenating these
+/// chunks produces one logical raw DEFLATE stream that any standard
+/// decoder (zlib, libdeflate, `unzip`, etc.) decompresses as a single
+/// unit. This is exactly the technique pigz uses for parallel gzip.
+///
+/// libdeflate doesn't expose flush semantics, so we use system zlib for
+/// this path even though libdeflate is the faster single-thread codec.
+/// On 8+ cores the multi-threading more than compensates.
 public struct ParallelDeflate: DeflateBackend, CRC32Computing {
     public let name = "cpu-parallel-zlib"
     public let chunkSize: Int
