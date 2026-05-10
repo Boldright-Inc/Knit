@@ -157,7 +157,7 @@ tell application "Terminal"
     repeat while busy of theTab
         delay 0.5
     end repeat
-    delay 1.0
+    delay 3.0
     repeat with w in windows
         if id of w is theWindowID then
             close w saving no
@@ -192,7 +192,7 @@ tell application "Terminal"
     repeat while busy of theTab
         delay 0.5
     end repeat
-    delay 1.0
+    delay 3.0
     repeat with w in windows
         if id of w is theWindowID then
             close w saving no
@@ -231,7 +231,7 @@ tell application "Terminal"
     repeat while busy of theTab
         delay 0.5
     end repeat
-    delay 1.0
+    delay 3.0
     repeat with w in windows
         if id of w is theWindowID then
             close w saving no
