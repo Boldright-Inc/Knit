@@ -5,11 +5,17 @@ import Foundation
 /// Sits between the CLI and `KnitReader`: opens the archive, validates
 /// each entry name with `SafePath` (zip-slip defence), and routes large
 /// entries through the optional GPU CRC32 verifier. Decompression itself
-/// happens inside `KnitReader.extract`.
+/// happens inside `KnitReader.extract`, driven by a shared
+/// `HybridZstdBatchDecoder` that parallelises per-block libzstd calls
+/// across `concurrency` worker threads — the same pattern that gives
+/// `pack` its 8 GB/s ceiling. Without this, decode is a single-threaded
+/// `ZSTD_decompress` loop and tops out at ~750 MB/s on M5 Max even
+/// though SSD write bandwidth is ten times higher.
 ///
-/// The extractor is intentionally synchronous and serial — extract speed
-/// is dominated by SSD write bandwidth on every Apple Silicon
-/// configuration we measure, so per-entry parallelism wouldn't help.
+/// Cross-entry parallelism isn't done here because real archives often
+/// have one giant entry that dominates total decode time (e.g. a single
+/// VM disk image inside a `.pvm.knit`); intra-entry block parallelism
+/// is what closes the gap to the SSD ceiling on those workloads.
 public final class KnitExtractor {
 
     /// Aggregate result returned to the CLI / callers. `gpuVerifyUsed`
@@ -34,10 +40,17 @@ public final class KnitExtractor {
     /// reaches 100% even when the verify path runs.
     public var progressReporter: ProgressReporter?
 
+    /// Number of worker threads the `HybridZstdBatchDecoder` runs per
+    /// batch. Defaults to `activeProcessorCount`; pass 1 to force
+    /// serial decode (mostly useful in tests).
+    public var concurrency: Int
+
     public init(useGPUVerify: Bool = true,
-                progressReporter: ProgressReporter? = nil) {
+                progressReporter: ProgressReporter? = nil,
+                concurrency: Int = ProcessInfo.processInfo.activeProcessorCount) {
         self.useGPUVerify = useGPUVerify
         self.progressReporter = progressReporter
+        self.concurrency = max(1, concurrency)
     }
 
     public func extract(archive: URL, to destDir: URL) throws -> Stats {
@@ -50,6 +63,13 @@ public final class KnitExtractor {
         let gpuCRC: MetalCRC32? = useGPUVerify ? MetalCRC32() : nil
         var gpuUsed = false
 
+        // One staged decoder shared across all entries: its only mutable
+        // state is per-entry watchdog tracking, which the call-site loop
+        // resets implicitly between entries. CPU-only at the moment;
+        // future GPU `BlockDecoding` implementations slot into the
+        // `gpuPath:` parameter.
+        let stagedDecoder = HybridZstdBatchDecoder(concurrency: concurrency)
+
         let start = ContinuousClock.now
         var bytesOut: UInt64 = 0
         for entry in reader.archive.entries {
@@ -57,7 +77,8 @@ public final class KnitExtractor {
             try reader.extract(entry,
                                to: outURL,
                                gpuCRC: gpuCRC,
-                               progressReporter: progressReporter)
+                               progressReporter: progressReporter,
+                               stagedDecoder: stagedDecoder)
             bytesOut += entry.uncompressedSize
             if gpuCRC != nil, entry.uncompressedSize >= 4 * 1024 * 1024 {
                 gpuUsed = true

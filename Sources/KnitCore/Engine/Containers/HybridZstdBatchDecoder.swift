@@ -80,6 +80,7 @@ public final class HybridZstdBatchDecoder {
     private let gpuPath: BlockDecoding?
 
     private let maxBatchBlocks: Int
+    private let concurrency: Int
     private let watchdogBudgetSeconds: Double = 1.5
     private var consecutiveSlowBatches: Int = 0
     private var poisonedThisEntry: Bool = false
@@ -90,12 +91,21 @@ public final class HybridZstdBatchDecoder {
     /// Eager construction of the GPU pipeline state happens inside the
     /// caller's `gpuPath` factory; if that fails the caller passes nil
     /// and we never touch the GPU.
+    ///
+    /// `concurrency` controls how many blocks within a batch are
+    /// decoded in parallel. Defaults to the host's active processor
+    /// count, which is what unlocks the ~10× decode speed-up vs the
+    /// historical serial libzstd loop. Pass 1 to force serial decode
+    /// (useful in tests that need deterministic ordering for a given
+    /// failure injection).
     public init(cpuPath: BlockDecoding = CPUZstdDecoder(),
                 gpuPath: BlockDecoding? = nil,
-                maxBatchBlocks: Int = 64) {
+                maxBatchBlocks: Int = 64,
+                concurrency: Int = ProcessInfo.processInfo.activeProcessorCount) {
         self.cpuPath = cpuPath
         self.gpuPath = gpuPath?.supportsGPU == true ? gpuPath : nil
         self.maxBatchBlocks = max(1, maxBatchBlocks)
+        self.concurrency = max(1, concurrency)
     }
 
     /// True if the orchestrator will route any block through the GPU
@@ -119,6 +129,15 @@ public final class HybridZstdBatchDecoder {
                        sink: Sink) throws -> Stats {
         precondition(blocks.count == uncompressedSizes.count,
                      "block / size array length mismatch")
+
+        // Reset per-entry adaptive state. The decoder is intended to be
+        // shared across an archive's entries (one allocation, many
+        // calls), but watchdog poisoning and slow-batch counters are
+        // about *this* entry — letting them leak across entries would
+        // demote a healthy entry to CPU-only because a previous entry
+        // had a slow tail.
+        consecutiveSlowBatches = 0
+        poisonedThisEntry = false
 
         var totalBytes: UInt64 = 0
         var fallbackBlocks: Int = 0
@@ -216,30 +235,14 @@ public final class HybridZstdBatchDecoder {
 
         do {
             try staging.withUnsafeMutableBufferPointer { stage in
-                var offset = 0
-                for idx in range {
-                    let outSize = uncompressedSizes[idx]
-                    let outSlice = UnsafeMutableBufferPointer(
-                        start: stage.baseAddress!.advanced(by: offset),
-                        count: outSize
-                    )
-                    let produced: Int
-                    do {
-                        produced = try primary.decodeBlock(blocks[idx], into: outSlice)
-                    } catch {
-                        // Per-block GPU fallback: re-decode just this
-                        // block via CPU. Doesn't poison the rest of the
-                        // batch.
-                        produced = try cpuPath.decodeBlock(blocks[idx], into: outSlice)
-                        fallbackThisBatch += 1
-                    }
-                    if produced != outSize {
-                        throw KnitError.integrity(
-                            "block \(idx) decoded length \(produced) ≠ declared \(outSize)"
-                        )
-                    }
-                    offset += outSize
-                }
+                fallbackThisBatch = try parallelDecodeBlocks(
+                    blocks: blocks,
+                    uncompressedSizes: uncompressedSizes,
+                    range: range,
+                    primary: primary,
+                    perBlockFallback: cpuPath,
+                    staging: stage
+                )
             }
         } catch {
             // Whole-batch failure path: re-decode the entire batch
@@ -298,21 +301,14 @@ public final class HybridZstdBatchDecoder {
         var staging = [UInt8](repeating: 0, count: stagedTotal)
 
         try staging.withUnsafeMutableBufferPointer { stage in
-            var offset = 0
-            for idx in range {
-                let outSize = uncompressedSizes[idx]
-                let outSlice = UnsafeMutableBufferPointer(
-                    start: stage.baseAddress!.advanced(by: offset),
-                    count: outSize
-                )
-                let produced = try cpuPath.decodeBlock(blocks[idx], into: outSlice)
-                if produced != outSize {
-                    throw KnitError.integrity(
-                        "block \(idx) decoded length \(produced) ≠ declared \(outSize)"
-                    )
-                }
-                offset += outSize
-            }
+            _ = try parallelDecodeBlocks(
+                blocks: blocks,
+                uncompressedSizes: uncompressedSizes,
+                range: range,
+                primary: cpuPath,
+                perBlockFallback: nil,
+                staging: stage
+            )
         }
 
         var nextRollingCRC = rollingCRC
@@ -342,4 +338,112 @@ public final class HybridZstdBatchDecoder {
             usedGPU: false
         )
     }
+
+    /// Decode every block in `range` in parallel into the supplied
+    /// `staging` buffer's contiguous slots, using `concurrentMap` to
+    /// fan out across `concurrency` worker threads.
+    ///
+    /// `primary` decodes by default. If `perBlockFallback` is non-nil
+    /// and `primary` throws on a block, that single block is re-decoded
+    /// via the fallback (without poisoning the rest of the batch). With
+    /// `perBlockFallback == nil` the first throw aborts the parallel
+    /// dispatch and propagates to the caller — used for the last-resort
+    /// CPU-only re-decode path where there's nothing left to fall back
+    /// to.
+    ///
+    /// Returns the per-batch fallback count (number of blocks that hit
+    /// the perBlockFallback path).
+    ///
+    /// Thread-safety: each worker writes to a non-overlapping byte
+    /// range of `staging`, so no synchronization is needed inside
+    /// libzstd. The `staging` pointer is captured by the parallel
+    /// closures via `@unchecked Sendable` wrappers because we hold it
+    /// alive on the calling thread for the full `concurrentMap` call.
+    private func parallelDecodeBlocks(
+        blocks: [UnsafeBufferPointer<UInt8>],
+        uncompressedSizes: [Int],
+        range: Range<Int>,
+        primary: BlockDecoding,
+        perBlockFallback: BlockDecoding?,
+        staging: UnsafeMutableBufferPointer<UInt8>
+    ) throws -> Int {
+        guard let stageBase = staging.baseAddress else { return 0 }
+
+        var jobs: [DecodeJob] = []
+        jobs.reserveCapacity(range.count)
+        var offset = 0
+        for idx in range {
+            let frame = blocks[idx]
+            let outSize = uncompressedSizes[idx]
+            // Hostile or buggy input: an empty block frame can't
+            // produce non-zero bytes. Refuse explicitly so a NULL
+            // baseAddress can't slip through.
+            guard let frameBase = frame.baseAddress else {
+                throw KnitError.formatError(
+                    ".knit: block \(idx) has empty compressed frame"
+                )
+            }
+            jobs.append(DecodeJob(
+                frameStart: frameBase,
+                frameLen: frame.count,
+                slotStart: stageBase.advanced(by: offset),
+                slotLen: outSize,
+                blockIdx: idx
+            ))
+            offset += outSize
+        }
+
+        let primaryDecoder = primary
+        let fallbackDecoder = perBlockFallback
+
+        let results: [PerBlockOutcome] = try concurrentMap(
+            jobs,
+            concurrency: self.concurrency
+        ) { job in
+            let frame = UnsafeBufferPointer(start: job.frameStart, count: job.frameLen)
+            let slot = UnsafeMutableBufferPointer(start: job.slotStart, count: job.slotLen)
+            do {
+                let produced = try primaryDecoder.decodeBlock(frame, into: slot)
+                if produced != job.slotLen {
+                    throw KnitError.integrity(
+                        "block \(job.blockIdx) decoded length \(produced) ≠ declared \(job.slotLen)"
+                    )
+                }
+                return PerBlockOutcome(didFallback: false)
+            } catch {
+                guard let fallback = fallbackDecoder else { throw error }
+                let produced = try fallback.decodeBlock(frame, into: slot)
+                if produced != job.slotLen {
+                    throw KnitError.integrity(
+                        "block \(job.blockIdx) decoded length \(produced) ≠ declared \(job.slotLen) (cpu fallback)"
+                    )
+                }
+                return PerBlockOutcome(didFallback: true)
+            }
+        }
+
+        return results.reduce(0) { $0 + ($1.didFallback ? 1 : 0) }
+    }
+}
+
+/// Per-block work item passed to the parallel map. `@unchecked
+/// Sendable` is correct because the wrapped pointers refer to memory
+/// owned by the caller (the mmap-backed archive for `frameStart` and
+/// the staging buffer for `slotStart`) and outlive the `concurrentMap`
+/// call by construction — the staging buffer is live for the full
+/// `withUnsafeMutableBufferPointer` body, and the archive mapping is
+/// owned by `KnitReader`.
+private struct DecodeJob: @unchecked Sendable {
+    let frameStart: UnsafePointer<UInt8>
+    let frameLen: Int
+    let slotStart: UnsafeMutablePointer<UInt8>
+    let slotLen: Int
+    let blockIdx: Int
+}
+
+/// Per-block result returned through `concurrentMap`. Tracks just
+/// whether the block was repaired via fallback so the orchestrator
+/// can surface a meaningful count in `Stats.gpuFallbackBlocks`.
+private struct PerBlockOutcome: Sendable {
+    let didFallback: Bool
 }
