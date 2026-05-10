@@ -6,7 +6,11 @@ import Foundation
 /// `KnitWriter` is append-only and we want deterministic on-disk layout.
 /// The parallelism instead happens *inside* each entry: a single large
 /// file is split into many independent zstd-frame blocks, all of which
-/// compress in parallel via `ParallelBlockCompressor`.
+/// compress in parallel via `StreamingBlockCompressor`.
+///
+/// **Memory contract**: peak RSS during compression is bounded by
+/// `concurrency × blockSize`, independent of input file size. This is
+/// what lets the tool handle 100 GB+ single files without OOM.
 ///
 /// This shape suits the `.knit` use-case (often "one or a handful of very
 /// large files") better than the ZIP shape (often "many small files").
@@ -38,17 +42,25 @@ public final class KnitCompressor: Sendable {
     }
 
     private let backend: BlockBackend
-    private let crc: CRC32Computing
     private let options: Options
-    private let probe: any EntropyProbing
 
     public init(backend: BlockBackend & CRC32Computing, options: Options = Options()) {
         self.backend = backend
-        self.crc = backend
         self.options = options
-        self.probe = AutoEntropyProbe()
     }
 
+    /// Walk the input tree and stream each entry into a `.knit` archive
+    /// without ever buffering an entry's full compressed payload in
+    /// memory. Peak memory is `O(concurrency × blockSize)` regardless of
+    /// total file size, so 100 GB+ inputs no longer trigger the OOM
+    /// killer that the old buffer-then-write design hit on every
+    /// memory-constrained Mac.
+    ///
+    /// Per-block CRC32 and entropy classification happen inside each
+    /// worker on cache-warm pages, then the driver folds CRCs in input
+    /// order via `crc32Combine`. This collapses what used to be three
+    /// passes over the input (CRC → entropy probe → compression) into
+    /// a single cache-warm pass per block.
     public func compress(input: URL, to output: URL) throws -> CompressionStats {
         let entries = try FileWalker.enumerate(input)
         let writer = try KnitWriter(url: output)
@@ -56,6 +68,13 @@ public final class KnitCompressor: Sendable {
 
         var bytesIn: UInt64 = 0
         var bytesOut: UInt64 = 0
+
+        let streamer = StreamingBlockCompressor(
+            backend: backend,
+            blockSize: options.blockSize,
+            concurrency: options.concurrency
+        )
+        let baseLevel = options.level.clampedForZstd()
 
         for entry in entries {
             let header = KnitWriter.EntryHeader(
@@ -65,84 +84,43 @@ public final class KnitCompressor: Sendable {
                 isDirectory: entry.isDirectory
             )
 
-            let payload: KnitWriter.EntryPayload
             if entry.isDirectory {
-                payload = KnitWriter.EntryPayload(
-                    blockSize: 0,
+                // Directory entries carry no data; write an empty
+                // streaming entry to keep the on-disk layout uniform.
+                let streamEntry = try writer.beginStreamingEntry(
+                    header: header,
                     uncompressedSize: 0,
-                    crc32: 0,
-                    blockLengths: [],
-                    blockData: Data()
+                    blockSize: 0,
+                    numBlocks: 0
                 )
-            } else {
-                let mapped = try MappedFile(url: entry.absoluteURL)
-                let buf = mapped.buffer
-                let crcVal = buf.count == 0 ? 0 : crc.crc32(buf, seed: 0)
-
-                let pbc = ParallelBlockCompressor(
-                    backend: backend,
-                    blockSize: options.blockSize,
-                    concurrency: options.concurrency
-                )
-
-                // Probe per-block entropy before invoking the codec. The
-                // result feeds two independent decisions:
-                //   1. Per-block level downgrade — incompressible blocks
-                //      compress at lvl=1 regardless of user level, since
-                //      lvl≥3 match search is pure overhead on noise.
-                //   2. Heatmap sampling — every probed block contributes a
-                //      coloured cell to the visualization.
-                let baseLevel = options.level.clampedForZstd()
-                var probeResults: [EntropyResult] = []
-                if options.entropyProbeEnabled, buf.count > 0 {
-                    probeResults = (try? probe.probe(buf, blockSize: options.blockSize)) ?? []
-                }
-
-                let perBlockLevels: [Int32]?
-                if !probeResults.isEmpty, baseLevel > 1 {
-                    perBlockLevels = probeResults.map { r in
-                        r.isLikelyIncompressible ? Int32(1) : baseLevel
-                    }
-                } else {
-                    perBlockLevels = nil
-                }
-
-                let blockOut = try pbc.compress(
-                    buf,
-                    level: baseLevel,
-                    perBlockLevels: perBlockLevels
-                )
-
-                if let recorder = options.heatmapRecorder, !probeResults.isEmpty {
-                    var batch: [HeatmapSample] = []
-                    batch.reserveCapacity(probeResults.count)
-                    let sizes = blockOut.blockSizes
-                    for (i, r) in probeResults.enumerated() {
-                        let stored = i < sizes.count ? Int(sizes[i]) : r.byteCount
-                        let disposition: HeatmapSample.Disposition =
-                            r.isLikelyIncompressible ? .stored : .compressed
-                        batch.append(HeatmapSample(
-                            entropy: r.entropy,
-                            originalBytes: r.byteCount,
-                            storedBytes: stored,
-                            disposition: disposition
-                        ))
-                    }
-                    recorder.recordBatch(batch)
-                }
-
-                payload = KnitWriter.EntryPayload(
-                    blockSize: UInt32(options.blockSize),
-                    uncompressedSize: UInt64(buf.count),
-                    crc32: crcVal,
-                    blockLengths: blockOut.blockSizes,
-                    blockData: blockOut.combined
-                )
+                try streamEntry.finish(crc32: 0)
+                continue
             }
 
-            try writer.writeEntry(header: header, payload: payload)
-            bytesIn  += payload.uncompressedSize
-            bytesOut += UInt64(payload.blockData.count)
+            let mapped = try MappedFile(url: entry.absoluteURL)
+            let buf = mapped.buffer
+
+            let numBlocks = (buf.count + options.blockSize - 1) / options.blockSize
+            let streamEntry = try writer.beginStreamingEntry(
+                header: header,
+                uncompressedSize: UInt64(buf.count),
+                blockSize: UInt32(options.blockSize),
+                numBlocks: UInt32(numBlocks)
+            )
+
+            let result = try streamer.compress(
+                buf,
+                level: baseLevel,
+                entropyDowngradeEnabled: options.entropyProbeEnabled,
+                heatmapRecorder: options.heatmapRecorder
+            ) { _, frame in
+                try streamEntry.writeBlock(frame)
+            }
+
+            try streamEntry.finish(crc32: result.crc32)
+
+            bytesIn += result.totalIn
+            bytesOut += result.totalOut
         }
 
         try writer.close()
