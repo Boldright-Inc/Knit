@@ -90,7 +90,8 @@ enum CLIAnalyze {
                            packElapsed: TimeInterval,
                            bytesIn: UInt64,
                            bytesOut: UInt64,
-                           entries: Int) -> String {
+                           entries: Int,
+                           walkSkip: WalkSkipReport? = nil) -> String {
         var out = ""
         out += "\n=== analyze: pack ===\n"
         out += "  total wall:                \(formatSeconds(packElapsed))\n"
@@ -153,7 +154,64 @@ enum CLIAnalyze {
             }
         }
 
+        if let walkSkip = walkSkip {
+            out += renderWalkSkip(walkSkip)
+        }
+
         out += "\n"
+        return out
+    }
+
+    // MARK: - Walk skip section
+
+    /// Renders the "what the walker chose not to include" summary that
+    /// answers questions like "Finder says my source is 9 GB but the
+    /// archive came out 7 GB — where did the rest go?". Aggregates by
+    /// reason (hidden / symlink) with totals + the largest contributors
+    /// listed by name so the user can see at a glance whether a chunky
+    /// hidden directory like `.git/` or a forest of `node_modules/.bin/`
+    /// symlinks accounts for the gap.
+    private static func renderWalkSkip(_ report: WalkSkipReport) -> String {
+        var out = ""
+        let hiddenItems = report.entries(reason: .hidden)
+        let symlinkItems = report.entries(reason: .symlink)
+        guard !hiddenItems.isEmpty || !symlinkItems.isEmpty else {
+            out += "\n  walk skip summary: nothing skipped\n"
+            return out
+        }
+
+        out += "\n  walk skip summary:\n"
+        if !hiddenItems.isEmpty {
+            let totalBytes = report.totalBytes(reason: .hidden)
+            let totalItems = report.totalItemCount(reason: .hidden)
+            out += "    hidden:    \(hiddenItems.count) top-level entries, " +
+                   "\(totalItems) items total " +
+                   "(\(formatBytesDecimal(totalBytes)))\n"
+            // Top 8 by bytes — keeps the line list bounded for huge
+            // trees (e.g. node_modules/.bin/ alone might have hundreds).
+            let top = hiddenItems.sorted { $0.bytes > $1.bytes }.prefix(8)
+            for entry in top {
+                out += "      " +
+                       entry.relativePath.padding(toLength: 36, withPad: " ", startingAt: 0) +
+                       "  " + formatBytesDecimal(entry.bytes) +
+                       (entry.itemCount > 1 ? "  (\(entry.itemCount) items)" : "") + "\n"
+            }
+            if hiddenItems.count > top.count {
+                out += "      ... and \(hiddenItems.count - top.count) more hidden entries\n"
+            }
+            out += "    drop --exclude-hidden to include these in the archive\n"
+        }
+        if !symlinkItems.isEmpty {
+            out += "    symlinks:  \(symlinkItems.count) entries (always skipped — " +
+                   "security + .knit v1 has no symlink record)\n"
+            let top = symlinkItems.prefix(5)
+            for entry in top {
+                out += "      \(entry.relativePath)\n"
+            }
+            if symlinkItems.count > top.count {
+                out += "      ... and \(symlinkItems.count - top.count) more symlinks\n"
+            }
+        }
         return out
     }
 

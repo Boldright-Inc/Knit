@@ -36,6 +36,18 @@ public final class KnitCompressor: Sendable {
         /// times — the data needed to decide which encode stage to
         /// hand off to the GPU. Nil in production: zero overhead.
         public var stageAnalytics: StageAnalytics?
+        /// When true, the file walker excludes hidden items
+        /// (POSIX dotfiles + items with `kCFURLIsHiddenKey` set).
+        /// Defaults to **false** — the tar/zip-compatible policy of
+        /// "archive what's there". Pass `true` for distribution-style
+        /// archives where things like `.git/`, `.DS_Store`, `.vscode/`
+        /// shouldn't leak.
+        public var excludeHidden: Bool
+        /// Optional collector populated by `FileWalker.enumerate` with
+        /// every item it chose to skip (hidden, when excluded; always
+        /// symlinks). Pair with `--analyze` to emit a "what was
+        /// skipped" section to stderr after pack finishes.
+        public var walkSkipCollector: WalkSkipCollector?
 
         public init(level: CompressionLevel = .default,
                     concurrency: Int = ProcessInfo.processInfo.activeProcessorCount,
@@ -43,7 +55,9 @@ public final class KnitCompressor: Sendable {
                     heatmapRecorder: HeatmapRecorder? = nil,
                     entropyProbeEnabled: Bool = true,
                     progressReporter: ProgressReporter? = nil,
-                    stageAnalytics: StageAnalytics? = nil) {
+                    stageAnalytics: StageAnalytics? = nil,
+                    excludeHidden: Bool = false,
+                    walkSkipCollector: WalkSkipCollector? = nil) {
             self.level = level
             self.concurrency = max(1, concurrency)
             self.blockSize = blockSize
@@ -51,6 +65,8 @@ public final class KnitCompressor: Sendable {
             self.entropyProbeEnabled = entropyProbeEnabled
             self.progressReporter = progressReporter
             self.stageAnalytics = stageAnalytics
+            self.excludeHidden = excludeHidden
+            self.walkSkipCollector = walkSkipCollector
         }
     }
 
@@ -75,7 +91,11 @@ public final class KnitCompressor: Sendable {
     /// passes over the input (CRC → entropy probe → compression) into
     /// a single cache-warm pass per block.
     public func compress(input: URL, to output: URL) throws -> CompressionStats {
-        let entries = try FileWalker.enumerate(input)
+        let entries = try FileWalker.enumerate(
+            input,
+            excludeHidden: options.excludeHidden,
+            skipCollector: options.walkSkipCollector
+        )
         let writer = try KnitWriter(url: output)
         let start = ContinuousClock.now
 

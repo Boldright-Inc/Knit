@@ -35,11 +35,17 @@ enum CLIProgress {
     }
 
     /// Recursively sum file sizes under `inputURL`. Used as the
-    /// denominator for the `pack` and `zip` progress bars. Skips
-    /// symlinks, matching `FileWalker`'s policy. Errors during the walk
-    /// just halt the count — the printer renders bytes-only when the
-    /// total comes back as 0.
-    static func totalUncompressedBytes(at inputURL: URL) throws -> UInt64 {
+    /// denominator for the `pack` and `zip` progress bars. Mirrors
+    /// `FileWalker`'s policy so the bar's % is honest:
+    ///   - by default includes hidden files (tar-compatible, matches
+    ///     the default `FileWalker.enumerate`);
+    ///   - when `excludeHidden` is true, skips items with
+    ///     `kCFURLIsHiddenKey` set;
+    ///   - always skips symlinks (the walker does too).
+    /// Errors during the walk just halt the count — the printer
+    /// renders bytes-only when the total comes back as 0.
+    static func totalUncompressedBytes(at inputURL: URL,
+                                       excludeHidden: Bool = false) throws -> UInt64 {
         let fm = FileManager.default
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: inputURL.path, isDirectory: &isDir) else {
@@ -50,14 +56,23 @@ enum CLIProgress {
             return (attrs[.size] as? NSNumber)?.uint64Value ?? 0
         }
         guard let it = fm.enumerator(at: inputURL,
-                                     includingPropertiesForKeys: [.isSymbolicLinkKey, .fileSizeKey],
-                                     options: [.skipsHiddenFiles]) else {
+                                     includingPropertiesForKeys: [
+                                        .isSymbolicLinkKey, .fileSizeKey, .isHiddenKey, .isDirectoryKey,
+                                     ],
+                                     options: []) else {
             return 0
         }
         var total: UInt64 = 0
-        for case let url as URL in it {
-            let rv = try? url.resourceValues(forKeys: [.isSymbolicLinkKey, .fileSizeKey])
+        while let next = it.nextObject() {
+            guard let url = next as? URL else { continue }
+            let rv = try? url.resourceValues(forKeys: [
+                .isSymbolicLinkKey, .fileSizeKey, .isHiddenKey, .isDirectoryKey,
+            ])
             if rv?.isSymbolicLink == true { continue }
+            if excludeHidden && rv?.isHidden == true {
+                if rv?.isDirectory == true { it.skipDescendants() }
+                continue
+            }
             if let size = rv?.fileSize { total &+= UInt64(size) }
         }
         return total

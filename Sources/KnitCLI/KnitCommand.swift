@@ -83,6 +83,10 @@ extension KnitCommand {
               help: "Suppress the live progress bar even when stderr is a terminal.")
         var noProgress: Bool = false
 
+        @Flag(name: .customLong("exclude-hidden"),
+              help: "Skip hidden items (.git, .DS_Store, anything with the macOS hidden flag). Default is to include them, matching tar/zip.")
+        var excludeHidden: Bool = false
+
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
             let outputURL = URL(fileURLWithPath: output ?? "\(input).zip").standardizedFileURL
@@ -92,7 +96,7 @@ extension KnitCommand {
                 ? HeatmapRecorder() : nil
             let showProgress = CLIProgress.shouldShowProgress(progress: progress,
                                                               noProgress: noProgress)
-            let totalBytes = showProgress ? (try? CLIProgress.totalUncompressedBytes(at: inputURL)) ?? 0 : 0
+            let totalBytes = showProgress ? (try? CLIProgress.totalUncompressedBytes(at: inputURL, excludeHidden: excludeHidden)) ?? 0 : 0
             let reporter: ProgressReporter? = showProgress
                 ? ProgressReporter(totalBytes: totalBytes, phase: .zipping) : nil
             let printer = reporter.map { CLIProgress.Printer(reporter: $0) }
@@ -106,7 +110,8 @@ extension KnitCommand {
                 concurrency: cores,
                 heatmapRecorder: recorder,
                 entropyProbeEnabled: !noEntropyProbe,
-                progressReporter: reporter
+                progressReporter: reporter,
+                excludeHidden: excludeHidden
             )
             let backend: DeflateBackend & CRC32Computing = parallel
                 ? ParallelDeflate(chunkSize: chunkKb * 1024, concurrency: cores)
@@ -183,6 +188,10 @@ extension KnitCommand {
                                  visibility: .private))
         var analyze: Bool = false
 
+        @Flag(name: .customLong("exclude-hidden"),
+              help: "Skip hidden items (.git, .DS_Store, anything with the macOS hidden flag). Default is to include them, matching tar/zip.")
+        var excludeHidden: Bool = false
+
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
             let outputURL = URL(fileURLWithPath: output ?? "\(input).knit").standardizedFileURL
@@ -192,7 +201,7 @@ extension KnitCommand {
                 ? HeatmapRecorder() : nil
             let showProgress = CLIProgress.shouldShowProgress(progress: progress,
                                                               noProgress: noProgress)
-            let totalBytes = showProgress ? (try? CLIProgress.totalUncompressedBytes(at: inputURL)) ?? 0 : 0
+            let totalBytes = showProgress ? (try? CLIProgress.totalUncompressedBytes(at: inputURL, excludeHidden: excludeHidden)) ?? 0 : 0
             let reporter: ProgressReporter? = showProgress
                 ? ProgressReporter(totalBytes: totalBytes, phase: .packing) : nil
             let printer = reporter.map { CLIProgress.Printer(reporter: $0) }
@@ -204,8 +213,12 @@ extension KnitCommand {
             // `--analyze` instruments the encoder. Same accumulator
             // type as `unpack --analyze`; the renderer separates wall
             // stages from cumulative-CPU stages so the % column has a
-            // meaningful denominator for each. See `CLIAnalyze.renderPack`.
+            // meaningful denominator for each. We also wire a
+            // `WalkSkipCollector` under analyse so the output answers
+            // "where did the size delta vs Finder come from?" (hidden
+            // dirs like `.git/`, symlinks).
             let analytics: StageAnalytics? = analyze ? StageAnalytics() : nil
+            let walkSkipCollector: WalkSkipCollector? = analyze ? WalkSkipCollector() : nil
             let opts = KnitCompressor.Options(
                 level: CompressionLevel(level),
                 concurrency: cores,
@@ -213,7 +226,9 @@ extension KnitCommand {
                 heatmapRecorder: recorder,
                 entropyProbeEnabled: !noEntropyProbe,
                 progressReporter: reporter,
-                stageAnalytics: analytics
+                stageAnalytics: analytics,
+                excludeHidden: excludeHidden,
+                walkSkipCollector: walkSkipCollector
             )
             let compressor = KnitCompressor(backend: CPUZstd(), options: opts)
             let stats = try compressor.compress(input: inputURL, to: outputURL)
@@ -237,11 +252,13 @@ extension KnitCommand {
 
             if let analytics = analytics {
                 let snap = analytics.snapshot()
+                let walkReport = walkSkipCollector?.snapshot()
                 let report = CLIAnalyze.renderPack(snap,
                                                    packElapsed: stats.elapsed,
                                                    bytesIn: stats.bytesIn,
                                                    bytesOut: stats.bytesOut,
-                                                   entries: stats.entriesWritten)
+                                                   entries: stats.entriesWritten,
+                                                   walkSkip: walkReport)
                 FileHandle.standardError.write(Data(report.utf8))
             }
         }

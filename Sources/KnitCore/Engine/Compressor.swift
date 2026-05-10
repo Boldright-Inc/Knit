@@ -58,19 +58,29 @@ public final class ZipCompressor: Sendable {
         /// Optional progress sink. The compressor calls `advance(by:)`
         /// once per finished entry, in input-byte units.
         public var progressReporter: ProgressReporter?
+        /// When true, the file walker excludes hidden items. Defaults
+        /// to **false** — see the matching field in
+        /// `KnitCompressor.Options` for the rationale.
+        public var excludeHidden: Bool
+        /// Optional collector populated by `FileWalker.enumerate`.
+        public var walkSkipCollector: WalkSkipCollector?
 
         public init(level: CompressionLevel = .default,
                     concurrency: Int = ProcessInfo.processInfo.activeProcessorCount,
                     mmapThreshold: Int = 4 * 1024 * 1024,
                     heatmapRecorder: HeatmapRecorder? = nil,
                     entropyProbeEnabled: Bool = true,
-                    progressReporter: ProgressReporter? = nil) {
+                    progressReporter: ProgressReporter? = nil,
+                    excludeHidden: Bool = false,
+                    walkSkipCollector: WalkSkipCollector? = nil) {
             self.level = level
             self.concurrency = max(1, concurrency)
             self.mmapThreshold = mmapThreshold
             self.heatmapRecorder = heatmapRecorder
             self.entropyProbeEnabled = entropyProbeEnabled
             self.progressReporter = progressReporter
+            self.excludeHidden = excludeHidden
+            self.walkSkipCollector = walkSkipCollector
         }
     }
 
@@ -88,7 +98,11 @@ public final class ZipCompressor: Sendable {
 
     /// Compress every entry under `input` (file or directory) into a ZIP at `output`.
     public func compress(input: URL, to output: URL) throws -> CompressionStats {
-        let entries = try FileWalker.enumerate(input)
+        let entries = try FileWalker.enumerate(
+            input,
+            excludeHidden: options.excludeHidden,
+            skipCollector: options.walkSkipCollector
+        )
         let writer = try ZipWriter(url: output)
 
         let start = ContinuousClock.now
