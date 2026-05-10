@@ -123,11 +123,15 @@ trap 'rm -rf "${TMP}"' EXIT
 
 # Each Quick Action spawns a temporary Terminal window so the user can
 # see Knit's `--progress` bar for long-running operations. The window
-# auto-exits the shell on completion; whether macOS auto-closes the
-# window after that depends on Terminal > Settings > Profiles > Shell
-# ("Close the window — When the shell exits cleanly" or "Always").
-# Either way, the operation runs to completion regardless of the user's
-# Terminal preference.
+# auto-closes when the runner finishes — AppleScript polls the new
+# tab's `busy` property and closes the window when the shell exits,
+# regardless of the user's Terminal "Close window when shell exits"
+# preference.
+#
+# The osascript invocation is backgrounded with `& disown` so the
+# Automator workflow returns immediately while Terminal does its
+# thing — otherwise Finder's Quick Action spinner would stay up for
+# the whole run.
 
 cat > "${TMP}/zip.sh" <<'BS'
 RUNNER="$(mktemp -t knit_zip_runner)"
@@ -137,13 +141,33 @@ RUNNER="$(mktemp -t knit_zip_runner)"
   for f in "$@"; do
     printf '/usr/local/bin/knit zip %q --parallel --level 6 --progress -o %q\n' "$f" "${f}.zip"
   done
-  echo 'printf "\\n[Done. Press ⌘W to close.]\\n"'
+  echo 'printf "\\n[Done.]\\n"'
   echo "rm -f -- '${RUNNER}'"
   echo 'exit 0'
 } > "${RUNNER}"
 chmod +x "${RUNNER}"
-osascript -e "tell application \"Terminal\" to activate" \
-          -e "tell application \"Terminal\" to do script \"${RUNNER}\"" >/dev/null
+{
+  osascript <<APPLESCRIPT
+tell application "Terminal"
+    activate
+    set theTab to do script "${RUNNER}"
+    -- `do script` without an `in` clause always opens a fresh window,
+    -- so the front window right after the call is ours to close later.
+    set theWindowID to id of front window
+    repeat while busy of theTab
+        delay 0.5
+    end repeat
+    delay 3.0
+    repeat with w in windows
+        if id of w is theWindowID then
+            close w saving no
+            exit repeat
+        end if
+    end repeat
+end tell
+APPLESCRIPT
+} >/dev/null 2>&1 &
+disown
 BS
 
 cat > "${TMP}/bzx.sh" <<'BS'
@@ -154,13 +178,31 @@ RUNNER="$(mktemp -t knit_pack_runner)"
   for f in "$@"; do
     printf '/usr/local/bin/knit pack %q --level 3 --progress -o %q\n' "$f" "${f}.knit"
   done
-  echo 'printf "\\n[Done. Press ⌘W to close.]\\n"'
+  echo 'printf "\\n[Done.]\\n"'
   echo "rm -f -- '${RUNNER}'"
   echo 'exit 0'
 } > "${RUNNER}"
 chmod +x "${RUNNER}"
-osascript -e "tell application \"Terminal\" to activate" \
-          -e "tell application \"Terminal\" to do script \"${RUNNER}\"" >/dev/null
+{
+  osascript <<APPLESCRIPT
+tell application "Terminal"
+    activate
+    set theTab to do script "${RUNNER}"
+    set theWindowID to id of front window
+    repeat while busy of theTab
+        delay 0.5
+    end repeat
+    delay 3.0
+    repeat with w in windows
+        if id of w is theWindowID then
+            close w saving no
+            exit repeat
+        end if
+    end repeat
+end tell
+APPLESCRIPT
+} >/dev/null 2>&1 &
+disown
 BS
 
 cat > "${TMP}/extract.sh" <<'BS'
@@ -175,13 +217,31 @@ RUNNER="$(mktemp -t knit_extract_runner)"
       *.zip)  printf '/usr/bin/unzip -o %q -d %q\n' "$f" "$dir" ;;
     esac
   done
-  echo 'printf "\\n[Done. Press ⌘W to close.]\\n"'
+  echo 'printf "\\n[Done.]\\n"'
   echo "rm -f -- '${RUNNER}'"
   echo 'exit 0'
 } > "${RUNNER}"
 chmod +x "${RUNNER}"
-osascript -e "tell application \"Terminal\" to activate" \
-          -e "tell application \"Terminal\" to do script \"${RUNNER}\"" >/dev/null
+{
+  osascript <<APPLESCRIPT
+tell application "Terminal"
+    activate
+    set theTab to do script "${RUNNER}"
+    set theWindowID to id of front window
+    repeat while busy of theTab
+        delay 0.5
+    end repeat
+    delay 3.0
+    repeat with w in windows
+        if id of w is theWindowID then
+            close w saving no
+            exit repeat
+        end if
+    end repeat
+end tell
+APPLESCRIPT
+} >/dev/null 2>&1 &
+disown
 BS
 
 emit_workflow "Knit Compress (ZIP)"  "${TMP}/zip.sh"
