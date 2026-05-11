@@ -189,6 +189,12 @@ public final class KnitReader: @unchecked Sendable {
             // non-default modes (e.g. APFS-stored `0o700`
             // user-private dirs unpacking as `0o755`).
             _ = outPath.withCString { chmod($0, mode_t(entry.unixMode)) }
+            // PR #82: stamp the directory's modification time from
+            // the archive. Without this, freshly-unpacked dirs all
+            // carry "now" mtime — losing the historical timestamp
+            // that the .knit faithfully recorded.
+            POSIXFile.setMTime(path: outPath,
+                               secondsSince1970: Int64(entry.modificationDate.timeIntervalSince1970))
             return
         }
 
@@ -261,6 +267,13 @@ public final class KnitReader: @unchecked Sendable {
             if postWriteVerify {
                 try verifyCRC(entry: entry, outPath: outPath, gpuCRC: gpuCRC)
             }
+            // PR #82: stamp the file's mtime from the archive
+            // while the fd is still open. Must come AFTER writes
+            // have completed (writes update mtime; setting before
+            // would be overwritten) and ideally BEFORE close
+            // (saves a path-lookup syscall vs `utimes`).
+            POSIXFile.setMTime(fd: outHandle.fileDescriptor,
+                               secondsSince1970: Int64(entry.modificationDate.timeIntervalSince1970))
             // PR #81: release the input-mmap pages this entry consumed.
             // See `releaseInputPagesFor(entry:)` doc-block for the
             // jetsam-prevention rationale (mirrors PR #76's pack-side
@@ -344,6 +357,11 @@ public final class KnitReader: @unchecked Sendable {
         if postWriteVerify {
             try verifyCRC(entry: entry, outPath: outPath, gpuCRC: gpuCRC)
         }
+        // PR #82: stamp the file's mtime from the archive while
+        // the fd is still open (legacy non-staged path —
+        // identical to the staged-path call above).
+        POSIXFile.setMTime(fd: outHandle.fileDescriptor,
+                           secondsSince1970: Int64(entry.modificationDate.timeIntervalSince1970))
     }
 
     /// Drive the entry's decode through a `HybridZstdBatchDecoder`. The

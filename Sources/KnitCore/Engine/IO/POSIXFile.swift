@@ -122,6 +122,32 @@ enum POSIXFile {
         return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 
+    /// Apply a modification timestamp to a file via `futimes(2)`.
+    /// `seconds` is whole-seconds-since-1970 (the precision the
+    /// `.knit` format stores). Both atime and mtime are set to the
+    /// same value — by convention most archivers don't distinguish
+    /// the two when restoring.
+    static func setMTime(fd: Int32, secondsSince1970: Int64) {
+        let secs = time_t(secondsSince1970)
+        var tv = [
+            timeval(tv_sec: secs, tv_usec: 0),
+            timeval(tv_sec: secs, tv_usec: 0),
+        ]
+        _ = futimes(fd, &tv)
+    }
+
+    /// Apply a modification timestamp to a path via `utimes(2)`.
+    /// Used for directories where no fd is held. Same semantics as
+    /// `setMTime(fd:secondsSince1970:)`.
+    static func setMTime(path: String, secondsSince1970: Int64) {
+        let secs = time_t(secondsSince1970)
+        var tv = [
+            timeval(tv_sec: secs, tv_usec: 0),
+            timeval(tv_sec: secs, tv_usec: 0),
+        ]
+        _ = path.withCString { utimes($0, &tv) }
+    }
+
     /// Concatenate a directory path with an archive entry name in
     /// a byte-preserving way. Equivalent to `dir + "/" + name` —
     /// pulled out into a helper purely so the call sites read
