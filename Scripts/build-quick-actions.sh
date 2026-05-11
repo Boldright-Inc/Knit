@@ -149,32 +149,106 @@ trap 'rm -rf "${TMP}"' EXIT
 # the outer shell exited, the tab has no processes and `close … saving
 # no` succeeds silently regardless of the user's preference.
 
-cat > "${TMP}/zip.sh" <<'BS'
-RUNNER="$(mktemp -t knit_zip_runner)"
+# --------------------------------------------------------------------
+# Shared shell helpers (sourced into every Quick Action via heredoc).
+# Sizes inputs and chooses between two paths:
+#
+#   * Silent background: input total < SIZE_THRESHOLD_BYTES.
+#       knit runs detached, stdout/stderr to /dev/null, no Terminal
+#       window, no notification. The user gets quiet success.
+#
+#   * Terminal-displayed: input total >= SIZE_THRESHOLD_BYTES.
+#       The existing osascript path opens Terminal.app, runs knit with
+#       --progress, auto-closes the window when the runner finishes.
+#
+# Threshold: 100 MiB. On M5 Max this is ~0.02 s of pack work and
+# ~0.05 s of unpack work — well under the "noticeable enough to want
+# feedback" line. Below the threshold the operation is over before
+# Terminal would have finished animating its window in. On lower-tier
+# Apple Silicon (base M1 / M2 with slower SSDs ≈ 1.5 GB/s) 100 MiB
+# is closer to 0.1–0.2 s — still imperceptible.
+#
+# Larger values shift more operations to silent. 100 MiB is the
+# user-preferred value (PR #50 spec).
+SHARED_PRELUDE='
+SIZE_THRESHOLD_BYTES=$((100 * 1024 * 1024))
+
+input_total_bytes() {
+    # Sum the size of every regular file under each argument. Handles
+    # mixed selections of files + directories. Directories are
+    # recursed via `find -type f` so we count payload bytes only
+    # (directory inodes themselves arent compressed).
+    local total=0
+    local arg s
+    for arg in "$@"; do
+        if [[ -d "$arg" ]]; then
+            s=$(/usr/bin/find "$arg" -type f -print0 2>/dev/null \
+                  | /usr/bin/xargs -0 /usr/bin/stat -f "%z" 2>/dev/null \
+                  | /usr/bin/awk "{ s += \$1 } END { print s+0 }")
+        elif [[ -f "$arg" ]]; then
+            s=$(/usr/bin/stat -f "%z" "$arg" 2>/dev/null || echo 0)
+        else
+            s=0
+        fi
+        total=$((total + s))
+    done
+    echo "$total"
+}
+
+should_show_terminal() {
+    # Echo 1 if Terminal should be opened, 0 if the run should be
+    # silent. Threshold-only; no time-based heuristic because we cant
+    # retroactively attach a Terminal to a process we already started.
+    local bytes
+    bytes=$(input_total_bytes "$@")
+    if (( bytes >= SIZE_THRESHOLD_BYTES )); then
+        echo 1
+    else
+        echo 0
+    fi
+}
+'
+
+cat > "${TMP}/zip.sh" <<BS
+${SHARED_PRELUDE}
+
+if [[ "\$(should_show_terminal "\$@")" = "0" ]]; then
+    # Small input: run silently in the background. The user gets a
+    # quick visual cue from Finder (the new .zip appears alongside
+    # the source) without a Terminal pop-up.
+    for f in "\$@"; do
+        /usr/local/bin/knit zip "\$f" --parallel --level 6 -o "\${f}.zip" \\
+            >/dev/null 2>&1 &
+    done
+    disown
+    exit 0
+fi
+
+RUNNER="\$(mktemp -t knit_zip_runner)"
 {
   echo '#!/bin/zsh'
   echo 'set -u'
-  for f in "$@"; do
-    printf '/usr/local/bin/knit zip %q --parallel --level 6 --progress -o %q\n' "$f" "${f}.zip"
+  for f in "\$@"; do
+    printf '/usr/local/bin/knit zip %q --parallel --level 6 --progress -o %q\n' "\$f" "\${f}.zip"
   done
   echo 'printf "\\n[Done.]\\n"'
   echo 'sleep 3'
-  echo "rm -f -- '${RUNNER}'"
+  echo "rm -f -- '\${RUNNER}'"
   echo 'exit 0'
-} > "${RUNNER}"
-chmod +x "${RUNNER}"
+} > "\${RUNNER}"
+chmod +x "\${RUNNER}"
 {
   osascript <<APPLESCRIPT
 tell application "Terminal"
     activate
-    set theTab to do script "${RUNNER}; exit"
-    -- `do script` without an `in` clause always opens a fresh window,
+    set theTab to do script "\${RUNNER}; exit"
+    -- \`do script\` without an \`in\` clause always opens a fresh window,
     -- so the front window right after the call is ours to close later.
     set theWindowID to id of front window
     repeat while busy of theTab
         delay 0.5
     end repeat
-    -- Brief grace period so the outer zsh's `exit` finishes processing
+    -- Brief grace period so the outer zsh's \`exit\` finishes processing
     -- before we send the close request — otherwise Terminal still sees
     -- the shell as a "running process" and prompts the user.
     delay 0.3
@@ -190,25 +264,36 @@ APPLESCRIPT
 disown
 BS
 
-cat > "${TMP}/bzx.sh" <<'BS'
-RUNNER="$(mktemp -t knit_pack_runner)"
+cat > "${TMP}/bzx.sh" <<BS
+${SHARED_PRELUDE}
+
+if [[ "\$(should_show_terminal "\$@")" = "0" ]]; then
+    for f in "\$@"; do
+        /usr/local/bin/knit pack "\$f" --level 3 -o "\${f}.knit" \\
+            >/dev/null 2>&1 &
+    done
+    disown
+    exit 0
+fi
+
+RUNNER="\$(mktemp -t knit_pack_runner)"
 {
   echo '#!/bin/zsh'
   echo 'set -u'
-  for f in "$@"; do
-    printf '/usr/local/bin/knit pack %q --level 3 --progress -o %q\n' "$f" "${f}.knit"
+  for f in "\$@"; do
+    printf '/usr/local/bin/knit pack %q --level 3 --progress -o %q\n' "\$f" "\${f}.knit"
   done
   echo 'printf "\\n[Done.]\\n"'
   echo 'sleep 3'
-  echo "rm -f -- '${RUNNER}'"
+  echo "rm -f -- '\${RUNNER}'"
   echo 'exit 0'
-} > "${RUNNER}"
-chmod +x "${RUNNER}"
+} > "\${RUNNER}"
+chmod +x "\${RUNNER}"
 {
   osascript <<APPLESCRIPT
 tell application "Terminal"
     activate
-    set theTab to do script "${RUNNER}; exit"
+    set theTab to do script "\${RUNNER}; exit"
     set theWindowID to id of front window
     repeat while busy of theTab
         delay 0.5
@@ -226,29 +311,48 @@ APPLESCRIPT
 disown
 BS
 
-cat > "${TMP}/extract.sh" <<'BS'
-RUNNER="$(mktemp -t knit_extract_runner)"
+cat > "${TMP}/extract.sh" <<BS
+${SHARED_PRELUDE}
+
+# For Extract the input is the compressed archive itself, so the size
+# threshold uses the archive's on-disk size. A 100 MiB .knit
+# decompresses to anywhere from ~100 MB to ~3 GB depending on ratio;
+# treating the archive size as the gate keeps the decision simple
+# without parsing the footer.
+if [[ "\$(should_show_terminal "\$@")" = "0" ]]; then
+    for f in "\$@"; do
+        dir="\$(dirname "\$f")"
+        case "\$f" in
+          *.knit) /usr/local/bin/knit unpack "\$f" -o "\$dir" >/dev/null 2>&1 & ;;
+          *.zip)  /usr/bin/unzip -o "\$f" -d "\$dir" >/dev/null 2>&1 & ;;
+        esac
+    done
+    disown
+    exit 0
+fi
+
+RUNNER="\$(mktemp -t knit_extract_runner)"
 {
   echo '#!/bin/zsh'
   echo 'set -u'
-  for f in "$@"; do
-    dir="$(dirname "$f")"
-    case "$f" in
-      *.knit) printf '/usr/local/bin/knit unpack %q --progress -o %q\n' "$f" "$dir" ;;
-      *.zip)  printf '/usr/bin/unzip -o %q -d %q\n' "$f" "$dir" ;;
+  for f in "\$@"; do
+    dir="\$(dirname "\$f")"
+    case "\$f" in
+      *.knit) printf '/usr/local/bin/knit unpack %q --progress -o %q\n' "\$f" "\$dir" ;;
+      *.zip)  printf '/usr/bin/unzip -o %q -d %q\n' "\$f" "\$dir" ;;
     esac
   done
   echo 'printf "\\n[Done.]\\n"'
   echo 'sleep 3'
-  echo "rm -f -- '${RUNNER}'"
+  echo "rm -f -- '\${RUNNER}'"
   echo 'exit 0'
-} > "${RUNNER}"
-chmod +x "${RUNNER}"
+} > "\${RUNNER}"
+chmod +x "\${RUNNER}"
 {
   osascript <<APPLESCRIPT
 tell application "Terminal"
     activate
-    set theTab to do script "${RUNNER}; exit"
+    set theTab to do script "\${RUNNER}; exit"
     set theWindowID to id of front window
     repeat while busy of theTab
         delay 0.5
