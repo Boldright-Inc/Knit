@@ -90,8 +90,19 @@ fi
 # 4. Build the component pkg (the actual payload + postinstall)
 # ---------------------------------------------------------------------------
 echo ">> pkgbuild — component package"
+# --component-plist passes a hand-written manifest that sets
+# BundleIsRelocatable=NO on Knit.app (PR #63 fix). Without it,
+# pkgbuild's auto-detected component metadata defaults to
+# `BundleIsRelocatable=YES`, and macOS Installer then "relocates"
+# the install onto any pre-existing co.boldright.knit Knit.app it
+# finds on disk (e.g. a developer's other source-tree checkout under
+# ~/ClaudeCode/BoZip/dist/Knit.app, registered with Spotlight). The
+# receipt records as installed but /Applications/Knit.app is never
+# materialised — only the relocation-immune Uninstall Knit.command
+# (no bundle identifier) survives.
 pkgbuild \
     --root "${PAYLOAD}" \
+    --component-plist "${PKG_RESOURCES}/Knit.component-plist" \
     --identifier "co.boldright.knit" \
     --version "0.1.0" \
     --install-location "/" \
