@@ -142,12 +142,25 @@ public final class ZipCompressor: Sendable {
         }
 
         for p in prepared {
+            // PR #65: pass the reporter's chunked-write callback ONLY for
+            // entries whose uncompressed bytes haven't already been
+            // counted during prepare (i.e. .stored entries that bypassed
+            // backend.compress). Passing it for `.deflate` or for the
+            // compress-grew-larger fallback would double-count and let
+            // the bar overshoot 100 %.
+            let writeProgress: (@Sendable (UInt64) -> Void)?
+            if p.needsWriteAdvance, let r = reporter {
+                writeProgress = { written in r.advance(by: written) }
+            } else {
+                writeProgress = nil
+            }
             try writer.writeEntry(
                 descriptor: p.descriptor,
                 method: p.method,
                 crc32: p.crc,
                 uncompressedSize: p.uncompressedSize,
-                payload: p.payload
+                payload: p.payload,
+                onProgress: writeProgress
             )
             bytesIn  += p.uncompressedSize
             bytesOut += UInt64(p.payload.count)
@@ -172,6 +185,14 @@ public final class ZipCompressor: Sendable {
         let crc: UInt32
         let uncompressedSize: UInt64
         let payload: Data
+        /// PR #65. True when these bytes have not yet been counted toward
+        /// the `progressReporter` and the writer should fire its per-chunk
+        /// `onProgress` callback against the reporter while it streams
+        /// the payload to disk. False when prepare-phase
+        /// `backend.compress(onProgress:)` already advanced the reporter
+        /// (compressed entries, including the "compress-grew-the-payload"
+        /// fallback) — re-advancing during write would double-count.
+        let needsWriteAdvance: Bool
     }
 
     private static func dataFromBuffer(_ buf: UnsafeBufferPointer<UInt8>) -> Data {
@@ -196,7 +217,8 @@ public final class ZipCompressor: Sendable {
                 method: .stored,
                 crc: 0,
                 uncompressedSize: 0,
-                payload: Data()
+                payload: Data(),
+                needsWriteAdvance: false
             )
         }
 
@@ -208,16 +230,17 @@ public final class ZipCompressor: Sendable {
         if options.level.raw == 0 || buf.count == 0 {
             let crcVal = buf.count == 0 ? 0 : crc.crc32(buf, seed: 0)
             // .stored short-circuit: backend.compress(onProgress:) is
-            // skipped, so we have to advance manually here. Otherwise a
-            // run with `--level 0` (or many tiny files) would show 0 %
-            // for the entire run.
-            onProgress?(UInt64(buf.count))
+            // skipped. PR #65 moved the per-entry advance to the writer's
+            // chunked progress callback (so a multi-GiB stored entry
+            // ticks during its serial NVMe drain instead of jumping 0 →
+            // 100 % and then sitting at 100 % through the actual write).
             return PreparedEntry(
                 descriptor: descriptor,
                 method: .stored,
                 crc: crcVal,
                 uncompressedSize: UInt64(buf.count),
-                payload: Self.dataFromBuffer(buf)
+                payload: Self.dataFromBuffer(buf),
+                needsWriteAdvance: true
             )
         }
 
@@ -240,15 +263,17 @@ public final class ZipCompressor: Sendable {
                                originalBytes: buf.count,
                                storedBytes: buf.count,
                                disposition: .stored)
-            // Entropy-driven .stored: same situation as level==0 above,
-            // backend is skipped — advance here for the bar to tick.
-            onProgress?(UInt64(buf.count))
+            // Entropy-driven .stored: backend skipped. PR #65 advances
+            // during the writer's payload write, not here, so a huge
+            // incompressible entry (the canonical case: a Parallels VM
+            // image inside a ZIP) ticks during its NVMe drain.
             return PreparedEntry(
                 descriptor: descriptor,
                 method: .stored,
                 crc: crcVal,
                 uncompressedSize: UInt64(buf.count),
-                payload: Self.dataFromBuffer(buf)
+                payload: Self.dataFromBuffer(buf),
+                needsWriteAdvance: true
             )
         }
 
@@ -267,7 +292,8 @@ public final class ZipCompressor: Sendable {
         // If compression made it larger, store uncompressed instead (ZIP spec encourages this).
         // The backend already advanced the reporter by buf.count during
         // its compress() pass, so we DON'T re-advance here — the
-        // entry's bytes are already accounted for.
+        // entry's bytes are already accounted for. `needsWriteAdvance:
+        // false` keeps the writer from double-counting.
         if compressed.count >= buf.count {
             recordEntryHeatmap(probe: probeResults,
                                originalBytes: buf.count,
@@ -278,7 +304,8 @@ public final class ZipCompressor: Sendable {
                 method: .stored,
                 crc: crcVal,
                 uncompressedSize: UInt64(buf.count),
-                payload: Self.dataFromBuffer(buf)
+                payload: Self.dataFromBuffer(buf),
+                needsWriteAdvance: false
             )
         }
 
@@ -291,7 +318,8 @@ public final class ZipCompressor: Sendable {
             method: .deflate,
             crc: crcVal,
             uncompressedSize: UInt64(buf.count),
-            payload: compressed
+            payload: compressed,
+            needsWriteAdvance: false
         )
     }
 
