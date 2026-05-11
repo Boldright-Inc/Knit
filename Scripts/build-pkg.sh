@@ -58,6 +58,42 @@ cp    "${ROOT_DIR}/.build/release/knit"     "${PAYLOAD}/usr/local/bin/knit"
 cp -R "${DIST}/QuickActions/"*.workflow     "${PAYLOAD}/Library/Services/"
 chmod 0755 "${PAYLOAD}/usr/local/bin/knit"
 
+# PR #63 fix. SwiftPM generates a `Knit_KnitCore.bundle` next to the
+# binary in `.build/release/` containing Metal kernel sources
+# (`crc32_block.metal`, `entropy_probe.metal`) that `MetalContext`
+# loads + compiles at runtime. The bundle MUST be co-located with
+# the binary at install time — the SwiftPM-generated
+# `resource_bundle_accessor.swift` does:
+#
+#     Bundle.main.bundleURL.appendingPathComponent("Knit_KnitCore.bundle")
+#
+# For `/usr/local/bin/knit`, that resolves to
+# `/usr/local/bin/Knit_KnitCore.bundle` — if absent, the accessor
+# falls back to the build-machine path baked into the binary
+# (`/Users/<builder>/.../.build/.../Knit_KnitCore.bundle`), which
+# obviously doesn't exist on a recipient's Mac. Result: a `Swift
+# fatalError` on the CLI's first Metal touch, surfaced through
+# `OperationCoordinator` as the cryptic "knit exited with status
+# 5" alert (SIGTRAP). Verified via crash report on a recipient's
+# M2 Max:
+#
+#   _assertionFailure ← closure #1 in variable initialization
+#   expression of static NSBundle.module
+#   ← MetalContext.loadRuntimeLibrary(device:)
+#   ← MetalEntropyProbe.init() ← KnitCompressor.compress
+#
+# Ship the bundle alongside the binary so `Bundle.main`-relative
+# resolution succeeds on every machine, not just the one that
+# built the pkg.
+if [[ -d "${ROOT_DIR}/.build/release/Knit_KnitCore.bundle" ]]; then
+    cp -R "${ROOT_DIR}/.build/release/Knit_KnitCore.bundle" \
+          "${PAYLOAD}/usr/local/bin/Knit_KnitCore.bundle"
+else
+    echo "error: ${ROOT_DIR}/.build/release/Knit_KnitCore.bundle not found." >&2
+    echo "       Did 'swift build -c release' run? CLI will SIGTRAP on Metal init." >&2
+    exit 1
+fi
+
 # Stage the user-facing uninstaller as /Applications/Uninstall Knit.command.
 # macOS .pkg has no native uninstall mechanism (unlike Windows MSI), so the
 # industry-standard solution is to ship a discoverable .command file

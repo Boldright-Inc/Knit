@@ -100,6 +100,14 @@ if [[ -x "${BIN_DST}" ]]; then
     removed_anything=1
 fi
 
+# PR #63: the Metal resource bundle ships next to the CLI binary.
+BUNDLE_DST="/usr/local/bin/Knit_KnitCore.bundle"
+if [[ -d "${BUNDLE_DST}" ]]; then
+    echo ">> Removing Metal resource bundle (${BUNDLE_DST}, sudo)"
+    sudo rm -rf "${BUNDLE_DST}"
+    removed_anything=1
+fi
+
 if [[ -d "${APP_DST}" ]]; then
     echo ">> Removing Knit.app (${APP_DST}, sudo)"
     /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
