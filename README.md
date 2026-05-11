@@ -73,9 +73,10 @@ Knit's Metal pipeline therefore focuses on the work where massive parallelism *d
 | Stage | Engine | What it does |
 |---|---|---|
 | Codec (DEFLATE / zstd) | **CPU** (libdeflate / libzstd) | The actual literal/match emission and entropy coding |
-| **Compressibility pre-screen** | **GPU** (`byte_histogram` MSL kernel) | Per-block 256-bin byte histogram → Shannon entropy. Above 7.5 bits/byte, ZIP entries skip the codec entirely; `.knit` blocks downgrade to lvl=1 since match search is wasted on noise. |
-| **CRC32 — pack side** | **GPU** (`crc32_per_slice` MSL kernel) | Per-slice parallel CRC + host-side combine, run alongside compression to hide the integrity-check latency on large entries. |
-| **CRC32 — extract side** | **GPU** (same kernel) | After each entry is written, the freshly written file is mmap'd (page-cache hot) and re-CRC'd to verify against the archive header. Entries < 4 MiB fall through to libdeflate. |
+| **Compressibility pre-screen** | **GPU** (`byte_histogram` MSL kernel) | Per-block 256-bin byte histogram → Shannon entropy. Above 7.5 bits/byte, ZIP entries skip the codec entirely; `.knit` blocks downgrade to lvl=1 since match search is wasted on noise. Dispatched at ~256 MiB chunk granularity, pipelined alongside worker compress. |
+| **CRC32 — pack side** | **CPU** (libdeflate) | Per-block CRC inside the compression worker, on cache-warm pages. We investigated moving this to MetalCRC32 (per-batch dispatch, pipelined like the entropy probe), but per-dispatch overhead exceeds libdeflate's full compute on typical 32–64 MiB batch sizes — see "Architecture decisions we ruled out" below. |
+| **CRC32 — extract side** | **GPU** (`crc32_per_slice` MSL kernel) | After each entry is written, the freshly written file is mmap'd (page-cache hot) and re-CRC'd to verify against the archive header. Entries < 4 MiB fall through to libdeflate. The GPU path wins here because the input is one large contiguous buffer — exactly the regime where MetalCRC32's dispatch overhead amortises. |
+| **Literal-section classifier** | **CPU** (header walker) | Inside `unpack --analyze`, every zstd block's literal-section header is classified (Raw / RLE / Compressed_1Stream / Compressed_4Stream / Treeless). The output drives the Phase 1b GPU-Huffman go/no-go gate. Stays under 2 % of `parallel.decode` wall; opt-in via `--analyze`. |
 | **Heatmap visualization** | **GPU** (probe data) → **CPU** render | Per-block samples drive a 24-bit ANSI heatmap and an exportable PPM. |
 
 The result is an honest division of labour: the CPU compresses, the GPU classifies and verifies, and the user gets to *see* the compressibility of their data — which is what the heatmap is for.
@@ -146,36 +147,56 @@ Reproduce with `./Scripts/bench.sh [size_mb=1024]`.
 - **libdeflate** (vendored) — fastest single-threaded DEFLATE
 - **zlib** (system) — chunk-parallel DEFLATE built on `Z_SYNC_FLUSH`
 - **libzstd** (vendored) — core of `.knit`, designed for block parallelism
-- **Metal compute** — `crc32_per_slice` for integrity, `byte_histogram` for compressibility analysis; both are runtime-compiled and dispatched through a single shared `MetalContext`
+- **Metal compute** — `crc32_per_slice` for extract-side integrity, `byte_histogram` for compressibility analysis; both are runtime-compiled and dispatched through a single shared `MetalContext`
+- **Pipelined GPU dispatch** — the entropy probe and (extract-side) CRC are kicked off on `DispatchQueue.global` *before* the worker fan-out, so the GPU compute overlaps with the CPU codec instead of stacking on top of it
+- **Sharded analytics** — `StageAnalytics` / `LiteralTypeAnalytics` use 32 lock-striped shards (Knuth-multiplicative hash on `Thread.current`) so per-block instrumentation doesn't contend across 16 worker threads
 
 ```
 Sources/
-  KnitCore/         compression engine (Swift)
+  KnitCore/          compression engine (Swift)
     Engine/
-      Backends/      DeflateBackend / BlockBackend / EntropyProbing protocols + impls
-      Containers/    ZipWriter, KnitWriter, KnitReader (with CRC verification)
-      IO/            mmap, FileWalker
-      MetalKernels/  crc32_block.metal, entropy_probe.metal
-      Visualization/ CompressibilityHeatmap, HeatmapRenderer
-  KnitCLI/          command-line entry point
+      Backends/       DeflateBackend / BlockBackend / EntropyProbing protocols + impls
+                      MetalCRC32, MetalEntropyProbe, CPU equivalents
+                      ZstdLiteralClassifier (RFC 8478 literal-section walker)
+      Containers/     ZipWriter, KnitWriter, KnitReader, HybridZstdBatchDecoder
+                      (with per-block CPU fallback + rolling-CRC verify)
+      IO/             mmap, FileWalker (firmlink-safe path resolution via realpath(3))
+      MetalKernels/   crc32_block.metal, entropy_probe.metal
+      Telemetry/      StageAnalytics, LiteralTypeAnalytics (32-shard accumulators)
+      Visualization/  CompressibilityHeatmap, HeatmapRenderer
+      Progress/       ProgressReporter
+  KnitCLI/           command-line entry point (`knit pack`, `unpack`, `zip`, …)
   CDeflate/          libdeflate (vendored)
   CZstd/             zstd (vendored)
   CZlibBridge/       thin C bridge to system zlib (Z_SYNC_FLUSH)
+
 Scripts/
   fetch-vendor.sh         pull libdeflate / zstd sources
-  bench.sh                automated benchmark harness
+  bench.sh                synthetic-corpus benchmark harness (random/repeating/mixed)
+  bench-corpora.sh        real-corpus --analyze runner (defaults to Tests/TestData/)
   build-quick-actions.sh  generate Finder Quick Actions
   install.sh              local install
   package-dmg.sh          DMG build + sign + notarize
+
+.github/workflows/
+  ci.yml                  release-mode build on macos-15 hosted runner
 ```
 
 ## Roadmap & known limitations
 
 - **The codec runs on the CPU, intentionally.** We evaluated a full GPU zstd encoder and concluded the ROI is poor on Apple Silicon: libzstd already saturates available memory bandwidth at low levels, and high-level strategies (lazy / btopt) don't map onto SIMT. Knit's GPU pipeline focuses on classification, integrity, and visualization — work the GPU genuinely does better.
+- **Pack on M5 Max is SSD-write-bound, not CPU-bound.** Benched against an 80 GB Windows VM image: encoder workers finish in ~3.7 s wall, `KnitWriter` drains to NVMe in ~20 s. Free CPU compute on this tier no longer translates to faster pack — moving a stage off the CPU would have to either fit the NVMe write budget (it already does) or shorten the write itself (NVMe controllers don't compress). This is the design target, not a regression to chase.
 - **Adaptive hardware-aware routing is the next milestone.** A short calibration step (run once at install time and cached) measures the local CPU/GPU/SSD ratios so the right backend is picked automatically per machine — base M-series, Pro/Max-tier, fanless Air under sustained load, etc.
 - **`.knit` is a custom container format.** It needs Knit (or a future port of the format) to decode. Tools like `unzip`, 7-Zip, the GNOME Archive Manager, etc. don't understand it. If you need broad interoperability, use ZIP.
 - **Apple Silicon only.** The CLI is built for arm64 Macs running macOS 15 or later. Intel Macs are not supported and there are no plans to support them.
 - **Not yet streaming on the writer side.** Both formats currently mmap their inputs; very-large directories are fine, but writers don't yet stream from arbitrary `Read` sources or stdin.
+
+### Architecture decisions we ruled out
+
+A few well-motivated GPU codec interventions were investigated and retired on bench data. Listed here so future contributors don't repeat the work without new data:
+
+- **GPU Huffman literal decode (Phase 1b).** Plan was a Metal kernel decoding the `Huffman_4Stream` literal section of each `.knit` block in parallel, plugged into the existing `HybridZstdBatchDecoder.gpuPath` slot. The CPU-side classifier we shipped (`ZstdLiteralClassifier`) measures the kernel's blast radius: on the Windows VM corpus, **18 %** of literal-bearing bytes are `Compressed_4Stream`; on a github-like 4 GB tree, **49 %**. Both below the **70 %** threshold at which the kernel would justify its surface area and 10⁹-input differential-fuzz harness. libzstd emits 99.7 % of VM blocks as `Raw_Block` because the data doesn't compress — a perfect GPU Huffman decoder would touch ~25 MB of literals out of 85 GB of decode work. Re-open if a corpus surfaces where the gate passes; the classifier output is one `unpack --analyze` away.
+- **Pack-side GPU CRC.** Plan was to replace the per-worker `libdeflate_crc32` call with a single per-batch `MetalCRC32` dispatch, pipelined behind worker compress. The kernel's per-dispatch overhead is **~80 ms on 35 MiB buffers** (M5 Max self-test reports 731 MB/s vs CPU libdeflate at 71 GB/s on the same size) — that's a 7× pack-time regression on the VM corpus. MetalCRC32 only beats libdeflate on very large single buffers (> 1 GiB), where dispatch cost amortises; it stays in use on the unpack-side post-extract verifier where that condition holds.
 
 ## Contributing
 

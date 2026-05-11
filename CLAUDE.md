@@ -424,6 +424,68 @@ forces off; default uses `isatty(stderr)`. Don't ship CLI subcommands
 without the same treatment — interactive users expect feedback;
 piped consumers don't want `\r`-overwriting noise in their logs.
 
+### 7. macOS path resolution
+
+#### Rule 7.1 — Use `realpath(3)`, not `URL.resolvingSymlinksInPath()`, for prefix-strip arithmetic
+
+PR #45's lesson. On macOS 26 Tahoe (`Mac17,*` hardware, Sequoia
+follow-on), `URL.resolvingSymlinksInPath()` started leaving the
+`/tmp` and `/var/folders/...` firmlinks unresolved on the
+default APFS volume layout — but `FileManager.enumerator` still
+resolves them through `/private/tmp/...`. Any code that:
+
+1. Resolves a root URL via `URL.resolvingSymlinksInPath()`,
+2. Walks its children via `FileManager.enumerator`,
+3. Strips the root's path-length off each child URL to derive
+   a relative path —
+
+will produce garbage relative paths whenever the input is under
+a firmlink. `FileWalker.enumerate` had this bug; `knit pack
+/tmp/foo/src ...` shipped archives whose entries were named
+`src/foo/src/file_0.bin` instead of `src/file_0.bin`.
+
+```swift
+// ❌ broken on macOS 26 — URL.path and FileManager enumerator
+// disagree on /tmp resolution
+let root = rawRoot.resolvingSymlinksInPath()
+let baseLen = root.path.count
+for case let rawURL as URL in fm.enumerator(at: root, ...)! {
+    let rel = String(rawURL.path.dropFirst(baseLen + 1))   // wrong
+    ...
+}
+
+// ✅ realpath(3) always follows symlinks via the kernel — its
+// output matches the form FileManager uses internally
+private static func realpathURL(_ url: URL) -> URL {
+    var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+    let resolved: String? = url.path.withCString {
+        guard let r = Darwin.realpath($0, &buf) else { return nil }
+        return String(cString: r)
+    }
+    guard let resolved else { return url }
+    return URL(fileURLWithPath: resolved)
+}
+let root = realpathURL(rawRoot)
+let baseLen = root.path.count
+// dropFirst(baseLen + 1) is now sound because the enumerator
+// yields children rooted at the same canonical form.
+```
+
+Applies anywhere the code does string-prefix arithmetic on
+`URL.path` for paths potentially under firmlinks — production
+code (`FileWalker.enumerate`) AND test code (the
+`HybridZstdBatchDecoderTests` byte-compare loops used the same
+pattern and broke the same way). Real-world `/Users/...` paths
+are unaffected because user-volume paths aren't firmlinked, which
+is why the bug went unnoticed without CI.
+
+The rule generalises beyond `/tmp` — any future firmlinked
+volume layout (e.g. a hypothetical macOS 27 change) will trip
+the same way. Using `realpath(3)` makes the code resilient
+because it asks the kernel for the canonical answer instead
+of relying on a Foundation API whose resolution policy has
+already changed once.
+
 ---
 
 ## Testing requirements
@@ -515,48 +577,143 @@ about it".
 | #38 | pipeline entropy probe with worker compress | Per-batch probe dispatched on `DispatchQueue.global` *before* workers start the current batch — async resolve via `ProbeFuture` (DispatchSemaphore + NSLock). Workers still consume entropy from `EntropyResult` arrays; probe wall hides behind worker work |
 | #39 | chunk pipelined probe into ~256 MiB | One GPU dispatch per ~8 batches instead of per batch; 2 291 dispatches × 18 ms → ~320 dispatches × 30 ms. Bootstrap-resolves chunk 0; thereafter chunks resolve at transitions with the worker-loop wall already covering the dispatch wall |
 
-## Current bench reference (M5 Max, post-PR-#39, 2026-05-10)
+## Recent landed work (PRs #40–#45)
+
+This block is the post-handoff narrative — the cloud session
+shipped through #39, the local session shipped #40 onward. The
+analyse-driven discipline (Rule 4.1) ran the table this round:
+three GPU codec interventions were investigated, two retired on
+no-go data, one CI safety net + one correctness fix landed.
+
+| PR | Title | What it taught / what landed |
+|---|---|---|
+| #40 | docs(CLAUDE.md): post-#39 status + Phase 1b plan + corpus convention | Handoff PR; added the "Recent landed work (PRs #29–#39)", "Current bench reference", "Phase 1b" plan, and bench corpus convention sections that the local agent picked up from |
+| #41 | tools(bench): `Scripts/bench-corpora.sh` for `--analyze` regression runs | First useful finding from the script: the post-PR-#40 "Current bench reference" was stale. Pack on the user's 80 GB VM came in at **27.85 s** wall, not 74.3 s. `archive.write` 20.34 s = 73 % of wall — pack is already SSD-write-bound on this M5 Max. The `compute.crc` cumulative is **27 s**, not 1141 s. Rule-4.1 "next lever" needed re-thinking |
+| #42 | fix(tests): unwrap `Double?` in `ProgressReporterTests` for Swift 6 | Tiny test fix; `XCTAssertEqual(... , accuracy:)` doesn't accept optionals. Spun off via the spawn-task chip while a different PR was in progress — kept that PR scoped |
+| #43 | feat(unpack): Phase 1b.0 spike — zstd literal-section classifier | CPU-only RFC 8478 walker (`ZstdLiteralClassifier`) wired into `HybridZstdBatchDecoder.parallelDecodeBlocks` worker. Sibling `LiteralTypeAnalytics` accumulator with the same 32-shard pattern as `StageAnalytics`. Renders distribution + PASS/FAIL gate after `unpack --analyze`. **Result: both real corpora FAILED the ≥70 % `Compressed_4Stream` gate** — VM at 18.09 %, github-like at 49.22 %. Phase 1b kernel work retired (see "Investigated, no-go" below) |
+| #44 | ci: add release-mode build on `macos-15` | Single-job workflow: `swift build -c release` on every push to `main` and PR. Documented reason: PRs #26 and #28 both broke `package-dmg.sh` because debug builds don't run strict-concurrency to completion. `swift test` is gated on the FileWalker fix below + a tiny follow-up PR to wire the job |
+| #45 | fix(filewalker): use `realpath(3)` so firmlinks resolve consistently on macOS 26 | Real correctness regression discovered during CI workflow validation. macOS 26 Tahoe stopped resolving `/tmp` → `/private/tmp` in `URL.resolvingSymlinksInPath()`, but `FileManager.enumerator` still resolves them — mismatch breaks `FileWalker.enumerate`'s prefix-strip arithmetic, producing archives with mangled entry names (e.g. `src/foo/src/file_0.bin` instead of `src/file_0.bin`) for any input under `/tmp` or `/var/folders/...`. Real-world `/Users/...` paths were unaffected, which is why the bug shipped silently. Fix: use Darwin's `realpath(3)` instead of `URL.resolvingSymlinksInPath()`. Companion: same firmlink-mismatch existed in two test helpers, fixed in the same PR |
+
+## Current bench reference (M5 Max 18-core, post-PR-#45, 2026-05-10)
 
 The reference walls we're working against. Use `--analyze` to refresh
 after every codec/orchestrator change. Numbers ≠ baselines if they
 came from a different build of `main`.
 
-**Pack — 80 GB Windows-VM `.pvm.knit`** (29 entries, ratio 99.7 %):
-- total: 74.3 s — encoder wall 74.3 s
-- stage wall: entropy.probe 0.2 s, parallel.compress 65.5 s, archive.write 8.5 s
-- cumulative CPU: **compute.crc 1141.7 s (498 ms/batch)**, compute.compress 15.8 s
-- **next lever per Rule 4.1**: wire `MetalCRC32` into the per-block worker pipeline
+**These supersede the pre-PR-#41 "post-PR-#39" numbers** that an
+earlier draft of this section quoted. PR #41 (the bench script)
+discovered those were ~3× off on this hardware — pack on the VM
+corpus was reported at 74 s but actually runs in 28 s. The shape
+of the bottleneck moved with the wall: pack is now SSD-write-bound
+on the user's actual host, not CPU-bound.
 
-**Pack — 9 GB GitHub folder** (100 817 small files):
-- total: 10.6 s, batches 89 653, avg 0.1 MiB, ratio 83.1 %
-- stage wall: entropy.probe 7.0 s, parallel.compress 15.3 s, archive.write 0.4 s
-- cumulative CPU: compute.crc 31.7 s, compute.compress 5.9 s
-- bottleneck: per-entry FS overhead; further wins require batched CRC dispatch and/or `KnitWriter` syscall reduction
+**Pack — 80 GB Windows-VM `test1.pvm`** (29 entries, ratio 99.7 %):
+- total: **27.85 s** wall (was 74.3 s in the stale draft)
+- stage wall: entropy.probe 3.64 s, parallel.compress 3.67 s, **archive.write 20.34 s (73.1 %)**
+- cumulative CPU: compute.crc **27.07 s** (was 1141.7 s), compute.compress 15.37 s
+- **bottleneck on this host: SSD write ceiling** — workers finish in ~3.7 s wall; the rest of the encoder wall is `KnitWriter` draining to NVMe at ~4.2 GB/s sustained
+- There is no remaining GPU-codec lever that meaningfully moves this wall (see "Investigated, no-go" below)
 
-**Unpack — 80 GB VM**: total 101.8 s; parallel.decode 61.2 s (47 ms/batch); sink 7.8 s
-**Unpack — 9 GB GitHub**: total 19.2 s; parallel.decode 2.1 s; sink 6.3 s — sink-bound
+**Pack — 4.3 GB github-like `test2/`** (83 164 small files, ratio 67.7 %):
+- total: 11.51 s — 74 104 batches at avg 0.04 MiB
+- stage wall: entropy.probe 3.11 s, parallel.compress 2.90 s, archive.write ~0 s
+- bottleneck: per-entry FS overhead (`mkdir` / `createFile` / sync); recent PRs #31–#33 already squeezed this; further wins require `KnitWriter` syscall reduction
+- Note: the `4.3 GB / 83 k files` corpus replaces the older `9 GB / 100 k files` github reference. The bottleneck shape is identical
 
-Raw analyze output is reproducible from `Tests/Benchmarks/data/external/`
-(see "Bench corpus directory convention" below).
+**Unpack — 80 GB VM**: total 94.12 s; parallel.decode 53.31 s; sink 7.36 s. `decoder wall: 0.10 s` is the known per-entry-wall analytics bug (see Open backlog), not a real wall measurement
+**Unpack — 4.3 GB github-like**: total 12.50 s; parallel.decode 1.61 s; sink 6.08 s — sink-bound
 
-## Phase 1b — GPU Huffman literal decode (next major phase)
+Raw analyze output is reproducible from `Tests/TestData/`
+(see "Bench corpus directory convention" below — note the path
+update: the local agent stages corpora under `Tests/TestData/`,
+not `Tests/Benchmarks/data/external/`).
+
+## Investigated, no-go (retired GPU codec interventions)
+
+The post-#40 CLAUDE.md proposed two GPU codec levers under the
+"Open backlog" header. PR #43's spike and PR #41's bench data
+together produced **no-go** results for both on this hardware /
+corpus combination. The next agent should NOT re-attempt these
+without new motivating data. The detailed analyses survive
+under "Phase 1b — GPU Huffman literal decode" below, but the
+short version is here.
+
+### Phase 1b GPU Huffman literal decode — FAILED gate
+
+PR #43 shipped the CPU pre-parse classifier and ran it against
+both real corpora. The gate is `bytes_in_Compressed_4Stream
+literal_sections / bytes_in_all_literal-bearing_zstd_blocks` ≥
+70 %. Actual:
+
+| Corpus | Compressed_4Stream byte share (literal-bearing) | All-bytes share |
+|---|---|---|
+| `test1.pvm` (80 GB VM) | **18.09 %** ✗ | 0.03 % |
+| `test2/` (4.3 GB github-like) | **49.22 %** ✗ | 13.89 % |
+
+Why so low: libzstd refuses to compress the VM corpus's
+near-random data (99.7 % ratio) and emits 99.7 % of zstd inner
+blocks as `Raw_Block` (no literal section at all). The
+github-like corpus is 71.8 % bytes-in-Raw-blocks because small
+files don't reach the threshold at which libzstd commits to a
+Compressed_Block. A GPU Huffman decoder would touch ~25 MB of
+literals out of 85 GB of decode work on the VM, ~295 MB out of
+3.4 GB on github-like — too small to justify the kernel +
+1e9-input fuzz harness investment.
+
+The CPU classifier itself (~1 % of `parallel.decode` wall) stays.
+Re-run `unpack --analyze` on a new corpus before re-opening Phase
+1b — if a realistic workload pushes the gate ≥ 70 %, the kernel
+work becomes worth doing.
+
+### Pack-side GPU CRC — FAILED dispatch budget
+
+Investigated mid-session; never shipped. The plan was to
+replace the per-block `libdeflate_crc32` call in the worker
+pipeline with a single per-batch `MetalCRC32` dispatch, hidden
+behind worker compress via the `ProbeContext`-style pipeline
+shape. Two empirical findings killed it:
+
+1. `metal-info`'s built-in self-test reports MetalCRC32 at
+   **731 MB/s** on 64 MB vs CPU libdeflate at **71 GB/s**.
+   GPU dispatch + commit + wait overhead dominates on the
+   buffer sizes pack actually uses (~32 MiB batches).
+2. With the pipelined wiring in place, the bench showed
+   **80 ms per dispatch on 35 MiB VM batches** — a 7×
+   pack-time regression on `test1.pvm` (27.85 s → 199.96 s).
+   Reverted in the same session.
+
+Per CLAUDE.md Rule 4.1: the cumulative `compute.crc` lever was
+27 s on this hardware (not 1141 s as the stale reference said).
+Even at zero dispatch cost the wall-time win is bounded by
+`parallel.compress` dropping from 3.67 s to ~0 — a few-second
+ceiling, not a multi-second floor. SSD writes already cap the
+encoder wall.
+
+The takeaway: **MetalCRC32 only beats libdeflate on > 1 GiB
+single buffers** (where dispatch overhead amortises). It stays
+wired into the unpack-side per-entry verifier (`KnitExtractor`'s
+`gpuCRC`) for the post-extract full-file pass on large entries
+— that's the regime it's good at.
+
+## Phase 1b — GPU Huffman literal decode (retired)
 
 Detail-heavy section so a fresh agent can pick this up cold.
+**Retired per PR #43's spike** — see "Investigated, no-go" above.
+Kept verbatim because (a) the architecture sketch is the right
+shape if a future corpus pushes the gate ≥ 70 %, and (b) the
+spike's existing infrastructure (CPU classifier + `--analyze`
+distribution renderer) is what would be re-used.
 
-### Why this is "next"
+### Why this WAS "next" (pre-spike)
 
 Unpack-side, `parallel.decode` is the dominant stage on every
-corpus large enough to be GPU-relevant: 61 s on the 80 GB VM,
-30 % of the GitHub-corpus decoder wall. Per Rule 4.1 the
+corpus large enough to be GPU-relevant: 53 s on the 80 GB VM,
+30 % of the github-like decoder wall. Per Rule 4.1 the
 intervention is "GPU Huffman literal decoder".
 
-Pack-side, the dominant lever is `MetalCRC32` (see bench
-reference above). The Huffman work below is the larger /
-higher-impact piece, but a pack-side GPU CRC PR is a natural
-smaller stepping stone if Phase 1b risk feels too large
-upfront. Either order is fine; Phase 1b *first* gives the next
-agent a chance to validate the differential-fuzz harness
-against a smaller surface before scaling it to Phase 2.
+Pack-side, the cloud session proposed `MetalCRC32` as the
+smaller stepping stone. Both proposals were retired by the
+spike data — see "Investigated, no-go" above.
 
 ### Goal
 
@@ -699,51 +856,86 @@ reasoning.
 
 ## Bench corpus directory convention
 
-The local agent has real input data. Standard locations:
+The local agent has real input data. Standard locations on this
+host (post-PR-#41):
 
 ```
-Tests/Benchmarks/data/external/      ← real-world inputs; gitignored
-    github/                          ← real GitHub repo checkout (~9 GB, 100k files)
-    pvm/                             ← Windows VM .pvm files (~80 GB, 29 files)
-    silesia/                         ← Silesia benchmark suite (~210 MB)
-    enwik9                           ← Wikipedia text corpus (~1 GB)
+Tests/TestData/      ← real-world inputs; gitignored
+    test1.pvm        ← Windows VM image (80 GB, 1 file, ratio 99.7 %)
+    test2/           ← github-like tree (4.3 GB, 83 164 files, ratio 67.7 %)
 ```
 
 The local agent has read access to these. They are
-**gitignored** (large + non-redistributable); do not check them
-in. Bench scripts source from this directory:
+**gitignored** (`Tests/TestData/` in `.gitignore`); do not check
+them in. `Scripts/bench-corpora.sh` sources from this directory
+by default and honours `KNIT_BENCH_CORPUS_ROOT` for overrides.
 
-- `./Scripts/bench-corpora.sh` — pack and unpack each subdirectory
-  with `--analyze`, dump stage breakdowns to
-  `Tests/Benchmarks/results/<timestamp>/`. If this script does
-  not exist yet, the next agent's first concrete task is to
-  write it — convention above is the canonical layout.
+- `./Scripts/bench-corpora.sh [name…]` — pack + unpack each child
+  of `${KNIT_BENCH_CORPUS_ROOT:-Tests/TestData/}` with `--analyze`,
+  dump per-corpus analyze logs + a `summary.tsv` to
+  `Tests/Benchmarks/results/<timestamp>/`. Archives + extracted
+  trees are removed after each run so the results dir stays small;
+  set `KNIT_BENCH_KEEP_ARCHIVE=1` to opt out (iterating on a codec
+  change and want to re-unpack the same archive).
 - `./Scripts/diff-fuzz-decode.sh <iterations>` — Phase 1b
-  differential fuzzer. Same shape: source data from
-  `data/external/`, write fuzz seeds to
-  `Tests/Benchmarks/results/fuzz/<timestamp>/`.
+  differential fuzzer. Mentioned in the retired Phase 1b plan
+  below. Not currently present; only build it if a future workload
+  passes the Phase 1b gate.
 
-Reference results from before any Phase 1b work are in
-`Tests/Benchmarks/results/baseline-2026-05-10.tsv` (or will be
-once the next agent runs `bench-corpora.sh` on post-#39 main —
-the analyze numbers in the "Current bench reference" section
-above are the expected output).
+The post-PR-#45 baseline `summary.tsv` is captured in the PR #41
+description (and is the source of the "Current bench reference"
+numbers above). Re-running `bench-corpora.sh` on a fresh `main`
+checkout reproduces those walls within run-to-run noise.
+
+> **Earlier drafts of this document** quoted a different path
+> (`Tests/Benchmarks/data/external/`) and named different corpora
+> (`github/`, `pvm/`, `silesia/`, `enwik9`). The actual on-disk
+> layout the local agent uses is `Tests/TestData/{test1.pvm,
+> test2/}` as above. Both are gitignored.
 
 ## Open backlog
 
 Tracked in PR descriptions; consolidated here for ease of
-prioritisation. Most-recent first.
+prioritisation. Most-recent first. The two top items from the
+previous draft (Phase 1b GPU Huffman, pack-side GPU CRC) have
+moved to the "Investigated, no-go" section above.
 
 | Item | Why | Sketch |
 |---|---|---|
-| **Phase 1b — GPU Huffman literal decode** | see "Phase 1b" section above; dominant unpack lever (61 s of 102 s on VM) | MSL kernel, plug into `HybridZstdBatchDecoder.gpuPath` |
-| **Pack-side GPU CRC** | `compute.crc` is 1141 s cumulative on VM pack (Rule 4.1 next intervention for the pack side). `MetalCRC32` exists but is not wired into the per-block worker pipeline | replace `libdeflate_crc32` call in `StreamingBlockCompressor` worker with a batched MetalCRC32 path; falls back to CPU when `MetalContext()` is nil |
-| **CI release-mode build** | PRs #26 and #28 both broke `package-dmg.sh` because debug `swift build` didn't run strict-concurrency to completion | add `swift build -c release` + `swift test -c release` jobs to CI |
+| **`swift test` CI job** | PR #44 added `swift build -c release` only; PR #45 unblocks tests (FileWalker firmlink fix). One-line follow-up adds the job | append a second job to `.github/workflows/ci.yml` running `./Scripts/run-tests.sh` |
 | **Atomic-on-success commit for `unpack`** | Streaming write + final-CRC mismatch leaves a partial output file on disk | write to `.tmp`, rename on CRC pass |
 | **Per-block CRCs in `.knit` v2** | Allows per-batch verify-before-commit instead of end-of-entry only | format version bump |
 | **Symlink preservation** | Currently always skipped; tar/zip preserve them | `.knit` v2 entry type, plus `--preserve-symlinks` flag |
 | **Heatmap interleave on parallel-entry path** | When `KnitCompressor` runs entries in parallel, heatmap samples interleave non-deterministically | thread per-task `HeatmapRecorder`s, drain in order |
-| **Decoder per-entry wall analytics bug** | `StageAnalytics.startWallClock()` is called per-entry, which overwrites earlier starts; analyse shows `decoder wall: 0.022 s` while stage sums are 4 s | accumulate or only set first |
+| **Decoder per-entry wall analytics bug** | `StageAnalytics.startWallClock()` is called per-entry, which overwrites earlier starts; analyse shows `decoder wall: 0.10 s` while stage sums are ~60 s on the VM unpack | accumulate or only set first |
+| **Standardize path resolution helper** | `FileWalker.realpathURL` exists but is private. If a second caller wants the same firmlink-safe resolution, pull it into a shared utility | move to a thin `Sources/KnitCore/Engine/IO/RealPath.swift` once a second call site needs it |
+
+### Pivot direction (post-#45)
+
+The three GPU codec levers the earlier roadmap proposed (Phase 1b,
+pack-side GPU CRC, Phase 2 full FSE) have all been retired or
+deprioritised based on bench data on this M5 Max. The project
+mandate ("push pack/unpack to I/O ceiling") has effectively been
+met — pack is SSD-write-bound at ~3 GB/s, unpack is
+sink-write-bound on small-file corpora and parallel-decode-bound
+(memcpy-dominated for incompressible inputs) on large-file
+corpora. Remaining backlog is correctness + infrastructure, not
+codec perf.
+
+A future agent who wants to revisit GPU codec work should first:
+
+1. Run `bench-corpora.sh` on the target corpus. Compare against
+   "Current bench reference" above.
+2. If `parallel.decode` and `parallel.compress` walls are both
+   small fractions of total wall (= already I/O-bound), the
+   answer is "the GPU has nothing useful to do here on this
+   corpus" — same outcome as PR #43's spike.
+3. If they're not — i.e. a corpus exists where the codec is
+   actually CPU-bound — re-open Phase 1b's classifier on that
+   corpus first, before any kernel work. PR #43's
+   `ZstdLiteralClassifier` + `LiteralTypeAnalytics` are still
+   wired in and produce the gate number automatically when
+   `unpack --analyze` runs.
 
 ---
 
