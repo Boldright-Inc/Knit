@@ -173,7 +173,14 @@ final class OperationCoordinator: NSObject, @unchecked Sendable {
     /// time — runs are executed serially (see `pendingRuns`). The map
     /// shape is retained to keep the index-keyed cleanup paths in
     /// `handleChildExit` unchanged, but it now functions as a singleton.
-    private var children: [Int: (progress: Progress, process: Process)] = [:]
+    ///
+    /// PR #67: also holds the `NDJSONLineParser` so `handleChildExit`
+    /// can pull captured stderr text out of it for the failure alert.
+    /// Nil for runs without `--progress-json` (the `/usr/bin/unzip`
+    /// fallback path).
+    private var children: [Int: (progress: Progress,
+                                  process: Process,
+                                  parser: NDJSONLineParser?)] = [:]
 
     /// Runs that haven't been launched yet. Drained one-at-a-time by
     /// `launchNextIfNeeded()` from `start()` and from `handleChildExit`.
@@ -327,15 +334,23 @@ final class OperationCoordinator: NSObject, @unchecked Sendable {
         proc.standardOutput = outPipe
         proc.standardError = errPipe
 
+        // The parser is stored on the children-map entry so
+        // handleChildExit can read its capturedText for the failure
+        // alert. Nil when there's no JSON channel to parse (unzip
+        // fallback) — stderr is drained without text capture in that
+        // case.
+        let parser: NDJSONLineParser? = run.progressJSON ? NDJSONLineParser() : nil
+
         lock.lock()
-        children[index] = (child, proc)
+        children[index] = (child, proc, parser)
         lock.unlock()
 
-        if run.progressJSON {
+        if let parser = parser {
             // ndjson lines come on stderr (the CLI writes the final
             // summary to stdout, progress to stderr — same split as
-            // the human-facing text bar).
-            let parser = NDJSONLineParser()
+            // the human-facing text bar). Non-JSON lines (real error
+            // output) are captured inside the parser and surfaced via
+            // `capturedTextSnapshot()` on failure.
             errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 let data = handle.availableData
                 if data.isEmpty {
@@ -436,9 +451,43 @@ final class OperationCoordinator: NSObject, @unchecked Sendable {
         let pending = pendingCount - 1
         pendingCount = pending
         let status = process.terminationStatus
+        let reason = process.terminationReason
         if launchError != nil || (status != 0 && !cancelled) {
-            anyFailureMessage = (launchError as NSError?)?.localizedDescription
-                ?? "knit exited with status \(status)"
+            // PR #67: build a useful failure message instead of the
+            // cryptic "knit exited with status N".
+            //
+            //  * Distinguish a Swift runtime trap (terminationReason ==
+            //    .uncaughtSignal, status == signal number — e.g.
+            //    SIGTRAP=5 from a precondition or force-unwrap) from a
+            //    clean exit code (.exit, status == app-chosen).
+            //  * Append the most recent non-JSON lines the CLI wrote
+            //    to stderr (typically the actual error text like
+            //    "knit: cannot create output: …"), so the user sees
+            //    why the operation failed without having to fetch a
+            //    crash report or re-run from a terminal.
+            let baseMsg: String
+            if let err = launchError as NSError? {
+                baseMsg = err.localizedDescription
+            } else {
+                switch reason {
+                case .uncaughtSignal:
+                    baseMsg = "knit was terminated by signal \(status) (\(Self.signalName(status)))"
+                case .exit:
+                    baseMsg = "knit exited with status \(status)"
+                @unknown default:
+                    baseMsg = "knit exited with status \(status)"
+                }
+            }
+            let captured = entry?.parser?.capturedTextSnapshot() ?? []
+            // Take only the tail — earlier non-JSON output is usually
+            // benign banner / probe-init text; the last few lines are
+            // where the real failure cause sits.
+            let tail = Array(captured.suffix(8))
+            if tail.isEmpty {
+                anyFailureMessage = baseMsg
+            } else {
+                anyFailureMessage = baseMsg + "\n\n" + tail.joined(separator: "\n")
+            }
         }
         lock.unlock()
 
@@ -530,6 +579,29 @@ final class OperationCoordinator: NSObject, @unchecked Sendable {
         return input.deletingLastPathComponent()
             .appendingPathComponent("\(base)\(suffix)")
     }
+
+    /// Map a POSIX signal number to its canonical mnemonic for the
+    /// failure-alert text. Used when `Process.terminationReason ==
+    /// .uncaughtSignal` so a Swift runtime trap shows as e.g. "signal
+    /// 5 (SIGTRAP)" instead of the cryptic "exited with status 5".
+    /// PR #67.
+    private static func signalName(_ sig: Int32) -> String {
+        switch sig {
+        case SIGHUP:  return "SIGHUP"
+        case SIGINT:  return "SIGINT"
+        case SIGQUIT: return "SIGQUIT"
+        case SIGILL:  return "SIGILL"
+        case SIGTRAP: return "SIGTRAP"   // Swift runtime trap (precondition fail, force-unwrap nil, integer overflow, fatalError)
+        case SIGABRT: return "SIGABRT"   // assertion / abort()
+        case SIGBUS:  return "SIGBUS"
+        case SIGSEGV: return "SIGSEGV"
+        case SIGSYS:  return "SIGSYS"
+        case SIGPIPE: return "SIGPIPE"
+        case SIGTERM: return "SIGTERM"
+        case SIGKILL: return "SIGKILL"
+        default:      return "signal \(sig)"
+        }
+    }
 }
 
 // MARK: - ndjson stream parser
@@ -550,14 +622,31 @@ struct ProgressJSONLine {
 /// `\n`-terminated chunk. `JSONSerialization.jsonObject(with:)` is
 /// strict about input being a single complete JSON document, hence
 /// the line-buffer instead of feeding it raw `Data`.
+///
+/// **PR #67 additions.** Lines that don't parse as JSON are no
+/// longer silently dropped — they're collected in a bounded ring
+/// buffer (`capturedText`), so when the CLI subprocess prints a
+/// real error message to stderr alongside its `--progress-json`
+/// stream, `OperationCoordinator` can surface that text in the
+/// failure alert instead of leaving the user with a bare "knit
+/// exited with status N".
 final class NDJSONLineParser: @unchecked Sendable {
     private var pending = Data()
     private let lock = NSLock()
 
+    /// Bounded buffer of non-JSON stderr lines seen so far. Trimmed
+    /// to `maxCapturedLines` from the head; older entries are
+    /// dropped on overflow so a runaway error spew can't grow
+    /// memory unboundedly while still preserving the most recent
+    /// (and usually most diagnostic) output.
+    private var capturedText: [String] = []
+    private let maxCapturedLines = 50
+
     /// Feed bytes from a pipe read. Calls `emit` once per complete
-    /// line, on whichever thread `feed` is called on (the
-    /// readabilityHandler thread). The caller is responsible for
-    /// any cross-thread hand-off.
+    /// JSON line, on whichever thread `feed` is called on (the
+    /// readabilityHandler thread). Non-JSON lines are appended to
+    /// `capturedText` instead. The caller is responsible for any
+    /// cross-thread hand-off.
     func feed(_ chunk: Data, emit: (ProgressJSONLine) -> Void) {
         lock.lock()
         pending.append(chunk)
@@ -572,9 +661,29 @@ final class NDJSONLineParser: @unchecked Sendable {
                 lock.unlock()
                 emit(parsed)
                 lock.lock()
+            } else if !lineBytes.isEmpty,
+                      let text = String(data: Data(lineBytes), encoding: .utf8) {
+                // Non-JSON text — usually a real error message from
+                // the CLI ("knit: cannot open input: ..."). Keep
+                // for the failure alert.
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    capturedText.append(trimmed)
+                    if capturedText.count > maxCapturedLines {
+                        capturedText.removeFirst(capturedText.count - maxCapturedLines)
+                    }
+                }
             }
         }
         lock.unlock()
+    }
+
+    /// Snapshot of non-JSON lines seen so far, oldest first. Used by
+    /// `OperationCoordinator.handleChildExit` to include the CLI's
+    /// real error output in the failure alert.
+    func capturedTextSnapshot() -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        return capturedText
     }
 
     private static func parseLine(_ data: Data) -> ProgressJSONLine? {
