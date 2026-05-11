@@ -56,6 +56,23 @@ public final class ZipWriter {
             throw KnitError.ioFailure(path: url.path, message: "cannot open for writing")
         }
         self.handle = h
+        // PR #68 fix. Disable the page cache for the output FD —
+        // matches the policy CLAUDE.md Rule 3.2 already documents for
+        // unpack output FDs but which had never been applied to the
+        // ZIP writer side. Without it, sustained multi-GB writes
+        // (e.g. ZIPping an 80 GB Parallels VM image) fill the page
+        // cache to ~50% of RAM, engage macOS's memory compressor, and
+        // throttle write throughput to ~50 MB/s on an M5 Max whose
+        // NVMe can otherwise sustain ~5 GB/s. F_NOCACHE makes writes
+        // bypass the page cache and stream straight into the NVMe
+        // controller's own DRAM cache, restoring near-line-rate
+        // throughput.
+        //
+        // Best-effort: a filesystem that doesn't support direct I/O
+        // (most don't reject this flag, but some external mounts
+        // might) continues through the cached path unchanged — no
+        // worse than pre-fix.
+        _ = fcntl(h.fileDescriptor, F_NOCACHE, 1)
     }
 
     deinit {

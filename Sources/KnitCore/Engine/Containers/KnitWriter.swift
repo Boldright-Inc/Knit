@@ -47,6 +47,13 @@ public final class KnitWriter {
             throw KnitError.ioFailure(path: url.path, message: "cannot open for writing")
         }
         self.handle = h
+        // PR #68: bypass the page cache for sustained multi-GB writes
+        // (same rationale as ZipWriter — see CLAUDE.md Rule 3.2).
+        // Without F_NOCACHE the kernel's writeback path fills RAM to
+        // ~50% with dirty pages and engages the memory compressor,
+        // throttling write throughput by 100× on large archives.
+        // Best-effort; harmless on filesystems that don't honour it.
+        _ = fcntl(h.fileDescriptor, F_NOCACHE, 1)
         try writeHeader()
     }
 
