@@ -27,18 +27,37 @@ public protocol EntropyProbing: Sendable {
     /// Compute per-block entropy. The buffer is split into `blockSize`-byte
     /// slices; the last slice may be shorter. Returns one `EntropyResult`
     /// per slice, in order.
+    ///
+    /// `onProgress` (PR #71) fires periodically during the probe with the
+    /// number of input bytes processed since the last call. For
+    /// `MetalEntropyProbe` that's once per Metal dispatch (each dispatch
+    /// covers ≤ UInt32.max bytes since PR #61); for `CPUEntropyProbe`
+    /// that's once per block batch on the parallel path or once per
+    /// block on the serial path. Callers wire it into the
+    /// `ProgressReporter` so a multi-GB probe phase (e.g. ZIPping an
+    /// 80 GB Parallels VM image — the probe runs on the entire entry
+    /// before the codec decision is made) ticks the bar instead of
+    /// sitting silent for seconds. Pass `nil` to disable.
     func probe(_ buffer: UnsafeBufferPointer<UInt8>,
-               blockSize: Int) throws -> [EntropyResult]
+               blockSize: Int,
+               onProgress: (@Sendable (UInt64) -> Void)?) throws -> [EntropyResult]
 }
 
 extension EntropyProbing {
+    /// Default-arg version of `probe` — preserves the two-argument call
+    /// sites that don't care about per-dispatch progress.
+    public func probe(_ buffer: UnsafeBufferPointer<UInt8>,
+                      blockSize: Int) throws -> [EntropyResult] {
+        try probe(buffer, blockSize: blockSize, onProgress: nil)
+    }
+
     /// Probe the full buffer as one block. Convenience for callers that just
     /// want a single up-front decision (e.g. ZIP per-entry method choice).
     public func probeWhole(_ buffer: UnsafeBufferPointer<UInt8>) throws -> EntropyResult {
         if buffer.count == 0 {
             return EntropyResult(entropy: 0, byteCount: 0)
         }
-        let results = try probe(buffer, blockSize: buffer.count)
+        let results = try probe(buffer, blockSize: buffer.count, onProgress: nil)
         return results.first ?? EntropyResult(entropy: 0, byteCount: buffer.count)
     }
 }
@@ -79,7 +98,8 @@ public struct CPUEntropyProbe: EntropyProbing {
     private static let parallelThreshold: Int = 4
 
     public func probe(_ buffer: UnsafeBufferPointer<UInt8>,
-                      blockSize: Int) throws -> [EntropyResult] {
+                      blockSize: Int,
+                      onProgress: (@Sendable (UInt64) -> Void)?) throws -> [EntropyResult] {
         guard let base = buffer.baseAddress, buffer.count > 0, blockSize > 0 else {
             return []
         }
@@ -91,7 +111,8 @@ public struct CPUEntropyProbe: EntropyProbing {
         // implementation so nothing latent depends on a specific Float
         // computation order.
         if numBlocks < Self.parallelThreshold || concurrency <= 1 {
-            return serialProbe(base: base, total: total, blockSize: blockSize)
+            return serialProbe(base: base, total: total, blockSize: blockSize,
+                               onProgress: onProgress)
         }
 
         // Parallel path. Block N's input slice doesn't overlap with any
@@ -109,6 +130,11 @@ public struct CPUEntropyProbe: EntropyProbing {
             let len = min(blockLen, totalLen - off)
             let p = basePtr.value.advanced(by: off)
             let entropy = EntropyMath.shannonEntropy(of: p, count: len)
+            // PR #71: per-block progress tick on the parallel path.
+            // Order of `emit` is non-deterministic across workers, but
+            // each worker contributes its block's byte count exactly
+            // once, so the cumulative advance still sums to `total`.
+            onProgress?(UInt64(len))
             return EntropyResult(entropy: entropy, byteCount: len)
         }
         return results
@@ -119,7 +145,8 @@ public struct CPUEntropyProbe: EntropyProbing {
     /// the file shipped with through PR #19.
     private func serialProbe(base: UnsafePointer<UInt8>,
                              total: Int,
-                             blockSize: Int) -> [EntropyResult] {
+                             blockSize: Int,
+                             onProgress: (@Sendable (UInt64) -> Void)?) -> [EntropyResult] {
         let numBlocks = (total + blockSize - 1) / blockSize
         var out: [EntropyResult] = []
         out.reserveCapacity(numBlocks)
@@ -128,6 +155,7 @@ public struct CPUEntropyProbe: EntropyProbing {
             let len = min(blockSize, total - off)
             let entropy = EntropyMath.shannonEntropy(of: base.advanced(by: off), count: len)
             out.append(EntropyResult(entropy: entropy, byteCount: len))
+            onProgress?(UInt64(len))
             off += len
         }
         return out
