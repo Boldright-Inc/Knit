@@ -226,6 +226,18 @@ final class OperationCoordinator: NSObject, @unchecked Sendable {
     private var anyFailureMessage: String?
     private var cancelled = false
 
+    /// Cross-Knit.app-instance serialisation lock. Quick Actions
+    /// spawn fresh Knit.app instances via `open -n -a`, so the
+    /// within-instance `pendingRuns` queue (PR #58) doesn't help
+    /// across instances. Two simultaneous Quick Actions on the
+    /// user's 80 GB Parallels VM corpus produced concurrent
+    /// subprocesses that hit SIGKILL (jetsam under memory pressure)
+    /// and ENOSPC (racing for ~160 GB of disk). The lock acquires
+    /// before each `subprocess.run()` and releases on subprocess
+    /// exit — coordinating all running Knit.app's on the host so
+    /// only one knit/zip CLI runs at a time. PR #79
+    private let crossLock = CrossInstanceLock()
+
     init(operation: KnitOperation,
          knitURL: URL,
          onAllDone: @escaping @Sendable () -> Void) {
@@ -403,6 +415,91 @@ final class OperationCoordinator: NSObject, @unchecked Sendable {
                                    outputURL: run.outputURL)
         }
 
+        // PR #79: acquire the cross-Knit.app-instance lock before
+        // spawning the subprocess. Non-blocking attempt first; if
+        // another Knit.app is running, switch the panel to a
+        // "Waiting…" state and acquire on a background queue so the
+        // main thread stays responsive. The lock is released in
+        // `handleChildExit` after the subprocess terminates.
+        if crossLock.tryAcquire() {
+            startSubprocess(proc: proc, index: index, run: run, child: child)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.window.showWaitingForLock(elapsedSeconds: 0)
+            }
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                let acquired = self.crossLock.acquireBlocking(
+                    cancelCheck: {
+                        self.lock.lock()
+                        let c = self.cancelled
+                        self.lock.unlock()
+                        return c
+                    },
+                    progressCallback: { elapsed in
+                        DispatchQueue.main.async { [weak self] in
+                            self?.window.showWaitingForLock(elapsedSeconds: elapsed)
+                        }
+                    }
+                )
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    if acquired {
+                        self.startSubprocess(proc: proc, index: index,
+                                             run: run, child: child)
+                    } else {
+                        // Cancelled while waiting — surface as
+                        // a launch error so the rest of the cleanup
+                        // path (unpublish, deletePartialOutput,
+                        // handleChildExit bookkeeping) runs as
+                        // normal.
+                        child.completedUnitCount = child.totalUnitCount
+                        child.unpublish()
+                        let err = NSError(
+                            domain: "Knit", code: -1,
+                            userInfo: [NSLocalizedDescriptionKey:
+                                "Cancelled while waiting for another Knit operation to finish"]
+                        )
+                        self.handleChildExit(index: index, process: proc,
+                                             outputURL: run.outputURL,
+                                             launchError: err)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Final-stage subprocess launch. Split out of `launchChild`
+    /// because the cross-instance-lock path may need to defer the
+    /// actual `proc.run()` to a later main-queue tick (PR #79).
+    private func startSubprocess(proc: Process, index: Int,
+                                  run: Run, child: Progress) {
+        // PR #79: cancel-during-acquire race window. If the user
+        // clicked the panel's Cancel button between the background
+        // queue's `acquireBlocking` returning true and this
+        // continuation running on the main queue, `handleCancel`
+        // already snapshotted `children` for SIGTERM but the proc
+        // wasn't running yet (`isRunning == false` skipped it).
+        // Starting it now would spawn an orphan that's no longer
+        // cancellable from the panel. Refuse early and route through
+        // the standard cleanup path so the lock is released and the
+        // unfinished entry is unpublished correctly.
+        lock.lock()
+        let isCancelled = self.cancelled
+        lock.unlock()
+        if isCancelled {
+            child.completedUnitCount = child.totalUnitCount
+            child.unpublish()
+            let err = NSError(
+                domain: "Knit", code: -1,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Cancelled before subprocess launch"]
+            )
+            handleChildExit(index: index, process: proc,
+                            outputURL: run.outputURL,
+                            launchError: err)
+            return
+        }
         do {
             try proc.run()
         } catch {
@@ -463,6 +560,17 @@ final class OperationCoordinator: NSObject, @unchecked Sendable {
                                   process: Process,
                                   outputURL: URL,
                                   launchError: Error? = nil) {
+        // PR #79: release the cross-Knit.app-instance lock as the
+        // very first thing in this handler, before any other
+        // bookkeeping. Holding it across the bookkeeping would
+        // serialise unrelated cleanup work against any waiting
+        // Knit.app. Safe to release unconditionally: the
+        // `crossLock.release()` call is a no-op if we never
+        // acquired it (e.g. a `launchError` from the
+        // pre-`tryAcquire` setup path), and idempotent across
+        // accidental double-calls.
+        crossLock.release()
+
         lock.lock()
         let entry = children[index]
         children.removeValue(forKey: index)
