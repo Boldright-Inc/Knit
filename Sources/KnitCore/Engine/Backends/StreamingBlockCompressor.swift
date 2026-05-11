@@ -388,6 +388,53 @@ public struct StreamingBlockCompressor: Sendable {
             let batchInputBytes = processed.reduce(0) { $0 + UInt64($1.originalSize) }
             analytics?.recordBatch(bytes: batchInputBytes, fallback: 0)
 
+            // PR #76: release this batch's input mmap pages from kernel
+            // residency. Recovers from a kernel panic reported by the
+            // user during pack of an 80 GB .pvm:
+            //
+            //   panic(cpu 1): cpt_mapcnt_inc: refcnt overflow:
+            //                 old_value 2048 value 2049
+            //   Panicked task: 4183847 pages, 22 threads: pid X knit
+            //
+            // Same shape as the original CLAUDE.md Rule 3.1 panic
+            // (PR #17), but coming from a different side now —
+            // input-mmap residency instead of page-cache writes.
+            //
+            // Root cause: on M5 Max (128 GB RAM) the kernel keeps
+            // `MADV_SEQUENTIAL` pages resident far longer than on
+            // memory-constrained hardware. The 80 GB input mmap stays
+            // ~entirely resident; the memory compressor opportunistically
+            // compresses cold pages; subsequent worker re-reads
+            // vm_remap those compressed pages back in, bumping their
+            // `cpt_mapcnt` per-page refcount. The refcount field is 11
+            // bits wide (cap 2048); a single shared page (e.g. zero
+            // pages in a sparse VM image) accumulates references from
+            // every batch that crosses it until overflow → panic.
+            //
+            // Explicit `MADV_DONTNEED` after each batch tells the
+            // kernel "these pages are done, you can drop them now",
+            // keeping resident input-mmap memory bounded to one
+            // batch's worth (~`concurrency × blockSize` ≈ a few MiB)
+            // regardless of input size. The compressor never activates
+            // on the input pages; `cpt_mapcnt` stays at 0 per page.
+            //
+            // Page alignment: batch ranges are already block-size
+            // aligned (typically 1 MiB), well above the 16 KiB page
+            // size on M-series, so no extra alignment math needed.
+            // Best-effort: madvise is advisory; if the kernel ignores
+            // (some filesystems / unusual mmap flags), no worse than
+            // the pre-fix behaviour.
+            let firstSlice = slices[batchStart]
+            let lastSlice = slices[batchEnd - 1]
+            let batchByteStart = firstSlice.offset
+            let batchByteLen = lastSlice.offset + lastSlice.length - batchByteStart
+            if batchByteLen > 0 {
+                let advisePtr = basePtr.value.advanced(by: batchByteStart)
+                _ = madvise(UnsafeMutableRawPointer(mutating: advisePtr),
+                            batchByteLen,
+                            MADV_DONTNEED)
+            }
+
             // Advance. If this was the last batch of the current
             // chunk and more chunks remain, swap in the next
             // chunk's probe (launched at the start of *this*
