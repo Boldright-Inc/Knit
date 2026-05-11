@@ -11,7 +11,7 @@ final class ProgressReporterTests: XCTestCase {
         let snap = r.snapshot()
         XCTAssertEqual(snap.processed, 350)
         XCTAssertEqual(snap.total, 1_000)
-        XCTAssertEqual(snap.fraction, 0.35, accuracy: 0.001)
+        XCTAssertEqual(snap.fraction!, 0.35, accuracy: 0.001)
     }
 
     func testFinishFlagFlips() {
@@ -35,7 +35,7 @@ final class ProgressReporterTests: XCTestCase {
         // total, the bar shouldn't render >100%.
         let r = ProgressReporter(totalBytes: 100, phase: .packing)
         r.advance(by: 200)
-        XCTAssertEqual(r.snapshot().fraction, 1.0, accuracy: 0.001)
+        XCTAssertEqual(r.snapshot().fraction!, 1.0, accuracy: 0.001)
     }
 
     func testEtaInfiniteUntilProgressMeasurable() {
