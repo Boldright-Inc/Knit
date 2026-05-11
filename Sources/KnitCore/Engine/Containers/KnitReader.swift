@@ -201,6 +201,11 @@ public final class KnitReader: @unchecked Sendable {
             if postWriteVerify {
                 try verifyCRC(entry: entry, outURL: outURL, gpuCRC: gpuCRC)
             }
+            // PR #81: release the input-mmap pages this entry consumed.
+            // See `releaseInputPagesFor(entry:)` doc-block for the
+            // jetsam-prevention rationale (mirrors PR #76's pack-side
+            // `MADV_DONTNEED` on the unpack input side).
+            releaseInputPagesFor(entry: entry)
             return
         }
 
@@ -266,6 +271,10 @@ public final class KnitReader: @unchecked Sendable {
             )
         }
 
+        // PR #81: legacy non-staged path release. See the staged-path
+        // call site and `releaseInputPagesFor` doc-block for rationale.
+        releaseInputPagesFor(entry: entry)
+
         // No `outHandle.synchronize()` — see commentary on the staged
         // path above for the rationale (macOS unified buffer cache
         // makes write↔mmap coherent on the same file without fsync).
@@ -278,6 +287,49 @@ public final class KnitReader: @unchecked Sendable {
     }
 
     /// Drive the entry's decode through a `HybridZstdBatchDecoder`. The
+    /// Release the input-mmap pages that backed `entry`'s compressed
+    /// payload, hinting the kernel that the range is no longer needed.
+    ///
+    /// **Why — PR #81.** PR #76 added `madvise(MADV_DONTNEED)` on the
+    /// pack/zip side to fix a `cpt_mapcnt` kernel panic on the user's
+    /// 80 GB `.pvm` corpus: on memory-rich hosts (M5 Max 128 GB RAM)
+    /// the kernel doesn't evict `MADV_SEQUENTIAL` input pages
+    /// aggressively, the memory compressor opportunistically
+    /// compresses cold pages, and `vm_remap` references on the
+    /// resulting shared pages accumulate past the 11-bit cap.
+    ///
+    /// The unpack input side was overlooked in PR #76 because the
+    /// post-#74 / post-#75 unpack wall on the same corpus was
+    /// dominated by `MetalCRC32.waitUntilCompleted` (~96 % of
+    /// main-thread wall) — the GPU verify pass forced the input
+    /// mmap to stay resident through that whole 60 s wait. PR #77
+    /// (`--no-post-verify` default-on for the GUI) cut that to ~0 %,
+    /// which made the unpack work *faster* on the happy path —
+    /// but also surfaced a NEW failure mode on the same memory-rich
+    /// host: jetsam (signal 9) on workloads that previously
+    /// happened to complete before pressure built up. Without
+    /// `MADV_DONTNEED`, the 80 GB archive's pages stay resident for
+    /// the entire (now-shorter) unpack window, and the residual
+    /// mid-extract memory pressure tips the kernel into killing
+    /// the process.
+    ///
+    /// Fix: hint per-entry release at the end of each `extract`
+    /// call, matching what PR #76 does per-batch on the pack side.
+    /// Best-effort — kernel may ignore on filesystems that don't
+    /// honour the hint; no worse than pre-fix.
+    private func releaseInputPagesFor(entry: KnitEntry) {
+        let len = Int(entry.compressedSize)
+        guard len > 0 else { return }
+        let start = Int(entry.dataOffset)
+        // Bounds-check against the mmap'd region; should always hold
+        // since `init` walks the archive header end-to-end before
+        // returning, but defend against a hostile entry header that
+        // somehow slipped through.
+        guard start >= 0, start + len <= mapped.count else { return }
+        let basePtr = UnsafeMutableRawPointer(mutating: mapped.pointer)
+        _ = madvise(basePtr.advanced(by: start), len, MADV_DONTNEED)
+    }
+
     /// staged decoder's sink writes each decoded block to `outHandle`
     /// in input order, exactly like the direct-libzstd loop, except
     /// the orchestrator first verifies a per-batch CRC fold and only
