@@ -1,34 +1,34 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <style>
-body { font-family: -apple-system, "Hiragino Sans", sans-serif; padding: 16px 22px; color: #222; }
+body { font-family: -apple-system, "Helvetica Neue", sans-serif; padding: 16px 22px; color: #222; }
 h2   { color: #d9621b; margin-top: 0; }
 ul   { padding-left: 20px; line-height: 1.7; }
 .note { color: #666; font-size: 12px; margin-top: 18px; }
 </style>
 </head>
 <body>
-<h2>Knit へようこそ</h2>
+<h2>Welcome to Knit</h2>
 
-<p>このインストーラは Knit を以下の場所に配置します：</p>
-
-<ul>
-  <li><b>/Applications/Knit.app</b> — `.knit` ファイルのアイコンを登録するためのアプリ</li>
-  <li><b>/usr/local/bin/knit</b> — コマンドライン（社内ターミナル作業用）</li>
-  <li><b>/Library/Services/Knit *.workflow</b> — Finder の右クリックメニュー</li>
-</ul>
-
-<p>インストール完了後、Finder で任意のファイルを右クリックすると以下のメニューが追加されています：</p>
+<p>This installer will place Knit in the following locations:</p>
 
 <ul>
-  <li><b>Knit Compress (ZIP)</b> — 標準 ZIP 形式で圧縮（どこでも展開可）</li>
-  <li><b>Knit Compress (.knit)</b> — Knit 高速形式で圧縮</li>
-  <li><b>Knit Extract</b> — 圧縮ファイルを展開</li>
+  <li><b>/Applications/Knit.app</b> — registers the icon for <code>.knit</code> files</li>
+  <li><b>/usr/local/bin/knit</b> — command-line tool</li>
+  <li><b>/Library/Services/Knit *.workflow</b> — Finder right-click menu items</li>
 </ul>
 
-<p class="note">対象環境：macOS 15 Sequoia 以降、Apple Silicon (M1〜M5) Mac<br>
-管理者パスワードの入力が求められます。</p>
+<p>After installation, right-click any file or folder in Finder to find these new items:</p>
+
+<ul>
+  <li><b>Knit Compress (ZIP)</b> — produces a standard ZIP archive (extractable anywhere)</li>
+  <li><b>Knit Compress (.knit)</b> — produces Knit's high-speed <code>.knit</code> archive</li>
+  <li><b>Knit Extract</b> — extracts ZIP or <code>.knit</code> archives</li>
+</ul>
+
+<p class="note">Requirements: macOS 15 Sequoia or later, Apple Silicon (M1–M5) Mac.<br>
+You will be asked for your administrator password.</p>
 </body>
 </html>
