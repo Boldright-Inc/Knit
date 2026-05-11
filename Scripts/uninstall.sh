@@ -17,6 +17,7 @@ QA_DST_USER="${HOME}/Library/Services"
 QA_DST_SYS="/Library/Services"
 BIN_DST="/usr/local/bin/knit"
 APP_DST="/Applications/Knit.app"
+UNINSTALL_CMD_DST="/Applications/Uninstall Knit.command"
 PKG_ID="co.boldright.knit"
 
 WORKFLOW_NAMES=(
@@ -72,6 +73,15 @@ if [[ -d "${APP_DST}" ]]; then
     /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
         -u "${APP_DST}" 2>/dev/null || true
     sudo rm -rf "${APP_DST}"
+    removed_anything=1
+fi
+
+# The user-facing uninstaller (.pkg + install.sh both drop a
+# "Uninstall Knit.command" alongside Knit.app in /Applications).
+# Sweep it too so /Applications stays clean. PR #53.
+if [[ -f "${UNINSTALL_CMD_DST}" ]]; then
+    echo ">> Removing uninstaller shortcut (${UNINSTALL_CMD_DST}, sudo)"
+    sudo rm -f "${UNINSTALL_CMD_DST}"
     removed_anything=1
 fi
 

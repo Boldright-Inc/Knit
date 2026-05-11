@@ -58,6 +58,15 @@ cp    "${ROOT_DIR}/.build/release/knit"     "${PAYLOAD}/usr/local/bin/knit"
 cp -R "${DIST}/QuickActions/"*.workflow     "${PAYLOAD}/Library/Services/"
 chmod 0755 "${PAYLOAD}/usr/local/bin/knit"
 
+# Stage the user-facing uninstaller as /Applications/Uninstall Knit.command.
+# macOS .pkg has no native uninstall mechanism (unlike Windows MSI), so the
+# industry-standard solution is to ship a discoverable .command file
+# alongside the installed app — the user can find it later in Finder and
+# double-click to launch the cleanup. PR #53 adds this.
+cp "${SCRIPT_DIR}/uninstall-command-template.sh" \
+    "${PAYLOAD}/Applications/Uninstall Knit.command"
+chmod 0755 "${PAYLOAD}/Applications/Uninstall Knit.command"
+
 # Ensure the postinstall script is executable when pkgbuild reads it.
 chmod 0755 "${PKG_SCRIPTS}/postinstall"
 
