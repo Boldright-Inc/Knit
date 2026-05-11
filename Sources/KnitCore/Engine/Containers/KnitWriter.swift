@@ -1,4 +1,5 @@
 import Foundation
+import Darwin   // writev(2), iovec, IOV_MAX — for the chunked-write path
 
 /// Streaming writer for the `.knit` container format. See `KnitFormat` for
 /// the exact byte layout — this class is the encoder side of that
@@ -195,6 +196,65 @@ extension KnitWriter {
         private var compressedBytes: UInt64 = 0
         private var finished: Bool = false
 
+        /// Pending compressed-block frames awaiting drain to the
+        /// underlying FD. Each `writeBlock` appends to this list;
+        /// it flushes via one `writev(2)` syscall when the size or
+        /// iovec-count threshold is reached, and again unconditionally
+        /// at `finish(crc32:)` before the seek-back patches.
+        ///
+        /// **Why we batch — PR #77.** A `sample` trace of an 80 GB
+        /// `.pvm` pack on M5 Max showed 70.6 % of main-thread wall
+        /// in kernel `write(2)` calls — one syscall per ~1 MiB
+        /// compressed block, ~80 000 syscalls total. With
+        /// F_NOCACHE on the writer FD (PR #68), each write goes
+        /// straight to the NVMe controller's DRAM cache; the
+        /// controller achieves peak throughput only when its
+        /// command queue stays deep (Apple SSDs scale near-linearly
+        /// up to QD=64). Issuing 1 MiB writes synchronously kept
+        /// the controller at effectively QD=1, capping sustained
+        /// write throughput at ~3.9 GB/s vs the ~5-6 GB/s the SSD
+        /// is capable of via APFS + F_NOCACHE.
+        ///
+        /// **Why `writev` instead of memcpy-into-one-`Data`.**
+        /// Concatenating frames into one contiguous buffer before
+        /// calling `write` would add ~2.7 s of memcpy wall on an
+        /// 80 GB pack (one full extra pass over compressed bytes
+        /// at ~30 GB/s) — close to the entire predicted wall-clock
+        /// win. `writev(2)` gathers an array of memory regions in
+        /// a single syscall with zero userspace copies.
+        ///
+        /// **Lifetime contract.** `flushPending()` bridges each
+        /// pending `Data` to an `NSData` before extracting iovec
+        /// pointers. `NSData.bytes` is formally guaranteed valid
+        /// for the NSData's lifetime (unlike
+        /// `Data.withUnsafeBytes`'s closure-only validity, which
+        /// dangles for `Data`'s inline-storage path when the
+        /// payload fits in ~14 bytes — see the comment in
+        /// `flushPending()` for the failure mode). Bridging is
+        /// O(1) for the common heap-stored case (1 MiB+ blocks)
+        /// and bounded to ≲ 14 bytes copy for the inline case.
+        private var pendingFrames: [Data] = []
+        private var pendingBytes: Int = 0
+
+        /// Byte threshold that triggers a `flushPending()` call
+        /// inside `writeBlock`. 32 MiB is large enough to drive
+        /// NVMe at deep queue depth (matches the `64 MiB` ZipWriter
+        /// PR #73 picked for the analogous problem on `.stored`
+        /// payloads, halved because here we typically flush more
+        /// often via `finish()` at entry boundaries) and small
+        /// enough that the pending buffer's peak memory stays
+        /// bounded per worker.
+        fileprivate static let flushBytesThreshold = 32 * 1024 * 1024
+
+        /// Iovec-count cap that ALSO triggers a flush. `IOV_MAX`
+        /// is 1024 on Darwin; we cap at 512 to leave headroom and
+        /// to bound the per-syscall iovec-build cost. For the
+        /// default 1 MiB blocks the byte threshold trips first
+        /// (32 iovecs); the cap matters only for unusually small
+        /// blocks (e.g. `--block-size 64K` would emit 512 frames
+        /// per 32 MiB).
+        fileprivate static let flushIOVecMax = 512
+
         fileprivate init(writer: KnitWriter,
                          entryStart: UInt64,
                          compressedSizeOffset: UInt64,
@@ -212,7 +272,12 @@ extension KnitWriter {
 
         /// Append one compressed block frame. Must be called exactly
         /// `numBlocks` times (or zero times for a directory entry)
-        /// before `finish(crc32:)`.
+        /// before `finish(crc32:)`. Bytes are queued in
+        /// `pendingFrames` and flushed via `writev(2)` when the
+        /// threshold is hit or at `finish(crc32:)` time — the
+        /// caller's `frame` `Data` can be released as soon as
+        /// this method returns (its storage is retained by
+        /// `pendingFrames` until flush). PR #77.
         public func writeBlock(_ frame: Data) throws {
             guard let writer = writer else {
                 throw KnitError.codecFailure("writeBlock after writer closed")
@@ -220,11 +285,129 @@ extension KnitWriter {
             precondition(!finished, "writeBlock after finish")
             precondition(blocksWritten < totalBlocks,
                          "writeBlock called more times than declared numBlocks")
-            try writer.handle.write(contentsOf: frame)
+            // Logical bookkeeping advances immediately so subsequent
+            // `entryStart`-relative math (the patches in finish()) and
+            // the writer's `currentOffset` model stay consistent; the
+            // kernel cursor catches up when flushPending() runs.
+            pendingFrames.append(frame)
+            pendingBytes += frame.count
             writer.currentOffset += UInt64(frame.count)
             blockLengths.append(UInt32(frame.count))
             compressedBytes += UInt64(frame.count)
             blocksWritten += 1
+
+            if pendingBytes >= Self.flushBytesThreshold
+                || pendingFrames.count >= Self.flushIOVecMax {
+                try flushPending()
+            }
+        }
+
+        /// Drain `pendingFrames` to disk via one or more `writev(2)`
+        /// calls. Called from `writeBlock` on threshold trips and
+        /// unconditionally from `finish(crc32:)` before the
+        /// seek-back patches — with F_NOCACHE the kernel doesn't
+        /// buffer writes, so seeking before the flush would scribble
+        /// the patches into a position the payload hasn't reached
+        /// yet on disk. PR #77.
+        private func flushPending() throws {
+            guard let writer = writer else {
+                throw KnitError.codecFailure("flushPending after writer closed")
+            }
+            guard !pendingFrames.isEmpty else { return }
+
+            let fd = writer.handle.fileDescriptor
+
+            // Bridge each pending Swift `Data` to `NSData`. We
+            // need stable pointers (NSData.bytes is documented to
+            // remain valid for the NSData's lifetime), whereas
+            // `Data.withUnsafeBytes`'s pointer is formally valid
+            // only inside the closure body. The escape works in
+            // production where compressed blocks are ~1 MiB and
+            // always heap-stored, but breaks for small payloads
+            // (≲ 14 B) that hit `Data`'s inline-storage path —
+            // the bytes live inside the `Data` struct, which is
+            // a stack temporary during `for frame in pendingFrames`,
+            // and the pointer dangles once the loop iteration
+            // ends. Bridging forces inline-stored Data onto the
+            // heap (small one-time copy, bounded to ≲ 14 B per
+            // frame) and is O(1) for the common heap-stored case.
+            let pinned: [NSData] = pendingFrames.map { $0 as NSData }
+
+            try withExtendedLifetime(pinned) {
+                var iovecs: [iovec] = []
+                iovecs.reserveCapacity(pinned.count)
+                for ns in pinned where ns.length > 0 {
+                    iovecs.append(iovec(
+                        iov_base: UnsafeMutableRawPointer(mutating: ns.bytes),
+                        iov_len: ns.length
+                    ))
+                }
+                if iovecs.isEmpty { return }
+
+                // writev(2) is spec'd to return less than the
+                // requested byte count on partial-write conditions
+                // (rare on regular files but legal — e.g. signal
+                // interruption). Loop until every iovec is drained,
+                // advancing the iovec pointer/length in place to
+                // skip already-written ranges. We also cap each
+                // syscall's iovec count at IOV_MAX as a defensive
+                // measure even though `flushIOVecMax` already
+                // enforces a tighter bound at queueing time.
+                try iovecs.withUnsafeMutableBufferPointer { iovBuf in
+                    var iovStart = 0
+                    while iovStart < iovBuf.count {
+                        let count = Int32(min(iovBuf.count - iovStart, Int(IOV_MAX)))
+                        let written = Darwin.writev(
+                            fd,
+                            iovBuf.baseAddress!.advanced(by: iovStart),
+                            count
+                        )
+                        if written < 0 {
+                            let saved = Darwin.errno
+                            let msg = String(cString: strerror(saved))
+                            throw KnitError.ioFailure(
+                                path: "<knit-writer>",
+                                message: "writev failed (errno=\(saved): \(msg))"
+                            )
+                        }
+                        if written == 0 {
+                            // Per POSIX, writev returning 0 on a
+                            // regular file with positive iov_len is
+                            // anomalous — typically ENOSPC manifests
+                            // as -1 with errno set, but defend
+                            // against an out-of-space race that
+                            // surfaces as a zero-byte write.
+                            throw KnitError.ioFailure(
+                                path: "<knit-writer>",
+                                message: "writev returned 0 (filesystem full?)"
+                            )
+                        }
+                        // Advance past consumed iovecs. The kernel
+                        // wrote `written` bytes contiguously from
+                        // the front of the current iovec list.
+                        var remaining = Int(written)
+                        while remaining > 0 && iovStart < iovBuf.count {
+                            let iov = iovBuf[iovStart]
+                            if remaining >= iov.iov_len {
+                                remaining -= iov.iov_len
+                                iovStart += 1
+                            } else {
+                                // Partial iovec consumption — adjust
+                                // its base/len in place for the next
+                                // writev iteration.
+                                iovBuf[iovStart].iov_base =
+                                    iov.iov_base!.advanced(by: remaining)
+                                iovBuf[iovStart].iov_len =
+                                    iov.iov_len - remaining
+                                remaining = 0
+                            }
+                        }
+                    }
+                }
+            }
+
+            pendingFrames.removeAll(keepingCapacity: true)
+            pendingBytes = 0
         }
 
         /// Finalise the entry: patch `compressed_size`, `crc32`, and
@@ -238,6 +421,12 @@ extension KnitWriter {
             precondition(!finished, "finish called twice on the same entry")
             precondition(blocksWritten == totalBlocks,
                          "finish called with \(blocksWritten)/\(totalBlocks) blocks written")
+
+            // Drain any queued payload bytes before the seek-back
+            // patches below — see `flushPending()` for the F_NOCACHE
+            // ordering hazard (the patches would otherwise scribble
+            // into the middle of unwritten payload). PR #77.
+            try flushPending()
 
             // Remember the end of the data section; we'll seek back here
             // before returning so the next entry begins at the right

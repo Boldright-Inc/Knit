@@ -101,10 +101,29 @@ extension KnitOperation {
                         outputURL: archive, sourceURL: archive,
                         phase: .copying, progressJSON: false)
                 }
+                // `--no-post-verify` (PR #75 flag, default-on
+                // when not passed): skip the post-write CRC re-read
+                // pass for every extracted entry. The decode-side
+                // per-batch CRC inside `HybridZstdBatchDecoder`
+                // still runs and catches every realistic failure
+                // mode (decoder bug, memory corruption, GPU kernel
+                // miscompute); the post-write pass only catches
+                // "the kernel returned from write(2) but the byte
+                // landed wrong on disk" — effectively impossible on
+                // APFS (block-level checksum) + modern NVMe
+                // (controller-side ECC). A `sample` trace of an
+                // 80 GB `.pvm.knit` extract on M5 Max showed 96 %
+                // of unpack wall in `MetalCRC32.crc32 ->
+                // waitUntilCompleted` for this exact post-write
+                // pass; the CLI exposes the flag specifically so
+                // GUI callers can opt out without losing the
+                // decoder-side correctness check.
                 return Run(
                     executableURL: knitURL,
                     args: ["unpack", archive.path,
-                           "-o", dir.path, "--progress-json"],
+                           "-o", dir.path,
+                           "--no-post-verify",
+                           "--progress-json"],
                     outputURL: archive, sourceURL: archive,
                     phase: .copying, progressJSON: true)
             }
