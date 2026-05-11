@@ -20,6 +20,7 @@
 
 import AppKit
 import Foundation
+import UniformTypeIdentifiers
 
 final class ProgressWindow: NSPanel {
 
@@ -154,16 +155,9 @@ final class ProgressWindow: NSPanel {
     /// Set the static header (icon + "Compressing X to Y" title).
     /// Called once when the operation starts.
     func configure(sourceURL: URL, outputURL: URL?, verb: Verb) {
-        if let outputURL = outputURL {
-            // Use the in-progress output's icon when the file exists
-            // on disk; otherwise fall back to the source icon (which
-            // we know exists because the user selected it).
-            let probe = FileManager.default.fileExists(atPath: outputURL.path)
-                ? outputURL : sourceURL
-            iconView.image = NSWorkspace.shared.icon(forFile: probe.path)
-        } else {
-            iconView.image = NSWorkspace.shared.icon(forFile: sourceURL.path)
-        }
+        iconView.image = Self.icon(for: verb,
+                                    sourceURL: sourceURL,
+                                    outputURL: outputURL)
 
         switch verb {
         case .compressing:
@@ -174,6 +168,50 @@ final class ProgressWindow: NSPanel {
             }
         case .extracting:
             titleLabel.stringValue = "Extracting \"\(sourceURL.lastPathComponent)\""
+        }
+    }
+
+    /// Pick the most informative icon for the panel:
+    ///
+    /// - **Compressing** → the OUTPUT format's icon. The user is making
+    ///   a `.knit` (or `.zip`); seeing that format's icon makes "what
+    ///   am I producing?" obvious at a glance. The earlier behaviour
+    ///   (source icon: PVM, PNG, etc.) put the focus on the wrong end
+    ///   of the operation.
+    /// - **Extracting** → the SOURCE archive's icon. The user already
+    ///   sees the archive in Finder; matching its icon ties the panel
+    ///   visually to the file they just acted on.
+    ///
+    /// For `.knit` the bundled `KnitDocument.icns` is preferred over
+    /// `NSWorkspace.icon(for: UTType)` because Launch Services may not
+    /// have registered our exported `co.boldright.knit.archive` UTI for
+    /// a locally-built / not-yet-installed Knit.app — system lookup
+    /// would silently return a generic document icon in that case. The
+    /// bundled resource is always present in the .app, so the icon is
+    /// always correct.
+    private static func icon(for verb: Verb,
+                              sourceURL: URL,
+                              outputURL: URL?) -> NSImage? {
+        switch verb {
+        case .compressing:
+            guard let outputURL = outputURL else {
+                return NSWorkspace.shared.icon(forFile: sourceURL.path)
+            }
+            let ext = outputURL.pathExtension.lowercased()
+            if ext == "knit",
+               let iconURL = Bundle.main.url(forResource: "KnitDocument",
+                                              withExtension: "icns"),
+               let image = NSImage(contentsOf: iconURL) {
+                return image
+            }
+            // `.zip` (and any other system-known type) goes through
+            // UTType so we get whatever the system has registered.
+            if let utType = UTType(filenameExtension: ext) {
+                return NSWorkspace.shared.icon(for: utType)
+            }
+            return NSWorkspace.shared.icon(forFile: sourceURL.path)
+        case .extracting:
+            return NSWorkspace.shared.icon(forFile: sourceURL.path)
         }
     }
 
