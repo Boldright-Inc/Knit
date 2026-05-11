@@ -93,9 +93,21 @@ extension KnitCommand {
               help: "Skip hidden items (.git, .DS_Store, anything with the macOS hidden flag). Default is to include them, matching tar/zip.")
         var excludeHidden: Bool = false
 
+        @Flag(name: .customLong("no-disk-check"),
+              help: ArgumentHelp(
+                "Skip the pre-flight free-disk-space check. Use only if you know the archive will be much smaller than the input; the codec will still surface ENOSPC mid-write if the disk fills up.",
+                visibility: .private))
+        var noDiskCheck: Bool = false
+
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
             let outputURL = URL(fileURLWithPath: output ?? "\(input).zip").standardizedFileURL
+
+            // Pre-flight: refuse early if the destination doesn't have
+            // room for a worst-case (incompressible) output. PR #79.
+            if !noDiskCheck {
+                try DiskSpacePreflight.check(input: inputURL, output: outputURL)
+            }
 
             let cores = jobs ?? ProcessInfo.processInfo.activeProcessorCount
             let recorder: HeatmapRecorder? = (heatmap || heatmapImage != nil)
@@ -206,9 +218,22 @@ extension KnitCommand {
               help: "Skip hidden items (.git, .DS_Store, anything with the macOS hidden flag). Default is to include them, matching tar/zip.")
         var excludeHidden: Bool = false
 
+        @Flag(name: .customLong("no-disk-check"),
+              help: ArgumentHelp(
+                "Skip the pre-flight free-disk-space check. Use only if you know the archive will be much smaller than the input; the codec will still surface ENOSPC mid-write if the disk fills up.",
+                visibility: .private))
+        var noDiskCheck: Bool = false
+
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
             let outputURL = URL(fileURLWithPath: output ?? "\(input).knit").standardizedFileURL
+
+            // Pre-flight: refuse early if the destination doesn't have
+            // room for a worst-case (incompressible) output. PR #79.
+            if !noDiskCheck {
+                try DiskSpacePreflight.check(input: inputURL, output: outputURL)
+            }
+
             let cores = jobs ?? ProcessInfo.processInfo.activeProcessorCount
 
             let recorder: HeatmapRecorder? = (heatmap || heatmapImage != nil)
