@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import Darwin
 @testable import KnitCore
 
 /// Tests for the orchestration layer that future GPU `BlockDecoding`
@@ -85,18 +86,38 @@ final class HybridZstdBatchDecoderTests: XCTestCase {
             try readerB.extract(entry, to: outURL, stagedDecoder: staged)
         }
 
-        // Compare each non-directory file byte-for-byte.
+        // Compare each non-directory file byte-for-byte. We resolve
+        // `outA.path` via realpath(3) so it matches the firmlink-
+        // resolved form `FileManager.enumerator` yields — on macOS 26
+        // Tahoe the two diverge for paths under `/var/folders/...`
+        // (the temp dir's home), so a naive `dropFirst` strips the
+        // wrong number of characters and the comparison looks for
+        // files at nonsense paths. Same root cause as the FileWalker
+        // fix that ships in this PR.
+        let outAResolved = realpathPath(outA.path)
         let fm = FileManager.default
         let walker = fm.enumerator(at: outA, includingPropertiesForKeys: [.isDirectoryKey])!
         for case let url as URL in walker {
             let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
             if isDir { continue }
-            let rel = String(url.path.dropFirst(outA.path.count))
-            let bUrl = URL(fileURLWithPath: outB.path + rel)
+            let rel = String(url.path.dropFirst(outAResolved.count))
+            let bUrl = URL(fileURLWithPath: realpathPath(outB.path) + rel)
             let aBytes = try Data(contentsOf: url)
             let bBytes = try Data(contentsOf: bUrl)
             XCTAssertEqual(aBytes, bBytes,
                            "byte mismatch between direct and staged decode at \(rel)")
+        }
+    }
+
+    /// Test-local realpath helper. Mirrors `FileWalker.realpathURL`
+    /// without exposing that method publicly. Returns the canonical
+    /// firmlink-resolved path so test-side prefix-stripping matches
+    /// what `FileManager.enumerator` hands back on macOS 26 Tahoe.
+    private func realpathPath(_ p: String) -> String {
+        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+        return p.withCString { cstr -> String in
+            guard let r = Darwin.realpath(cstr, &buf) else { return p }
+            return String(cString: r)
         }
     }
 

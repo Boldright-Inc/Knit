@@ -106,12 +106,26 @@ final class KnitRoundTripTests: XCTestCase {
 
         // Flip one byte inside the compressed payload. Because the CRC is
         // computed over the *uncompressed* output, mutating any compressed
-        // byte will (almost) always cause the decompressed bytes to differ
-        // from the original — and thus the verifier should reject.
+        // byte should cause the decompressed bytes to differ from the
+        // original — and thus the verifier should reject.
+        //
+        // Earlier this test used `raw.count / 2` to pick the corruption
+        // offset, but small archives place that midpoint inside the
+        // entry-name index string (corrupting which doesn't always
+        // surface as a CRC mismatch — sometimes the safe-path resolve
+        // catches it first; sometimes nothing fires). Locate the zstd
+        // frame magic (`28 b5 2f fd`) and corrupt a byte well inside
+        // the compressed data so the failure mode is deterministically
+        // a decode-then-CRC mismatch.
         var raw = try Data(contentsOf: archive)
-        // Hit a byte well after the header but before the footer.
-        let mid = raw.count / 2
-        raw[mid] ^= 0xFF
+        guard let frameStart = raw.range(of: Data([0x28, 0xB5, 0x2F, 0xFD]))?.lowerBound else {
+            XCTFail("could not locate zstd frame magic in archive")
+            return
+        }
+        let target = frameStart + 12   // well past the frame header
+        XCTAssert(target < raw.count - 16,
+                  "archive too small to corrupt safely inside the frame")
+        raw[target] ^= 0xFF
         try raw.write(to: archive)
 
         XCTAssertThrowsError(

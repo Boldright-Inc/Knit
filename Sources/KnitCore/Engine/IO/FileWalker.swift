@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// Resolved metadata for one entry in the input tree. The same struct is
 /// used by both ZIP and `.knit` writers; `relativePath` is shaped to be
@@ -64,10 +65,22 @@ public enum FileWalker {
     ) throws -> [FileEntry] {
         let fm = FileManager.default
         // Resolve symlinks on the *root* once so the prefix we strip
-        // below matches the URLs the enumerator hands back (on macOS
-        // /tmp is itself a symlink to /private/tmp). Note: we only
-        // resolve at the root; per-entry symlinks are still skipped.
-        let root = rawRoot.resolvingSymlinksInPath()
+        // below matches the URLs the enumerator hands back. We use
+        // realpath(3) instead of `URL.resolvingSymlinksInPath()`
+        // because the two disagree on macOS 26 Tahoe's volume
+        // layout: `resolvingSymlinksInPath` started returning
+        // `/tmp/...` unchanged on this version, but
+        // `FileManager.enumerator` still yields its children via
+        // `/private/tmp/...` (the firmlinked form). When `baseLen`
+        // is computed from the *unresolved* root and the enumerator
+        // hands back the *resolved* form, the string-prefix strip in
+        // the loop below produces nonsense relative paths — e.g.
+        // packing `/tmp/foo/src` had entries appearing as
+        // `src/foo/src/file_0.bin` instead of `src/file_0.bin`. The
+        // C `realpath` function always follows symlinks via the
+        // kernel, so its output is the canonical form FileManager
+        // also uses internally.
+        let root = realpathURL(rawRoot)
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: root.path, isDirectory: &isDir) else {
             throw KnitError.ioFailure(path: root.path, message: "not found")
@@ -211,5 +224,29 @@ public enum FileWalker {
             modificationDate: modDate,
             unixMode: mode
         )
+    }
+
+    /// Canonicalize `url` via `realpath(3)` — follows every symlink,
+    /// returns the kernel's resolved path. Falls back to the input
+    /// URL unchanged when the path doesn't exist or realpath fails;
+    /// the caller's `fileExists` check below catches the not-found
+    /// case with a more specific error.
+    ///
+    /// Why this instead of `URL.resolvingSymlinksInPath()`: on macOS
+    /// 26 Tahoe, `resolvingSymlinksInPath` started leaving the `/tmp`
+    /// firmlink unresolved, but `FileManager.enumerator` continues
+    /// to resolve it. The mismatch broke the prefix-stripping
+    /// arithmetic that derives entry names from full paths.
+    private static func realpathURL(_ url: URL) -> URL {
+        let p = url.path
+        // PATH_MAX on Darwin is 1024. Use a generous fixed buffer
+        // so a single allocation covers every realistic input.
+        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+        let resolved: String? = p.withCString { cstr in
+            guard let r = Darwin.realpath(cstr, &buf) else { return nil }
+            return String(cString: r)
+        }
+        guard let resolved else { return url }
+        return URL(fileURLWithPath: resolved)
     }
 }
