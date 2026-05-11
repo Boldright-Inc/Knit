@@ -284,7 +284,16 @@ public final class ZipCompressor: Sendable {
         // Decide method: store if data is small, incompressible (heuristic on
         // try-then-fallback) or level == 0.
         if options.level.raw == 0 || buf.count == 0 {
-            let crcVal = buf.count == 0 ? 0 : crc.crc32(buf, seed: 0)
+            // PR #72: parallel-CRC on large buffers. Below 64 MiB
+            // (parallelCRC32's internal threshold) this falls through
+            // to a single libdeflate call, matching the prior cost
+            // exactly. Above the threshold, an N-way parallel walk +
+            // O(N) crc32Combine fold replaces the single-threaded
+            // libdeflate scan that previously dominated the prepare
+            // phase for huge `.stored` entries.
+            let crcVal = buf.count == 0
+                ? 0
+                : parallelCRC32(buf, using: crc, concurrency: options.concurrency)
             // .stored short-circuit: backend.compress(onProgress:) is
             // skipped AND the probe doesn't run for this branch. PR
             // #71: the writer is the only phase that contributes to
@@ -323,7 +332,12 @@ public final class ZipCompressor: Sendable {
         if options.entropyProbeEnabled,
            !probeResults.isEmpty,
            overall >= EntropyResult.incompressibleThreshold {
-            let crcVal = crc.crc32(buf, seed: 0)
+            // PR #72: parallel CRC (see the level=0 short-circuit
+            // above for the full rationale). This is the canonical
+            // hot path for huge incompressible inputs — the 80 GB
+            // Parallels VM case — where the old single-threaded
+            // libdeflate scan added ~8 s of silent prepare time.
+            let crcVal = parallelCRC32(buf, using: crc, concurrency: options.concurrency)
             recordEntryHeatmap(probe: probeResults,
                                originalBytes: buf.count,
                                storedBytes: buf.count,
@@ -355,7 +369,12 @@ public final class ZipCompressor: Sendable {
             level: options.level.clampedForDeflate(),
             onProgress: codecCallback
         )
-        let crcVal = crc.crc32(buf, seed: 0)
+        // PR #72: parallel CRC. For compressible inputs (the common
+        // .deflate case) the CRC walk runs concurrently with the
+        // codec's own pass; the parallel split here gives the
+        // bandwidth-limited CRC a fair share of cores instead of
+        // serialising it on one.
+        let crcVal = parallelCRC32(buf, using: crc, concurrency: options.concurrency)
 
         // If compression made it larger, store uncompressed instead
         // (ZIP spec encourages this). Probe + codec together have
