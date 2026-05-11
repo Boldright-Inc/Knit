@@ -16,6 +16,38 @@ public protocol DeflateBackend: Sendable {
     /// follows libdeflate semantics (0..12); callers should pass through
     /// `CompressionLevel.clampedForDeflate()` rather than a raw integer.
     func compress(_ input: UnsafeBufferPointer<UInt8>, level: Int32) throws -> Data
+
+    /// Compress with an optional incremental-progress callback. The
+    /// callback fires with the number of *uncompressed* input bytes
+    /// drained so far each time the backend makes meaningful progress.
+    /// Sum of all callback values equals `input.count` for a successful
+    /// compression; on throw the sum equals whatever was completed
+    /// before the failure.
+    ///
+    /// Single-threaded backends (`CPUDeflate`) cannot easily expose
+    /// progress mid-compression — the default extension fires the
+    /// callback once at the very end with the full input count, which
+    /// matches the old per-entry granularity. Multi-threaded backends
+    /// (`ParallelDeflate`) override to fire per chunk, which is what
+    /// the user sees as a smoothly-updating progress bar on a single
+    /// large file zip (PR #54 fix).
+    func compress(_ input: UnsafeBufferPointer<UInt8>,
+                  level: Int32,
+                  onProgress: (@Sendable (UInt64) -> Void)?) throws -> Data
+}
+
+extension DeflateBackend {
+    /// Default progress-aware shim: run the existing `compress(_:level:)`
+    /// to completion, then fire the callback once with the full input
+    /// size. Conformers that can do better (e.g. per-chunk granularity)
+    /// override this method directly.
+    public func compress(_ input: UnsafeBufferPointer<UInt8>,
+                         level: Int32,
+                         onProgress: (@Sendable (UInt64) -> Void)?) throws -> Data {
+        let result = try compress(input, level: level)
+        onProgress?(UInt64(input.count))
+        return result
+    }
 }
 
 /// Computes a CRC-32 checksum using the IEEE 802.3 / zlib polynomial

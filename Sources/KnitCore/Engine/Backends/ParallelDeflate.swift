@@ -37,6 +37,19 @@ public struct ParallelDeflate: DeflateBackend, CRC32Computing {
     }
 
     public func compress(_ input: UnsafeBufferPointer<UInt8>, level: Int32) throws -> Data {
+        return try compress(input, level: level, onProgress: nil)
+    }
+
+    /// Per-chunk progress-aware override. Fires `onProgress(chunkSize)`
+    /// after each chunk's `compressChunk` returns, so the CLI's
+    /// `--progress` bar ticks smoothly during a single-file zip even
+    /// when that file is multi-gigabyte. Without this override the
+    /// protocol's default extension only advances once at the end of
+    /// the whole compress() call, leaving the bar stuck at 0 % for
+    /// the entire run — the bug PR #54 fixes.
+    public func compress(_ input: UnsafeBufferPointer<UInt8>,
+                         level: Int32,
+                         onProgress: (@Sendable (UInt64) -> Void)?) throws -> Data {
         guard input.count > 0 else { return Data() }
 
         // zlib levels go 0..9; clamp from libdeflate range.
@@ -56,15 +69,22 @@ public struct ParallelDeflate: DeflateBackend, CRC32Computing {
         // The buffer is guaranteed alive for the duration of `compress(_:level:)`,
         // so passing the raw pointer across threads is safe — wrap it for Sendable.
         let basePtr = SendableRawPointer(input.baseAddress!)
+        let progressLocal = onProgress
 
         // Compress chunks in parallel
         let outputs: [Data] = try concurrentMap(slices, concurrency: concurrency) { slice in
             let chunkPtr = basePtr.value.advanced(by: slice.offset)
-            return try Self.compressChunk(
+            let result = try Self.compressChunk(
                 input: UnsafeBufferPointer(start: chunkPtr, count: slice.length),
                 level: zlibLevel,
                 isLast: slice.isLast
             )
+            // Fire after the chunk's codec pass — workers complete out
+            // of order, so the reporter sees bytes in the order they
+            // finish (not strict byte-offset order). The aggregate
+            // sum still matches input.count for a successful run.
+            progressLocal?(UInt64(slice.length))
+            return result
         }
 
         // Concatenate
