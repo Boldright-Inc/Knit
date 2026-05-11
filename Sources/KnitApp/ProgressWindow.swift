@@ -220,12 +220,44 @@ final class ProgressWindow: NSPanel {
     /// indicate "unknown" (we treat that as indeterminate).
     func update(processed: UInt64, total: UInt64, etaSeconds: Double) {
         if total == 0 {
-            progressBar.isIndeterminate = true
-            progressBar.startAnimation(nil)
+            // Stay in (or return to) indeterminate. Don't blindly call
+            // startAnimation — NSProgressIndicator's "is animation
+            // running" state isn't exposed, so re-starting an already-
+            // running animation can stutter the drawing on some macOS
+            // versions. Toggle the flag and let AppKit decide.
+            if !progressBar.isIndeterminate {
+                progressBar.isIndeterminate = true
+                progressBar.startAnimation(nil)
+            }
             detailLabel.stringValue = Self.formatBytes(processed)
             return
         }
-        progressBar.isIndeterminate = false
+        // **PR #66 fix.** Apple's docs are explicit about this:
+        //
+        //   "If you set isIndeterminate to NO when the progress
+        //    indicator is animating, you should stop the animation by
+        //    sending stopAnimation: to the receiver."
+        //
+        // `configureSubviews` calls `startAnimation(nil)` at init so the
+        // bar is visibly bouncing the moment the panel is shown. Just
+        // flipping `isIndeterminate = false` here doesn't actually stop
+        // the running animation — the indeterminate bouncer keeps
+        // drawing on top of (and visually masking) the determinate
+        // fill, so the user sees the "left-right preparing" animation
+        // for the entire compression even though `doubleValue` /
+        // `maxValue` are being updated correctly underneath. Reported
+        // for a multi-GB `knit pack` where the bar appeared stuck in
+        // preparing-mode the whole run while the CLI's text `--progress`
+        // bar (same ProgressReporter source) ticked normally.
+        //
+        // Stop the animation first, THEN switch the flag, THEN set the
+        // numeric values. Guarded so we only stop+toggle when actually
+        // transitioning — repeated determinate updates skip the flag
+        // dance.
+        if progressBar.isIndeterminate {
+            progressBar.stopAnimation(nil)
+            progressBar.isIndeterminate = false
+        }
         progressBar.maxValue = Double(total)
         progressBar.doubleValue = Double(processed)
 
