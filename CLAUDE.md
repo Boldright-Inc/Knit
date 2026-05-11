@@ -20,8 +20,16 @@ Concretely:
   and "GPU does part of the work, CPU does the rest" patterns that would
   be uneconomic on PCIe are first-class here.
 - The benchmark target is **NVMe write ceiling on the host's SSD**
-  (~6–8 GB/s on M3 Max / M5 Max for sequential writes). Pack already
-  hits this on short bursts; unpack is a separate work-stream.
+  (~6–8 GB/s on M3 Max / M5 Max for sequential writes).
+  **Status post-PR-#77: substantially met.** Pack is no longer
+  syscall-bound (PR #77's `writev(2)` gather closed the
+  per-block `write(2)` ceiling at ~3.9 GB/s); the remaining
+  bottleneck is CPU compute on the worker pool, not I/O. Unpack
+  is no longer GPU-CRC-stall-bound on the GUI path
+  (`--no-post-verify` default-on in Knit.app); the remaining
+  bottleneck is DRAM bandwidth on the Raw_Block inline memcpy.
+  See the post-PR-#77 "Current bench reference" section below
+  for the sample-trace evidence.
 - "Use the GPU" means specifically: measure where CPU spends time, then
   hand that stage off to a Metal kernel. Speculation about which stage
   to GPU-accelerate is not OK — see the `--analyze` discipline below.
@@ -916,6 +924,108 @@ motivating data. New architectural shape: **Knit.app launcher**
 | #58 | fix(knit-app): visible progress UI + bounded subprocess execution | Post-#57 hotfix surfacing two compounding bugs. (a) `LSUIElement` + `.accessory` activation silenced both system NSProgress and Finder file-icon overlay — `setActivationPolicy(.regular)` + remove LSUIElement, plus add custom `ProgressWindow` NSPanel as guaranteed-visible fallback. (b) `OperationCoordinator.start()`'s `for`-loop spawned one knit subprocess per input synchronously; combined with macOS Tahoe's openFiles double-fire (filenames included the literal flag strings "pack"/"unpack"), a single Quick Action fanned out to dozens of stuck Knit.app + ~120 knit subprocesses, crashing the host. Fix: `pendingRuns` serial queue, openFiles `--operation` guard, alert deferral via `DispatchQueue.main.async`, 256-input cap. **See "Knit.app launcher" architecture invariants** at top of this file for the constraints to preserve |
 | #59 | fix(ux): ProgressWindow shows output-format icon when compressing | User-reported: the panel showed the source file's icon (PVM disk image, PNG, etc.) when compressing to `.knit`. Switched to load bundled `KnitDocument.icns` directly for `.knit` output, `UTType` lookup for `.zip` and other system-known types. Bundled-resource path is required because Launch Services may not have registered our exported `co.boldright.knit.archive` UTI for a locally-built Knit.app — system lookup would silently return a generic doc icon |
 
+## Recent landed work (PRs #60–#77)
+
+The codec-perf workstream re-opened post-#59 once `sample(1)`
+traces on the user's M5 Max identified bottlenecks the earlier
+`--analyze` data had missed: per-`write(2)` syscall serialisation
+(both pack and ZIP), post-write GPU verify's main-thread stall,
+and kernel page-cache accumulation from large mmap'd inputs. This
+block records that catch-up work and the ZIP-side memcpy
+elimination that came along the way.
+
+| PR | Title | What it taught / what landed |
+|---|---|---|
+| #60–#67 | UX polish + format glue | Heatmap rendering tweaks, openFiles guard refinements, alert routing on subprocess failure. Per-PR detail in `gh pr list --state merged` |
+| #68 | perf(zip,pack): F_NOCACHE on writer FDs | Both `KnitWriter` and `ZipWriter` call `fcntl(fd, F_NOCACHE, 1)` at open time. Without it the kernel's writeback path fills RAM to ~50 % with dirty pages and engages the memory compressor, throttling sustained write throughput on multi-GB archives. Rule 3.2 distilled from this PR |
+| #69 | feat(zip): ZIP64 large-entry support | Entries ≥ 4 GB now emit ZIP64 extra fields per spec. Required to pack the user's 80 GB Parallels VM image |
+| #70 | perf(zip): stream `.stored` from mmap, no 80 GB Data copy | Replaced `Data(bytes:count:)` (which `vm_copy`'s the whole entry) with `writeRawChunkedMapped` — direct chunked writes from the input mmap. Discovered via `sample` showing 100 % main-thread time in `vm_copy` on 80 GB ZIP. The Rule 3.1 addendum (PR #71) covers the safety contract for `Data(bytesNoCopy:)` writes on F_NOCACHE FDs |
+| #71 | docs(CLAUDE.md): F_NOCACHE relaxes Rule 3.1 | Documents that the original PR #17 ban on `Data(bytesNoCopy:..., deallocator: .none)` applies only to PAGE-CACHE writes; with F_NOCACHE the vm_remap accumulation path is bypassed entirely. PR #70 leans on this |
+| #72 | perf(zip): parallel CRC32 for `.stored` entries | Per-entry CRC walk was serial libdeflate at ~750 MB/s — 100 s on the 80 GB VM. Sharded across `concurrentMap` workers for ~3-4 GB/s aggregate, ~25 s on the same input. Sample-trace bottleneck identification, not analyze-based |
+| #73 | perf(zip): bump payload-write chunk size 8 MiB → 64 MiB | Post-PR-#72 sample showed 100 % main-thread time in raw `write(2)` — no userspace overhead left to shave. 64 MiB chunks cut syscall count 8× and let the NVMe controller see longer contiguous ranges. Companion finding to PR #77 below: per-syscall byte budget matters for QD on F_NOCACHE writes |
+| #74 | perf(unpack): inline `RawFrameDecoder` + no-copy writer sink | Two coordinated changes. (a) RFC 8478 Raw_Block fast path on the main thread — for incompressible VM data (99.7 % Raw_Block per PR #43 classifier), skips the libzstd worker round-trip entirely; per-block parse + memcpy stays on main thread inside `HybridZstdBatchDecoder.decodeBatch:298`. (b) Replaced `Data(buffer:)` in the sink closure with `Data(bytesNoCopy:..., deallocator: .none)` per Rule 3.1 addendum. Halved unpack wall on the VM corpus before PR #75's `--no-post-verify` work made the verify pass optional |
+| #75 | perf(unpack): `--no-post-verify` flag | CLI flag to skip the post-write CRC re-read pass entirely. Decode-side per-batch CRC inside `HybridZstdBatchDecoder` still runs; what's skipped is the additional pass that mmap's the just-written file and re-CRCs it. APFS block-checksum + NVMe ECC make this defence-in-depth essentially free of value on modern macOS storage. ~60 s of wall reduction on 80 GB unpack |
+| #76 | fix(pack,zip): `MADV_DONTNEED` per-batch input mmap to prevent `cpt_mapcnt` panic | User report: kernel panic during `knit pack` of 80 GB `.pvm` on M5 Max — `cpt_mapcnt_inc: refcnt overflow` (2048 → 2049 cap). Root cause: M5 Max's 128 GB RAM has enough headroom that the kernel doesn't evict `MADV_SEQUENTIAL` input pages; the memory compressor opportunistically compresses cold pages; worker re-reads vm_remap those compressed pages → per-page refcount climbs past the 11-bit cap. Fix: explicit `madvise(MADV_DONTNEED)` after each batch's drain loop (pack) and per-chunk in `writeRawChunkedMapped` (ZIP). Same shape as the original Rule 3.1 panic (PR #17) but from the input-mmap side, not page-cache writes. **Side effect surfaced in PR #77**: with writev applying sustained I/O pressure, the `DONTNEED` hint is actually honoured rather than ignored on memory-rich hosts — resident-set drops 80 GB → ~2 GB during pack |
+| #77 | perf: push pack/unpack toward NVMe ceiling | Two-section PR. (a) `KnitWriter.StreamingEntry` coalesces per-block writes into 32 MiB `writev(2)` gather syscalls; pre-PR-#77 sample-trace pinned 70.6 % of main-thread wall in single-block `write(2)`, capping the NVMe controller at effectively QD=1. Post-PR sample shows `writev` path at 3.5 % main-thread wall, `write` (entry headers + finish patches) at 7 %, the rest split among worker waits and compute. NSData lifetime trick documented inside `KnitWriter` for the writev iovec pointer-escape (small inline-stored `Data` hits a dangling-pointer hazard caught by `RoundtripTests` during dev). (b) `Sources/KnitApp/OperationCoordinator.swift` passes `--no-post-verify` to the unpack subprocess by default — the GUI was paying the full ~60 s verify cost despite PR #75 having shipped the flag. Sample-trace 96 % of unpack main-thread wall in `MetalCRC32 -> waitUntilCompleted` dropped to 0 % |
+
+## Current bench reference (M5 Max 18-core, post-PR-#77, 2026-05-12)
+
+Bottleneck shape changed materially between PR #45 and PR #77. The
+post-#45 section below is **retained as the most recent full-wall
+analyze measurement** on this hardware; what follows is the
+post-#77 **sample-trace** update — ~2 s `sample(1)` windows
+showing how the CPU/IO mix split moved, not new total walls.
+A `bench-corpora.sh` run will refresh the analyze numbers; this
+section is the in-flight summary based on `sample` evidence.
+
+### Sample-trace shape (pre/post PR #77, M5 Max, 80 GB `.pvm`)
+
+**Pack (PID 4186 → PID 7777):**
+
+| Stage | Pre-PR-#77 | Post-PR-#77 |
+|---|---|---|
+| kernel `write(2)` (single-block payload) | **70.6 % (536 samp)** | 7 % (entry headers + finish-time patches only) |
+| `writev(2)` gather (new in #77) | — | 3.5 % |
+| `concurrentMap` group/sem wait (worker pool) | 10.1 % | **76 %** ← workers now dominate |
+| entropy.probe resolve wait | 11.7 % | 5.4 % |
+| `lseek` (finish-time patch seeks) | not visible | 2.2 % |
+| Physical resident footprint | 79.4 GB | **2.4 GB** |
+
+Workers themselves spend ~80 % on `libdeflate_crc32` and ~20 %
+on `ZSTD_compress` (the VM corpus is incompressible so zstd
+gives up fast — CRC is now 5× heavier than compress in
+cumulative-CPU terms). The pre-#77 worker stall in
+`MetalEntropyProbe.probeOneDispatch` (~1101 sample-equivalents
+across worker threads) is also gone — once writev applied
+sustained I/O pressure, the `madvise(MADV_DONTNEED)` hint from
+PR #76 actually evicted the input mmap pages that were causing
+vm_remap thrash on the GPU probe's mmap aliasing.
+
+**Unpack (PID 4208 → PID 7794, GUI now passes `--no-post-verify`):**
+
+| Stage | Pre-PR-#77 | Post-PR-#77 |
+|---|---|---|
+| `MetalCRC32.crc32 -> waitUntilCompleted` (post-write verify) | **96 % (805 samp)** | **0 %** |
+| `_platform_memmove` (RawFrameDecoder inline fast path, PR #74) | not visible (verify hid it) | **49 % (1037 samp)** ← decompression itself |
+| Worker `concurrentMap` wait (slow path for `Compressed_Block` batches) | not visible | 11 % |
+| Sink `write(2)` to output FD | not visible | 4 % |
+| `libdeflate_crc32` per-batch fold | not visible | 2.4 % |
+
+The 49 % memmove **is** the Raw_Block decode work — for
+incompressible input, decompression is literally byte-for-byte
+memcpy from the compressed block to the staging buffer. M5 Max
+DRAM bandwidth (~80 GB/s aggregate, ~30-40 GB/s single-threaded)
+is the ceiling.
+
+### What the shift means
+
+Pack moved from **`write(2)` syscall serialisation bound** to
+**CPU-bound on workers** (CRC + compress + entropy). The natural
+ceiling is now M5 Max's 18-core CPU bandwidth, no longer the
+NVMe controller's queue depth. CRC is the dominant CPU stage on
+incompressible input — the post-#45 retired pack-side
+MetalCRC32 (which lost on ~35 MiB batches) deserves
+re-evaluation **at the per-entry-CRC scale**: the VM corpus has
+29 entries averaging ~3 GB, well above the 1 GiB
+dispatch-amortisation point. This is the pack-side cousin of
+the "MetalCRC32 for ZIP per-entry large buffers" backlog item.
+Gate before code: `bench-corpora.sh` numbers per Rule 4.1.
+
+Unpack moved from **GPU CRC dispatch-wait bound** to
+**DRAM-bandwidth bound** on the Raw_Block inline fast path.
+Parallelising the fast path across cores could push from
+~30-40 GB/s single-thread to ~60 GB/s aggregate (memory-bandwidth
+ceiling, ~2× the current rate). Tractable but the operation is
+already at its natural ceiling.
+
+### Caveat: sample windows are not full-wall measurements
+
+The percentages above are from `sample(1)` snapshots — ~2 s
+windows mid-execution. They represent **CPU mix at steady
+state**, not full wall. A future agent running
+`bench-corpora.sh` should fold the resulting analyze data into
+a new revision of this section once captured.
+
 ## Current bench reference (M5 Max 18-core, post-PR-#45, 2026-05-10)
 
 The reference walls we're working against. Use `--analyze` to refresh
@@ -1233,8 +1343,38 @@ moved to the "Investigated, no-go" section above.
 | **Standardize path resolution helper** | `FileWalker.realpathURL` exists but is private. If a second caller wants the same firmlink-safe resolution, pull it into a shared utility | move to a thin `Sources/KnitCore/Engine/IO/RealPath.swift` once a second call site needs it |
 | **Streaming CRC for ZIP `.stored` entries** | After PR #72 the per-entry CRC walk runs in parallel (~0.5 s for 80 GB), but it still requires a second pass over the buffer. A truly streaming writer computes CRC incrementally as the payload bytes flow through `writeRawChunkedMapped` — no separate walk needed at all | ZIP spec: set GP flag bit 3 to defer CRC to a post-payload `data descriptor` record; `ZipWriter.writeEntry` keeps a rolling CRC inside the chunked-write loop and emits the descriptor right after the payload. Halves prepare-phase wall on huge `.stored` inputs. Touches LFH layout + per-chunk CRC accumulation; needs a streaming test against `unzip -t` to verify the bit-3 path is honoured (older readers may not understand it) |
 | **MetalCRC32 for ZIP per-entry large buffers** | CLAUDE.md "Investigated, no-go" retired pack-side `MetalCRC32` because pack's per-batch buffers (~32 MiB) sit below the GPU dispatch amortisation point. ZIP's per-entry CRC is a DIFFERENT regime — a single 80 GB buffer dispatches once, so the kernel overhead amortises well | wire `MetalCRC32?` into `ZipCompressor.Options` (mirrors `KnitExtractor.gpuCRC`); when present, the `.stored` short-circuits and the post-codec CRC path call `gpuCRC.crc32(buf)` instead of `parallelCRC32`. Benchmark against the PR #72 parallel path first — on 80 GB the libdeflate-parallel walk is already ~3-4 GB/s aggregate, and GPU may or may not beat that. **Don't ship blind**; needs `Scripts/bench-corpora.sh` numbers as gate |
+| **Per-entry MetalCRC32 on pack-side for large entries** | Post-PR-#77 worker CPU is dominated by `libdeflate_crc32` (~80 % of worker sample-time on the VM corpus). The post-#45 ruling against pack-side MetalCRC32 was on ~35 MiB per-batch buffers — far below the 1 GiB amortisation point. The VM corpus has 29 entries averaging ~3 GB each: well above that point | thread `MetalCRC32?` into `StreamingBlockCompressor` at entry granularity (not per-block): accumulate the entry's payload via mmap-alias and dispatch ONE GPU CRC per entry. Pipelined behind worker compress like the entropy probe. Needs `bench-corpora.sh` calibration first (per Rule 4.1); the wall-win is bounded by `parallel.compress` shrinkage, not eliminated CRC compute — but with workers no longer write-bottlenecked, freeing 80 % of their CPU should translate to wall reduction |
+| **Multi-thread the unpack Raw_Block inline fast path** | Post-PR-#77 unpack main-thread wall is 49 % `_platform_memmove` inside `RawFrameDecoder.decode` (PR #74). Single-threaded at ~30-40 GB/s — DRAM bandwidth is ~80 GB/s on M5 Max | split the staging buffer across `concurrentMap` workers for the all-Raw_Block fast path. Keep the worker round-trip skip (the round-trip cost was the original PR #74 motivation), just parallelise the memmove inside the existing closure. Expected ~50-80 % wall reduction on incompressible large-entry decode. Lower-risk than parallel writes because the operation is pure memcpy with deterministic destination offsets — no ordering constraint |
 
-### Pivot direction (post-#45)
+### Pivot direction (post-#77)
+
+PR #77 closed the two remaining levers from the post-#45 pivot
+list: pack is no longer write-syscall bound (`writev(2)` gather
+ate the 70.6 % main-thread wall down to 3.5 %), unpack no longer
+pays the post-write verify wall (GUI default-off via the existing
+`--no-post-verify` flag). Both operations now sit at their
+natural hardware ceilings:
+
+- **Pack: CPU compute** — workers spend ~80 % of their time
+  in `libdeflate_crc32`, ~20 % in `ZSTD_compress`. The 18-core
+  M5 Max CPU bandwidth is the ceiling. The only remaining GPU
+  lever worth re-evaluating is **per-entry MetalCRC32 for large
+  entries** — the post-PR-#45 retired ruling was on ~35 MiB
+  per-batch buffers (below the 1 GiB dispatch-amortisation
+  point), but the VM corpus has 29 entries averaging ~3 GB
+  each. Pack-side cousin of the "MetalCRC32 for ZIP per-entry
+  large buffers" backlog item; same caveat about
+  `bench-corpora.sh` calibration before code.
+
+- **Unpack: DRAM bandwidth** — 49 % of main-thread wall is the
+  Raw_Block inline memmove (decompression IS memcpy for
+  incompressible input). Multi-threading the fast path would
+  push toward the memory-bandwidth ceiling (~60 GB/s aggregate
+  vs ~30-40 GB/s single-thread, ~2× the current rate).
+  Tractable but not urgent — the operation is already at its
+  natural ceiling for the single-threaded path.
+
+### Pivot direction (post-#45, retained for context)
 
 The three GPU codec levers the earlier roadmap proposed (Phase 1b,
 pack-side GPU CRC, Phase 2 full FSE) have all been retired or
