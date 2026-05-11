@@ -54,8 +54,25 @@ public final class MetalEntropyProbe: EntropyProbing, @unchecked Sendable {
         //
         // Headroom factor (3/4) leaves room for the histogram output
         // buffer plus any other Metal allocations the system has live.
+        //
+        // **UInt32 cap (PR #61 fix).** `ProbeParams` (the kernel's
+        // arg struct) declares `totalBytes` as `uint`, and
+        // `probeOneDispatch` coerces `total` via `UInt32(total)`. On
+        // M3 Max / M5 Max `maxBufferLength` is ~18 GB, so the
+        // `(deviceMax / 4) * 3` term alone would push `chunkSize`
+        // past `UInt32.max` (≈ 4 GiB). When a single entry being
+        // probed (e.g. a ZIP entry > 4 GiB) hit that path, the
+        // coercion trapped with `EXC_BREAKPOINT` / SIGTRAP — the
+        // Swift runtime's "Not enough bits to represent the passed
+        // value" check. Found via crash report from the user's
+        // 80 GB VM corpus pack via the Quick Action (status 5
+        // surfaced through OperationCoordinator). Cap chunkSize at
+        // the largest block-aligned multiple ≤ UInt32.max to keep
+        // each dispatch inside the kernel's UInt32 addressing.
         let deviceMax = max(blockSize, Int(context.device.maxBufferLength))
-        let safeChunkLimit = max(blockSize, (deviceMax / 4) * 3)
+        let memChunkLimit = max(blockSize, (deviceMax / 4) * 3)
+        let uint32ChunkLimit = (Int(UInt32.max) / blockSize) * blockSize
+        let safeChunkLimit = min(memChunkLimit, uint32ChunkLimit)
         var chunkSize = (safeChunkLimit / blockSize) * blockSize
         if chunkSize < blockSize { chunkSize = blockSize }
 
