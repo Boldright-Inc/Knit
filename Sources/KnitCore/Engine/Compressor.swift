@@ -112,47 +112,68 @@ public final class ZipCompressor: Sendable {
         // Stage 1: concurrently produce per-entry compressed payloads.
         // Stage 2: write to ZIP serially in walk order.
         //
-        // Progress reporting plumbs an `onProgress(bytes)` closure all
-        // the way down into the backend's `compress(_:level:onProgress:)`.
-        // For `ParallelDeflate` (the `--parallel` Quick Action path) the
-        // closure fires per chunk, so a single multi-gigabyte file
-        // produces a steady tick instead of a single "0 % → 100 %" jump
-        // at the very end of the codec pass — PR #54 fix. For the
-        // `.stored` paths (level 0, entropy-too-high, or
-        // compression-grew-the-buffer) the backend isn't called at all,
-        // so `prepare(...)` advances explicitly on those branches.
+        // Progress reporting (PR #71): each entry contributes
+        // `uncompressedSize` to the reporter's total budget. The
+        // budget is distributed across three phases (probe, codec,
+        // write) so the bar visibly moves regardless of which phase
+        // dominates wall-clock for the workload:
+        //
+        //   entropy probe — half rate, fires per Metal dispatch
+        //                   (≤4 GiB/dispatch on M3 Max / M5 Max, so a
+        //                   long incompressible-file probe ticks ~20
+        //                   times instead of sitting silent for
+        //                   seconds)
+        //   codec compress — half rate, fires per chunk via
+        //                   ParallelDeflate's onProgress (PR #54)
+        //   payload write — variable rate per entry, controlled by
+        //                   PreparedEntry.writeAdvanceRate; see the
+        //                   enum's doc-block for the four cases.
+        //
+        // Net effect on a typical entry: the bar ticks throughout
+        // the entry's lifetime instead of all-or-nothing during one
+        // phase. Sums per entry to exactly `uncompressedSize`.
         let reporter = options.progressReporter
-        // Build the per-chunk progress closure as an explicit `if let`
-        // assignment rather than via `Optional.map { … }`. Swift 6's
-        // type inferencer fails to reconcile the @Sendable annotation
-        // with the closure-returning-closure shape via `map` and emits
-        // a "failed to produce diagnostic" internal error. The
-        // unrolled form below is byte-equivalent and compiles cleanly.
-        let onProgress: (@Sendable (UInt64) -> Void)?
+        // Half-rate closures for the prepare phases.  Explicit `if
+        // let` (instead of `Optional.map`) because Swift 6's
+        // inferencer fails on closure-returning-closure with
+        // @Sendable.
+        let probeOnProgress: (@Sendable (UInt64) -> Void)?
+        let codecOnProgress: (@Sendable (UInt64) -> Void)?
         if let r = reporter {
-            onProgress = { bytes in r.advance(by: bytes) }
+            probeOnProgress = { bytes in r.advance(by: bytes / 2) }
+            codecOnProgress = { bytes in r.advance(by: bytes / 2) }
         } else {
-            onProgress = nil
+            probeOnProgress = nil
+            codecOnProgress = nil
         }
         let prepared: [PreparedEntry] = try concurrentMap(
             entries,
             concurrency: options.concurrency
         ) { entry in
-            return try self.prepare(entry: entry, onProgress: onProgress)
+            return try self.prepare(entry: entry,
+                                     probeOnProgress: probeOnProgress,
+                                     codecOnProgress: codecOnProgress)
         }
 
         for p in prepared {
-            // PR #65: pass the reporter's chunked-write callback ONLY for
-            // entries whose uncompressed bytes haven't already been
-            // counted during prepare (i.e. .stored entries that bypassed
-            // backend.compress). Passing it for `.deflate` or for the
-            // compress-grew-larger fallback would double-count and let
-            // the bar overshoot 100 %.
+            // PR #71: writer rate per entry. See `WriteAdvanceRate`
+            // for what each case represents.
             let writeProgress: (@Sendable (UInt64) -> Void)?
-            if p.needsWriteAdvance, let r = reporter {
-                writeProgress = { written in r.advance(by: written) }
-            } else {
+            switch p.writeAdvanceRate {
+            case .none:
                 writeProgress = nil
+            case .full:
+                if let r = reporter {
+                    writeProgress = { written in r.advance(by: written) }
+                } else {
+                    writeProgress = nil
+                }
+            case .half:
+                if let r = reporter {
+                    writeProgress = { written in r.advance(by: written / 2) }
+                } else {
+                    writeProgress = nil
+                }
             }
             try writer.writeEntry(
                 descriptor: p.descriptor,
@@ -179,6 +200,30 @@ public final class ZipCompressor: Sendable {
 
     // MARK: - Per-entry preparation
 
+    /// PR #71. Per-entry "how much of the entry's byte budget should
+    /// the writer advance during the payload drain" indicator,
+    /// replacing the prior `needsWriteAdvance: Bool`. Three states
+    /// cover every prepare path:
+    ///
+    /// - `.none`  — every byte has already been credited during
+    ///              prepare (the probe + codec phases together
+    ///              covered the entry's `uncompressedSize`). Writer
+    ///              does not advance the reporter.
+    /// - `.full`  — nothing has been credited yet; the probe didn't
+    ///              run (level=0 short-circuit, or empty file) and
+    ///              the codec didn't run either. Writer advances by
+    ///              the full payload byte count.
+    /// - `.half`  — the probe ran (and contributed half the entry's
+    ///              budget) but the codec was short-circuited
+    ///              (entropy-too-high → `.stored`). Writer advances
+    ///              by the OTHER half: each chunk-byte advances the
+    ///              reporter by 0.5 byte.
+    fileprivate enum WriteAdvanceRate: Sendable {
+        case none
+        case full
+        case half
+    }
+
     fileprivate struct PreparedEntry: @unchecked Sendable {
         let descriptor: ZipWriter.EntryDescriptor
         let method: CompressionMethod
@@ -198,14 +243,10 @@ public final class ZipCompressor: Sendable {
         /// Convenience: payload byte count captured at construction
         /// so the write loop doesn't re-walk the enum every iteration.
         let payloadByteCount: UInt64
-        /// PR #65. True when these bytes have not yet been counted toward
-        /// the `progressReporter` and the writer should fire its per-chunk
-        /// `onProgress` callback against the reporter while it streams
-        /// the payload to disk. False when prepare-phase
-        /// `backend.compress(onProgress:)` already advanced the reporter
-        /// (compressed entries, including the "compress-grew-the-payload"
-        /// fallback) — re-advancing during write would double-count.
-        let needsWriteAdvance: Bool
+        /// PR #71. How much of this entry's `uncompressedSize`
+        /// budget the writer should advance during its payload drain.
+        /// See `WriteAdvanceRate` for the three cases.
+        let writeAdvanceRate: WriteAdvanceRate
     }
 
     private static func dataFromBuffer(_ buf: UnsafeBufferPointer<UInt8>) -> Data {
@@ -214,7 +255,8 @@ public final class ZipCompressor: Sendable {
     }
 
     private func prepare(entry: FileEntry,
-                         onProgress: (@Sendable (UInt64) -> Void)?) throws -> PreparedEntry {
+                         probeOnProgress: (@Sendable (UInt64) -> Void)?,
+                         codecOnProgress: (@Sendable (UInt64) -> Void)?) throws -> PreparedEntry {
         let descriptor = ZipWriter.EntryDescriptor(
             name: entry.relativePath,
             modificationDate: entry.modificationDate,
@@ -232,7 +274,7 @@ public final class ZipCompressor: Sendable {
                 uncompressedSize: 0,
                 payload: .data(Data()),
                 payloadByteCount: 0,
-                needsWriteAdvance: false
+                writeAdvanceRate: .none
             )
         }
 
@@ -244,12 +286,10 @@ public final class ZipCompressor: Sendable {
         if options.level.raw == 0 || buf.count == 0 {
             let crcVal = buf.count == 0 ? 0 : crc.crc32(buf, seed: 0)
             // .stored short-circuit: backend.compress(onProgress:) is
-            // skipped. PR #65 moved the per-entry advance to the writer's
-            // chunked progress callback. PR #70 also replaces the
-            // `Data(bytes:count:)` copy with a `.mapped(mapped)` payload
-            // so a multi-GiB stored entry streams directly from mmap
-            // during the writer's drain instead of materialising an
-            // 80 GB heap allocation here.
+            // skipped AND the probe doesn't run for this branch. PR
+            // #71: the writer is the only phase that contributes to
+            // this entry's progress budget, so `.full` advance rate.
+            // PR #70 streams from mmap (no Data copy).
             return PreparedEntry(
                 descriptor: descriptor,
                 method: .stored,
@@ -257,7 +297,7 @@ public final class ZipCompressor: Sendable {
                 uncompressedSize: UInt64(buf.count),
                 payload: .mapped(mapped),
                 payloadByteCount: UInt64(buf.count),
-                needsWriteAdvance: true
+                writeAdvanceRate: .full
             )
         }
 
@@ -265,10 +305,18 @@ public final class ZipCompressor: Sendable {
         // threshold there's no productive work for the codec to do — we'd
         // attempt a full compress() and then fall back to .stored anyway.
         // Skip straight to .stored, saving the wasted CPU pass.
+        //
+        // PR #71: pass `probeOnProgress` so a multi-GB probe (~ 5 s on
+        // M5 Max for an 80 GB buffer) ticks the bar at half-rate as
+        // each Metal dispatch completes.
         let probeBlockSize = 1 * 1024 * 1024
         var probeResults: [EntropyResult] = []
+        var probeRan = false
         if options.entropyProbeEnabled {
-            probeResults = (try? probe.probe(buf, blockSize: probeBlockSize)) ?? []
+            probeResults = (try? probe.probe(buf,
+                                              blockSize: probeBlockSize,
+                                              onProgress: probeOnProgress)) ?? []
+            probeRan = !probeResults.isEmpty
         }
         let overall = byteWeightedEntropy(probeResults)
 
@@ -280,13 +328,9 @@ public final class ZipCompressor: Sendable {
                                originalBytes: buf.count,
                                storedBytes: buf.count,
                                disposition: .stored)
-            // Entropy-driven .stored: backend skipped. PR #65 advances
-            // during the writer's payload write, not here. PR #70
-            // additionally replaces the `Data(bytes:count:)` copy with
-            // a `.mapped(mapped)` payload — the canonical 80 GB
-            // Parallels VM case no longer materialises an 80 GB heap
-            // allocation in prepare(); the writer streams directly
-            // from mmap during its NVMe drain.
+            // Entropy-driven .stored: backend skipped. Probe advanced
+            // half the budget (PR #71); writer advances the other half.
+            // PR #70 streams from mmap, so no 80 GB Data copy.
             return PreparedEntry(
                 descriptor: descriptor,
                 method: .stored,
@@ -294,29 +338,29 @@ public final class ZipCompressor: Sendable {
                 uncompressedSize: UInt64(buf.count),
                 payload: .mapped(mapped),
                 payloadByteCount: UInt64(buf.count),
-                needsWriteAdvance: true
+                writeAdvanceRate: .half
             )
         }
 
         // The codec path: backend.compress(onProgress:) fires the
         // callback itself as it makes progress. ParallelDeflate fires
         // per chunk; CPUDeflate fires once at the end via the protocol
-        // extension default. Either way the per-entry contribution
-        // sums to buf.count when this call returns successfully.
+        // extension default. PR #71: half-rate when probe also ran
+        // (typical), full-rate when probe was skipped (entropy probe
+        // disabled by caller) — the codec then carries the whole
+        // budget itself.
+        let codecCallback = probeRan ? codecOnProgress : Self.reporterFullRateClosure(reporter: options.progressReporter)
         let compressed = try backend.compress(
             buf,
             level: options.level.clampedForDeflate(),
-            onProgress: onProgress
+            onProgress: codecCallback
         )
         let crcVal = crc.crc32(buf, seed: 0)
 
-        // If compression made it larger, store uncompressed instead (ZIP spec encourages this).
-        // The backend already advanced the reporter by buf.count during
-        // its compress() pass, so we DON'T re-advance here — the
-        // entry's bytes are already accounted for. `needsWriteAdvance:
-        // false` keeps the writer from double-counting. PR #70: this
-        // fallback can also stream from mmap (entry was already
-        // mmap-resident during the failed codec pass).
+        // If compression made it larger, store uncompressed instead
+        // (ZIP spec encourages this). Probe + codec together have
+        // already accounted for `buf.count`, so write must NOT advance.
+        // PR #70 streams from mmap.
         if compressed.count >= buf.count {
             recordEntryHeatmap(probe: probeResults,
                                originalBytes: buf.count,
@@ -329,7 +373,7 @@ public final class ZipCompressor: Sendable {
                 uncompressedSize: UInt64(buf.count),
                 payload: .mapped(mapped),
                 payloadByteCount: UInt64(buf.count),
-                needsWriteAdvance: false
+                writeAdvanceRate: .none
             )
         }
 
@@ -344,8 +388,20 @@ public final class ZipCompressor: Sendable {
             uncompressedSize: UInt64(buf.count),
             payload: .data(compressed),
             payloadByteCount: UInt64(compressed.count),
-            needsWriteAdvance: false
+            writeAdvanceRate: .none
         )
+    }
+
+    /// PR #71 helper. When `entropyProbeEnabled == false` and the
+    /// codec is the only phase that touches the bytes, it carries
+    /// the entire entry budget at full rate. Built once per `prepare`
+    /// call to keep the @Sendable closure construction off the hot
+    /// path of the normal probe-ran case.
+    private static func reporterFullRateClosure(
+        reporter: ProgressReporter?
+    ) -> (@Sendable (UInt64) -> Void)? {
+        guard let r = reporter else { return nil }
+        return { bytes in r.advance(by: bytes) }
     }
 
     /// Push one `HeatmapSample` per probed block into the recorder. When the

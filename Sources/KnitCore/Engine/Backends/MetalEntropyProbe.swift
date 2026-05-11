@@ -34,14 +34,16 @@ public final class MetalEntropyProbe: EntropyProbing, @unchecked Sendable {
     }
 
     public func probe(_ buffer: UnsafeBufferPointer<UInt8>,
-                      blockSize: Int) throws -> [EntropyResult] {
+                      blockSize: Int,
+                      onProgress: (@Sendable (UInt64) -> Void)?) throws -> [EntropyResult] {
         guard let base = buffer.baseAddress, buffer.count > 0, blockSize > 0 else {
             return []
         }
         // Below the dispatch-amortization threshold, defer to CPU. Same code
         // path; the result format is identical.
         if buffer.count < Self.minBufferForGPU {
-            return try CPUEntropyProbe().probe(buffer, blockSize: blockSize)
+            return try CPUEntropyProbe().probe(buffer, blockSize: blockSize,
+                                                onProgress: onProgress)
         }
 
         // Cap each Metal dispatch at a fraction of the device's
@@ -85,6 +87,12 @@ public final class MetalEntropyProbe: EntropyProbing, @unchecked Sendable {
             let chunkBuf = UnsafeBufferPointer(start: chunkPtr, count: chunkLen)
             let chunkResults = try probeOneDispatch(chunkBuf, blockSize: blockSize)
             allResults.append(contentsOf: chunkResults)
+            // PR #71: fire per-dispatch so the bar can tick during a
+            // multi-GB probe (each dispatch covers ≤ UInt32.max bytes
+            // post-PR-#61, i.e. ~4 GiB on M3 Max / M5 Max — so an
+            // 80 GB probe fires ~20 ticks, enough to show smooth
+            // motion).
+            onProgress?(UInt64(chunkLen))
             off += chunkLen
         }
         return allResults
@@ -196,7 +204,8 @@ public struct AutoEntropyProbe: EntropyProbing {
     }
 
     public func probe(_ buffer: UnsafeBufferPointer<UInt8>,
-                      blockSize: Int) throws -> [EntropyResult] {
-        try backend.probe(buffer, blockSize: blockSize)
+                      blockSize: Int,
+                      onProgress: (@Sendable (UInt64) -> Void)?) throws -> [EntropyResult] {
+        try backend.probe(buffer, blockSize: blockSize, onProgress: onProgress)
     }
 }

@@ -405,6 +405,37 @@ write paths. The ~3 s of memcpy across 80 GB on M5 Max is the safety
 margin we trade for keeping user buffers and kernel buffers in
 disjoint physical pages.
 
+##### Rule 3.1 addendum (PR #71): F_NOCACHE relaxes the constraint
+
+The vm_remap accumulation in the original panic was the kernel's
+**page-cache "zero-copy" optimisation** kicking in for cached
+writes. When the destination FD has been opened with
+`F_NOCACHE` (Rule 3.2 / PR #68), the kernel skips the page-cache
+aliasing path entirely — `write(2)` goes direct to the NVMe
+controller's own DRAM, no vm_remap reference, no `cpt_mapcnt`
+increment. Under those conditions `Data(bytesNoCopy:..., 
+deallocator: .none)` is **safe for arbitrarily large write
+paths**, and PR #70 leans on this to stream `.stored` ZIP entries
+straight from mmap without an 80 GB `Data(bytes:count:)` 
+`vm_copy` intermediate.
+
+Two conditions must hold to use this exemption:
+
+1. The destination FD has `fcntl(fd, F_NOCACHE, 1)` set
+   (writer-side; the read-side mmap is unaffected).
+2. The aliased range per `write(contentsOf:)` call is bounded
+   (chunked) so any latent vm_remap on a degraded filesystem
+   (one that ignores `F_NOCACHE`) accumulates at most ~chunk-count
+   references — orders of magnitude below the `cpt_mapcnt`
+   overflow threshold. 8 MiB chunks (PR #65 / PR #70 writers)
+   cap this at ~10 000 references for an 80 GB write.
+
+Without `F_NOCACHE` the original prohibition stands —
+`Data(buffer:)` copying is the only safe path. The two rules
+together describe the same kernel constraint from opposite
+ends: Rule 3.1 bans aliasing on the cached path, Rule 3.2 + PR
+#71 lift the ban on the uncached path.
+
 #### Rule 3.2 — F_NOCACHE on output FDs for sustained large writes
 
 Same PR #17. Without it, the page cache holds dirty pages until the
