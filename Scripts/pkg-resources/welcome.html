@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<style>
+body { font-family: -apple-system, "Hiragino Sans", sans-serif; padding: 16px 22px; color: #222; }
+h2   { color: #d9621b; margin-top: 0; }
+ul   { padding-left: 20px; line-height: 1.7; }
+.note { color: #666; font-size: 12px; margin-top: 18px; }
+</style>
+</head>
+<body>
+<h2>Knit へようこそ</h2>
+
+<p>このインストーラは Knit を以下の場所に配置します：</p>
+
+<ul>
+  <li><b>/Applications/Knit.app</b> — `.knit` ファイルのアイコンを登録するためのアプリ</li>
+  <li><b>/usr/local/bin/knit</b> — コマンドライン（社内ターミナル作業用）</li>
+  <li><b>/Library/Services/Knit *.workflow</b> — Finder の右クリックメニュー</li>
+</ul>
+
+<p>インストール完了後、Finder で任意のファイルを右クリックすると以下のメニューが追加されています：</p>
+
+<ul>
+  <li><b>Knit Compress (ZIP)</b> — 標準 ZIP 形式で圧縮（どこでも展開可）</li>
+  <li><b>Knit Compress (.knit)</b> — Knit 高速形式で圧縮</li>
+  <li><b>Knit Extract</b> — 圧縮ファイルを展開</li>
+</ul>
+
+<p class="note">対象環境：macOS 15 Sequoia 以降、Apple Silicon (M1〜M5) Mac<br>
+管理者パスワードの入力が求められます。</p>
+</body>
+</html>
