@@ -179,6 +179,22 @@ public final class KnitReader: @unchecked Sendable {
             if !POSIXFile.mkdirParents(outPath) {
                 throw KnitError.ioFailure(path: outPath, message: "could not create directory")
             }
+            // PR #82: apply the archive's stored unixMode to the
+            // directory we just created. `mkdir(2)` itself respects
+            // the process umask, so calling `chmod(2)` afterwards
+            // is the way to land the exact mode bits the archive
+            // recorded. Pre-PR-#82 the legacy `FileManager.createDirectory`
+            // path silently ignored `entry.unixMode` and let umask
+            // pick — a round-trip drift for directories with
+            // non-default modes (e.g. APFS-stored `0o700`
+            // user-private dirs unpacking as `0o755`).
+            _ = outPath.withCString { chmod($0, mode_t(entry.unixMode)) }
+            // PR #82: stamp the directory's modification time from
+            // the archive. Without this, freshly-unpacked dirs all
+            // carry "now" mtime — losing the historical timestamp
+            // that the .knit faithfully recorded.
+            POSIXFile.setMTime(path: outPath,
+                               secondsSince1970: Int64(entry.modificationDate.timeIntervalSince1970))
             return
         }
 
@@ -195,7 +211,18 @@ public final class KnitReader: @unchecked Sendable {
                 _ = POSIXFile.mkdirParents(parentPath)
             }
         }
-        let outHandle = try POSIXFile.openForWriting(outPath)
+        // PR #82: apply the archive's stored unixMode at open
+        // time so the file lands with the original bits.
+        // Pre-PR-#82 the legacy `FileManager.createFile` path
+        // ignored `entry.unixMode` and used umask defaults —
+        // a Parallels VM's `0o600` (private) image would unpack
+        // as `0o644` (world-readable), a quiet security
+        // round-trip regression. `O_CREAT`'s `mode_t` argument
+        // is masked through umask, so we also call `chmod(2)`
+        // afterwards to land the literal recorded bits.
+        let outHandle = try POSIXFile.openForWriting(outPath,
+                                                      mode: mode_t(entry.unixMode))
+        _ = outPath.withCString { chmod($0, mode_t(entry.unixMode)) }
         defer { try? outHandle.close() }
 
         // Opt-in staged path: build (frame, uncompressedSize) per block
@@ -240,6 +267,13 @@ public final class KnitReader: @unchecked Sendable {
             if postWriteVerify {
                 try verifyCRC(entry: entry, outPath: outPath, gpuCRC: gpuCRC)
             }
+            // PR #82: stamp the file's mtime from the archive
+            // while the fd is still open. Must come AFTER writes
+            // have completed (writes update mtime; setting before
+            // would be overwritten) and ideally BEFORE close
+            // (saves a path-lookup syscall vs `utimes`).
+            POSIXFile.setMTime(fd: outHandle.fileDescriptor,
+                               secondsSince1970: Int64(entry.modificationDate.timeIntervalSince1970))
             // PR #81: release the input-mmap pages this entry consumed.
             // See `releaseInputPagesFor(entry:)` doc-block for the
             // jetsam-prevention rationale (mirrors PR #76's pack-side
@@ -323,6 +357,11 @@ public final class KnitReader: @unchecked Sendable {
         if postWriteVerify {
             try verifyCRC(entry: entry, outPath: outPath, gpuCRC: gpuCRC)
         }
+        // PR #82: stamp the file's mtime from the archive while
+        // the fd is still open (legacy non-staged path —
+        // identical to the staged-path call above).
+        POSIXFile.setMTime(fd: outHandle.fileDescriptor,
+                           secondsSince1970: Int64(entry.modificationDate.timeIntervalSince1970))
     }
 
     /// Drive the entry's decode through a `HybridZstdBatchDecoder`. The
