@@ -163,7 +163,7 @@ public final class ZipCompressor: Sendable {
                 onProgress: writeProgress
             )
             bytesIn  += p.uncompressedSize
-            bytesOut += UInt64(p.payload.count)
+            bytesOut += p.payloadByteCount
         }
 
         try writer.close()
@@ -179,12 +179,25 @@ public final class ZipCompressor: Sendable {
 
     // MARK: - Per-entry preparation
 
-    fileprivate struct PreparedEntry: Sendable {
+    fileprivate struct PreparedEntry: @unchecked Sendable {
         let descriptor: ZipWriter.EntryDescriptor
         let method: CompressionMethod
         let crc: UInt32
         let uncompressedSize: UInt64
-        let payload: Data
+        /// PR #70. Was `Data`; widened to `ZipWriter.Payload` so a
+        /// `.stored` entry pointing at a huge incompressible file (e.g.
+        /// an 80 GB Parallels VM image) can stream straight from the
+        /// mmap during the writer's drain instead of `Data(bytes:count:)`-
+        /// copying the entire buffer into a fresh allocation during
+        /// `prepare()`. `@unchecked Sendable` because the new
+        /// `.mapped(MappedFile)` case carries a class — by the time the
+        /// PreparedEntry reaches the serial write loop, the MappedFile
+        /// has been fully constructed and is only read from, so the
+        /// closed-over reference is effectively immutable.
+        let payload: ZipWriter.Payload
+        /// Convenience: payload byte count captured at construction
+        /// so the write loop doesn't re-walk the enum every iteration.
+        let payloadByteCount: UInt64
         /// PR #65. True when these bytes have not yet been counted toward
         /// the `progressReporter` and the writer should fire its per-chunk
         /// `onProgress` callback against the reporter while it streams
@@ -217,7 +230,8 @@ public final class ZipCompressor: Sendable {
                 method: .stored,
                 crc: 0,
                 uncompressedSize: 0,
-                payload: Data(),
+                payload: .data(Data()),
+                payloadByteCount: 0,
                 needsWriteAdvance: false
             )
         }
@@ -231,15 +245,18 @@ public final class ZipCompressor: Sendable {
             let crcVal = buf.count == 0 ? 0 : crc.crc32(buf, seed: 0)
             // .stored short-circuit: backend.compress(onProgress:) is
             // skipped. PR #65 moved the per-entry advance to the writer's
-            // chunked progress callback (so a multi-GiB stored entry
-            // ticks during its serial NVMe drain instead of jumping 0 →
-            // 100 % and then sitting at 100 % through the actual write).
+            // chunked progress callback. PR #70 also replaces the
+            // `Data(bytes:count:)` copy with a `.mapped(mapped)` payload
+            // so a multi-GiB stored entry streams directly from mmap
+            // during the writer's drain instead of materialising an
+            // 80 GB heap allocation here.
             return PreparedEntry(
                 descriptor: descriptor,
                 method: .stored,
                 crc: crcVal,
                 uncompressedSize: UInt64(buf.count),
-                payload: Self.dataFromBuffer(buf),
+                payload: .mapped(mapped),
+                payloadByteCount: UInt64(buf.count),
                 needsWriteAdvance: true
             )
         }
@@ -264,15 +281,19 @@ public final class ZipCompressor: Sendable {
                                storedBytes: buf.count,
                                disposition: .stored)
             // Entropy-driven .stored: backend skipped. PR #65 advances
-            // during the writer's payload write, not here, so a huge
-            // incompressible entry (the canonical case: a Parallels VM
-            // image inside a ZIP) ticks during its NVMe drain.
+            // during the writer's payload write, not here. PR #70
+            // additionally replaces the `Data(bytes:count:)` copy with
+            // a `.mapped(mapped)` payload — the canonical 80 GB
+            // Parallels VM case no longer materialises an 80 GB heap
+            // allocation in prepare(); the writer streams directly
+            // from mmap during its NVMe drain.
             return PreparedEntry(
                 descriptor: descriptor,
                 method: .stored,
                 crc: crcVal,
                 uncompressedSize: UInt64(buf.count),
-                payload: Self.dataFromBuffer(buf),
+                payload: .mapped(mapped),
+                payloadByteCount: UInt64(buf.count),
                 needsWriteAdvance: true
             )
         }
@@ -293,7 +314,9 @@ public final class ZipCompressor: Sendable {
         // The backend already advanced the reporter by buf.count during
         // its compress() pass, so we DON'T re-advance here — the
         // entry's bytes are already accounted for. `needsWriteAdvance:
-        // false` keeps the writer from double-counting.
+        // false` keeps the writer from double-counting. PR #70: this
+        // fallback can also stream from mmap (entry was already
+        // mmap-resident during the failed codec pass).
         if compressed.count >= buf.count {
             recordEntryHeatmap(probe: probeResults,
                                originalBytes: buf.count,
@@ -304,7 +327,8 @@ public final class ZipCompressor: Sendable {
                 method: .stored,
                 crc: crcVal,
                 uncompressedSize: UInt64(buf.count),
-                payload: Self.dataFromBuffer(buf),
+                payload: .mapped(mapped),
+                payloadByteCount: UInt64(buf.count),
                 needsWriteAdvance: false
             )
         }
@@ -318,7 +342,8 @@ public final class ZipCompressor: Sendable {
             method: .deflate,
             crc: crcVal,
             uncompressedSize: UInt64(buf.count),
-            payload: compressed,
+            payload: .data(compressed),
+            payloadByteCount: UInt64(compressed.count),
             needsWriteAdvance: false
         )
     }

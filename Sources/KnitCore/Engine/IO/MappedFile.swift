@@ -13,12 +13,12 @@ import Foundation
 ///
 /// `@unchecked Sendable` is correct here because the mapped region is
 /// `PROT_READ` only — there are no data races on read-only memory.
-final class MappedFile: @unchecked Sendable {
-    let pointer: UnsafePointer<UInt8>
-    let count: Int
+public final class MappedFile: @unchecked Sendable {
+    public let pointer: UnsafePointer<UInt8>
+    public let count: Int
     private let fd: Int32
 
-    init(url: URL) throws {
+    public init(url: URL) throws {
         let path = url.path
         let fd = open(path, O_RDONLY | O_CLOEXEC)
         if fd < 0 {
@@ -74,7 +74,7 @@ final class MappedFile: @unchecked Sendable {
         close(fd)
     }
 
-    var buffer: UnsafeBufferPointer<UInt8> {
+    public var buffer: UnsafeBufferPointer<UInt8> {
         UnsafeBufferPointer(start: count > 0 ? pointer : nil, count: count)
     }
 }

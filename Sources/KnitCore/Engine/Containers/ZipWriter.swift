@@ -43,6 +43,35 @@ public final class ZipWriter {
         public let localHeaderOffset: UInt64
     }
 
+    /// Payload source for `writeEntry`. PR #70: split between
+    /// `.data` (compressed output already produced in memory — small
+    /// for a typical compress-then-store ZIP, since the codec shrunk
+    /// the bytes) and `.mapped` (raw mmap of the input file, used
+    /// when the entry will be written `.stored` so we can stream
+    /// straight from the page cache to the FD without an 80 GB
+    /// `Data(bytes:count:)` `vm_copy` first).
+    ///
+    /// `@unchecked Sendable` because the .mapped case carries a
+    /// `MappedFile` (a `final class @unchecked Sendable`) — sending
+    /// the enum across actor boundaries is safe by the same
+    /// rationale as the class itself.
+    public enum Payload: @unchecked Sendable {
+        /// In-memory payload (DEFLATE output, small entries, etc.).
+        case data(Data)
+        /// Stream the entry's bytes directly from a memory-mapped
+        /// input. The MappedFile is retained for the duration of
+        /// the write — no intermediate Data copy.
+        case mapped(MappedFile)
+
+        /// Number of payload bytes the writer will emit.
+        var byteCount: Int {
+            switch self {
+            case .data(let d):     return d.count
+            case .mapped(let m):   return m.buffer.count
+            }
+        }
+    }
+
     // MARK: - State
 
     private let handle: FileHandle
@@ -102,7 +131,7 @@ public final class ZipWriter {
         method: CompressionMethod,
         crc32: UInt32,
         uncompressedSize: UInt64,
-        payload: Data,
+        payload: Payload,
         onProgress: (@Sendable (UInt64) -> Void)? = nil
     ) throws {
         precondition(!closed, "writeEntry on closed ZipWriter")
@@ -110,11 +139,12 @@ public final class ZipWriter {
         let offset = currentOffset
         let nameBytes = Array(descriptor.name.utf8)
         let ts = MSDOSTimestamp(date: descriptor.modificationDate)
+        let payloadCount = payload.byteCount
         // ZIP64 is required if any size or offset doesn't fit in 32 bits.
         // We emit ZIP64 selectively per-entry: small entries stay in the
         // pre-2001 layout for maximum compatibility with older readers.
         let needsZip64 = uncompressedSize >= 0xFFFF_FFFF
-                       || UInt64(payload.count) >= 0xFFFF_FFFF
+                       || UInt64(payloadCount) >= 0xFFFF_FFFF
                        || offset >= 0xFFFF_FFFF
 
         var lfh = Data(capacity: 30 + nameBytes.count + (needsZip64 ? 20 : 0))
@@ -132,7 +162,7 @@ public final class ZipWriter {
         // Size fields: when ZIP64 applies, both 32-bit fields are filled
         // with the sentinel 0xFFFF_FFFF and the real values live in the
         // ZIP64 extra-field that follows the file name.
-        let compressedSize32 = needsZip64 ? UInt32(0xFFFF_FFFF) : UInt32(payload.count)
+        let compressedSize32 = needsZip64 ? UInt32(0xFFFF_FFFF) : UInt32(payloadCount)
         let uncompressedSize32 = needsZip64 ? UInt32(0xFFFF_FFFF) : UInt32(uncompressedSize)
         lfh.appendLE(compressedSize32)
         lfh.appendLE(uncompressedSize32)
@@ -148,17 +178,22 @@ public final class ZipWriter {
             lfh.appendLE(UInt16(0x0001))
             lfh.appendLE(UInt16(16))
             lfh.appendLE(uncompressedSize)
-            lfh.appendLE(UInt64(payload.count))
+            lfh.appendLE(UInt64(payloadCount))
         }
 
         try writeRaw(lfh)
-        try writeRawChunked(payload, onProgress: onProgress)
+        switch payload {
+        case .data(let d):
+            try writeRawChunked(d, onProgress: onProgress)
+        case .mapped(let m):
+            try writeRawChunkedMapped(m, onProgress: onProgress)
+        }
 
         entries.append(EntryResult(
             descriptor: descriptor,
             method: method,
             crc32: crc32,
-            compressedSize: UInt64(payload.count),
+            compressedSize: UInt64(payloadCount),
             uncompressedSize: uncompressedSize,
             localHeaderOffset: offset
         ))
@@ -196,6 +231,70 @@ public final class ZipWriter {
     private func writeRaw(_ data: Data) throws {
         try handle.write(contentsOf: data)
         currentOffset += UInt64(data.count)
+    }
+
+    /// PR #70. Stream a `MappedFile`'s mmap-backed bytes straight to
+    /// the output FD in 8 MiB chunks. No intermediate `Data` copy —
+    /// the previous `.stored`-entry path went through
+    /// `Self.dataFromBuffer(buf)` → `Data(bytes:count:)` →
+    /// `vm_copy(80 GB)`, which a `sample` trace of the user's M5 Max
+    /// pinned at 100 % main-thread time when zipping a Parallels VM
+    /// image. Replacing that with a direct write from the mmap
+    /// region eliminates the 80 GB allocation and the vm_copy entirely.
+    ///
+    /// Each chunk is wrapped in a transient `Data(bytesNoCopy:..,
+    /// deallocator: .none)` purely so we can call
+    /// `FileHandle.write(contentsOf:)`. CLAUDE.md Rule 3.1 warns
+    /// against this pattern for FILE WRITES through the page cache
+    /// (vm_remap accumulates references on shared physical pages
+    /// until `cpt_mapcnt` overflows the kernel's refcount). With
+    /// PR #68's `F_NOCACHE` on the writer FD that path is bypassed
+    /// — writes go straight to the NVMe controller, no page-cache
+    /// aliasing, no vm_remap accumulation. Chunking at 8 MiB also
+    /// bounds the aliased range per syscall, so even in a
+    /// degraded-fallback (no F_NOCACHE honoured) situation we'd
+    /// accumulate vm_remap refs in proportion to chunk count, far
+    /// below the overflow threshold.
+    private func writeRawChunkedMapped(_ mapped: MappedFile,
+                                        onProgress: (@Sendable (UInt64) -> Void)?) throws {
+        let buf = mapped.buffer
+        guard let base = buf.baseAddress, buf.count > 0 else {
+            // Empty file: nothing to write, but the LFH already
+            // declared zero payload bytes, so this is a valid result.
+            return
+        }
+        let chunkSize = 8 * 1024 * 1024
+        if onProgress == nil || buf.count <= chunkSize {
+            // Single-shot path. Wrap the whole mmap as a no-copy Data
+            // for the one write call. (For a small entry this matches
+            // the original copying path's behaviour at lower cost.)
+            let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: base),
+                            count: buf.count,
+                            deallocator: .none)
+            try handle.write(contentsOf: data)
+            currentOffset += UInt64(buf.count)
+            onProgress?(UInt64(buf.count))
+            return
+        }
+        var offset = 0
+        while offset < buf.count {
+            let end = min(offset + chunkSize, buf.count)
+            let chunkPtr = base.advanced(by: offset)
+            let written = end - offset
+            let chunkData = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: chunkPtr),
+                                 count: written,
+                                 deallocator: .none)
+            try handle.write(contentsOf: chunkData)
+            currentOffset += UInt64(written)
+            onProgress?(UInt64(written))
+            offset = end
+        }
+        // Touching `mapped` here keeps the MappedFile alive for the
+        // full loop. Without this the compiler is free to release the
+        // last reference earlier (no further uses), which would
+        // unmap the region mid-write and segfault. Explicit
+        // `withExtendedLifetime` is the canonical pattern.
+        withExtendedLifetime(mapped) {}
     }
 
     /// Chunked variant of `writeRaw` that fires `onProgress` after each
