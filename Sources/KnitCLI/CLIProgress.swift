@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import KnitCore
 
 /// CLI-side helpers for the `--progress` flag: a printer thread that
@@ -166,31 +167,116 @@ enum CLIProgress {
 
         /// Formats one snapshot as a single-line progress bar.
         ///
-        /// Layout (88 cols max so it sits inside an 80-col terminal even
-        /// after the leading `\r`):
+        /// The output is sized to fit the terminal's actual column
+        /// width so that `\r\033[2K` overwrite works correctly. If
+        /// the output line is wider than the terminal, the terminal
+        /// wraps it into two visible lines — and `\033[2K` only
+        /// clears the *current* line, so the wrapped second row stays
+        /// on screen and the next render appears below it. After
+        /// ~10 renders the bar visually "accumulates" instead of
+        /// updating in place (PR #48 user-reported regression). We
+        /// avoid this by:
         ///
-        ///     \r  pack  [████████░░░░░░░░░░░░] 38.4%  3.21 GB/s   ETA 0:18
+        ///   1. Querying terminal width via `ioctl(TIOCGWINSZ)`
+        ///      (`terminalCols()`), falling back to 80 if stderr
+        ///      isn't a TTY.
+        ///   2. Shrinking the bar between 8 and 24 cells based on
+        ///      remaining budget after the fixed columns.
+        ///   3. Dropping optional columns (bytes, MB/s, ETA) when
+        ///      the terminal is genuinely narrow.
+        ///   4. As a last-resort safety net, truncating the visible
+        ///      string to `cols - 1` so even a malformed budget never
+        ///      wraps.
+        ///
+        /// Layout (full, when terminal is wide enough):
+        ///
+        ///     \r\033[2K  pack  [████████░░░░░░░░░░░░] 38.4%  3.21 GB / 8.4 GB  3210 MB/s  ETA 0:18
+        ///
+        /// Layout (narrow terminal, falls back to bar + pct only):
+        ///
+        ///     \r\033[2K  pack  [█████░░] 38.4%
         static func format(_ snap: ProgressReporter.Snapshot) -> String {
+            let cols = max(40, terminalCols())
             let phase = snap.phase.rawValue.padding(toLength: 6,
                                                     withPad: " ",
                                                     startingAt: 0)
-            let mbps = snap.bytesPerSecond / 1_000_000
-            let bar = renderBar(fraction: snap.fraction, width: 24)
             let pct = snap.fraction.map { String(format: "%5.1f%%", $0 * 100) } ?? "  ?  "
             let processedHuman = humanBytes(snap.processed)
             let totalHuman = snap.total > 0 ? humanBytes(snap.total) : "?"
-            let eta = renderETA(snap.etaSeconds)
+            let mbps = snap.bytesPerSecond / 1_000_000
+            let mbpsStr = String(format: "%6.0f MB/s", mbps)
+            let etaStr = renderETA(snap.etaSeconds)
 
-            // \r to overwrite, ESC[2K clears the rest of the previous line
-            // (handles the case where a shorter render follows a longer one).
-            let prefix = "\r\u{1B}[2K  "
-            return prefix
-                + phase
-                + "  " + bar
-                + "  " + pct
-                + "  " + processedHuman + " / " + totalHuman
-                + String(format: "  %6.0f MB/s", mbps)
-                + "  ETA " + eta
+            // Fixed prefix in visible chars: "  " + phase(6) + "  "
+            // + bar (8…24 + brackets) + "  " + pct(6) = at least
+            // 10 + 2 + 8 + 2 + 6 = 28 visible. Anything below that
+            // and the rendered line stops being legible at a glance.
+            let budget = cols - 1  // 1-char safety margin so wrap can't happen
+
+            // Optional columns, in drop-order priority (last to drop first):
+            //   * bytes column   ~ "  123.45 GB / 123.45 GB" = ~24 chars
+            //   * MB/s column    ~ "  1234 MB/s"             = ~12 chars
+            //   * ETA column     ~ "  ETA 12:34"             = ~11 chars
+            let bytesCol = "  " + processedHuman + " / " + totalHuman
+            let mbpsCol = "  " + mbpsStr
+            let etaCol = "  ETA " + etaStr
+
+            var showBytes = true
+            var showMBPS = true
+            var showETA = true
+            var barWidth = 24
+
+            func currentVisible() -> Int {
+                // 2 spaces + phase(6) + 2 spaces + "[" + bar + "]" + 2 spaces + pct(6)
+                //   + optional cols, where each is already prefixed with 2 spaces.
+                var n = 2 + 6 + 2 + 1 + barWidth + 1 + 2 + 6
+                if showBytes { n += bytesCol.count }
+                if showMBPS  { n += mbpsCol.count }
+                if showETA   { n += etaCol.count }
+                return n
+            }
+
+            // Greedy: drop the lowest-priority column first, then shrink the bar.
+            if currentVisible() > budget { showETA   = false }
+            if currentVisible() > budget { showMBPS  = false }
+            if currentVisible() > budget { showBytes = false }
+            while currentVisible() > budget && barWidth > 8 {
+                barWidth -= 2
+            }
+
+            let bar = renderBar(fraction: snap.fraction, width: barWidth)
+            var visible = "  " + phase + "  " + bar + "  " + pct
+            if showBytes { visible += bytesCol }
+            if showMBPS  { visible += mbpsCol }
+            if showETA   { visible += etaCol }
+
+            // Last-resort truncation: if the budget math missed
+            // anything (e.g. a multi-codepoint glyph in `humanBytes`
+            // ever showing up), hard-cap at `budget`.
+            if visible.count > budget {
+                visible = String(visible.prefix(budget))
+            }
+
+            // \r to overwrite, ESC[2K clears the rest of the previous
+            // line (handles the case where a shorter render follows a
+            // longer one). ESC[2K only clears the *current* line — the
+            // budget logic above is what guarantees the line doesn't
+            // wrap onto a second visible row.
+            return "\r\u{1B}[2K" + visible
+        }
+
+        /// Best-effort terminal width via `ioctl(TIOCGWINSZ)` on stderr.
+        /// Returns 80 if stderr is not a tty (`ioctl` returns non-zero)
+        /// or the kernel reports 0 columns (rare; happens on some
+        /// pseudo-tty setups). 80 is the standard "looks fine in
+        /// nearly every terminal" default.
+        private static func terminalCols() -> Int {
+            var ws = winsize()
+            let fd = FileHandle.standardError.fileDescriptor
+            if ioctl(fd, TIOCGWINSZ, &ws) == 0, ws.ws_col > 0 {
+                return Int(ws.ws_col)
+            }
+            return 80
         }
 
         private static func renderBar(fraction: Double?, width: Int) -> String {
