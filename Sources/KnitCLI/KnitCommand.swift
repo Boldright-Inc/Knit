@@ -83,6 +83,12 @@ extension KnitCommand {
               help: "Suppress the live progress bar even when stderr is a terminal.")
         var noProgress: Bool = false
 
+        @Flag(name: .customLong("progress-json"),
+              help: ArgumentHelp(
+                "Emit ndjson progress on stderr instead of the text bar. Used by Knit.app to drive an NSProgress.",
+                visibility: .private))
+        var progressJSON: Bool = false
+
         @Flag(name: .customLong("exclude-hidden"),
               help: "Skip hidden items (.git, .DS_Store, anything with the macOS hidden flag). Default is to include them, matching tar/zip.")
         var excludeHidden: Bool = false
@@ -94,12 +100,14 @@ extension KnitCommand {
             let cores = jobs ?? ProcessInfo.processInfo.activeProcessorCount
             let recorder: HeatmapRecorder? = (heatmap || heatmapImage != nil)
                 ? HeatmapRecorder() : nil
-            let showProgress = CLIProgress.shouldShowProgress(progress: progress,
-                                                              noProgress: noProgress)
-            let totalBytes = showProgress ? (try? CLIProgress.totalUncompressedBytes(at: inputURL, excludeHidden: excludeHidden)) ?? 0 : 0
-            let reporter: ProgressReporter? = showProgress
+            let needReporter = CLIProgress.shouldHaveReporter(
+                progress: progress, noProgress: noProgress, progressJSON: progressJSON)
+            let totalBytes = needReporter ? (try? CLIProgress.totalUncompressedBytes(at: inputURL, excludeHidden: excludeHidden)) ?? 0 : 0
+            let reporter: ProgressReporter? = needReporter
                 ? ProgressReporter(totalBytes: totalBytes, phase: .zipping) : nil
-            let printer = reporter.map { CLIProgress.Printer(reporter: $0) }
+            let printer = CLIProgress.makePrinter(
+                reporter: reporter, progress: progress,
+                noProgress: noProgress, progressJSON: progressJSON)
             printer?.start()
             defer {
                 reporter?.finish()
@@ -183,6 +191,12 @@ extension KnitCommand {
               help: "Suppress the live progress bar even when stderr is a terminal.")
         var noProgress: Bool = false
 
+        @Flag(name: .customLong("progress-json"),
+              help: ArgumentHelp(
+                "Emit ndjson progress on stderr instead of the text bar. Used by Knit.app to drive an NSProgress.",
+                visibility: .private))
+        var progressJSON: Bool = false
+
         @Flag(name: .customLong("analyze"),
               help: ArgumentHelp("Print encoder per-stage timing breakdown to stderr (internal).",
                                  visibility: .private))
@@ -199,12 +213,14 @@ extension KnitCommand {
 
             let recorder: HeatmapRecorder? = (heatmap || heatmapImage != nil)
                 ? HeatmapRecorder() : nil
-            let showProgress = CLIProgress.shouldShowProgress(progress: progress,
-                                                              noProgress: noProgress)
-            let totalBytes = showProgress ? (try? CLIProgress.totalUncompressedBytes(at: inputURL, excludeHidden: excludeHidden)) ?? 0 : 0
-            let reporter: ProgressReporter? = showProgress
+            let needReporter = CLIProgress.shouldHaveReporter(
+                progress: progress, noProgress: noProgress, progressJSON: progressJSON)
+            let totalBytes = needReporter ? (try? CLIProgress.totalUncompressedBytes(at: inputURL, excludeHidden: excludeHidden)) ?? 0 : 0
+            let reporter: ProgressReporter? = needReporter
                 ? ProgressReporter(totalBytes: totalBytes, phase: .packing) : nil
-            let printer = reporter.map { CLIProgress.Printer(reporter: $0) }
+            let printer = CLIProgress.makePrinter(
+                reporter: reporter, progress: progress,
+                noProgress: noProgress, progressJSON: progressJSON)
             printer?.start()
             defer {
                 reporter?.finish()
@@ -346,6 +362,12 @@ extension KnitCommand {
               help: "Suppress the live progress bar even when stderr is a terminal.")
         var noProgress: Bool = false
 
+        @Flag(name: .customLong("progress-json"),
+              help: ArgumentHelp(
+                "Emit ndjson progress on stderr instead of the text bar. Used by Knit.app to drive an NSProgress.",
+                visibility: .private))
+        var progressJSON: Bool = false
+
         @Flag(name: .customLong("analyze"),
               help: ArgumentHelp("Print decode-stage timing breakdown to stderr (internal).",
                                  visibility: .private))
@@ -354,19 +376,21 @@ extension KnitCommand {
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
             let outURL = URL(fileURLWithPath: output).standardizedFileURL
-            let showProgress = CLIProgress.shouldShowProgress(progress: progress,
-                                                              noProgress: noProgress)
+            let needReporter = CLIProgress.shouldHaveReporter(
+                progress: progress, noProgress: noProgress, progressJSON: progressJSON)
             // Total uncompressed bytes for the progress bar are read out
             // of the .knit footer so we don't need a second SSD pass.
             let totalBytes: UInt64
-            if showProgress {
+            if needReporter {
                 totalBytes = (try? CLIProgress.totalUncompressedBytesInKnit(at: inputURL)) ?? 0
             } else {
                 totalBytes = 0
             }
-            let reporter: ProgressReporter? = showProgress
+            let reporter: ProgressReporter? = needReporter
                 ? ProgressReporter(totalBytes: totalBytes, phase: .extracting) : nil
-            let printer = reporter.map { CLIProgress.Printer(reporter: $0) }
+            let printer = CLIProgress.makePrinter(
+                reporter: reporter, progress: progress,
+                noProgress: noProgress, progressJSON: progressJSON)
             printer?.start()
             defer {
                 reporter?.finish()
