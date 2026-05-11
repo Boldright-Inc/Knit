@@ -1,0 +1,72 @@
+name: CI
+
+# Why this workflow exists: PRs #26 and #28 both broke
+# `Scripts/package-dmg.sh` because the diagnostic they introduced
+# (`@Sendable` capture of a `var`; `public struct` without explicit
+# `Sendable` conformance) only fires when Swift 6's strict-concurrency
+# analyser runs to completion, which `swift build` (debug) skips by
+# default. Both PRs reviewed green on dev hosts that hadn't run
+# `swift build -c release` locally. This workflow is the safety net
+# for that — every push and every PR builds in release mode on a
+# hosted runner.
+#
+# Runner: `macos-15` (Apple Silicon). Knit is macOS-only: the codebase
+# uses Metal, F_NOCACHE, arm64 CRC32, mmap-aliased MTLBuffers, and
+# `.macOS(.v15)` in Package.swift. Intel runners would not compile.
+# `macos-latest` would also work but pinning a major version keeps
+# GitHub's runner upgrades from quietly turning the CI red.
+#
+# Scope of this initial CI: release-mode build only. `swift test` is
+# intentionally NOT wired up yet because several tests under
+# `KnitRoundTripTests` / `HybridZstdBatchDecoderTests` /
+# `HybridZstdBatchDecoderConcurrencyTests` / `RoundtripTests` fail on
+# macOS 26 Tahoe due to a real FileWalker bug: macOS 26 changed
+# `URL.resolvingSymlinksInPath()` to no longer resolve `/tmp` →
+# `/private/tmp`, but `FileManager.enumerator` still yields the
+# firmlink-resolved form. The prefix-stripping arithmetic in
+# `FileWalker.enumerate` then computes garbage relative paths
+# whenever the input is under `/tmp` or `/var/folders/...` — exactly
+# the temp dirs every test fixture uses. The fix lives in a separate
+# PR; once that lands a follow-up adds the `swift test` job.
+#
+# Why ship CI without tests anyway: the documented motivation for
+# this workflow is catching the strict-concurrency footgun that
+# took down PRs #26 and #28's release builds. That footgun fires
+# during `swift build -c release` — the build job covers it on day
+# one. Waiting for a fully green test suite would leave that
+# footgun uncovered for longer.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A single concurrency group per ref keeps the queue clean: a force-push
+# to a PR cancels the previous run instead of letting both finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-release:
+    name: swift build -c release (strict-concurrency complete)
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcrun --show-sdk-version
+
+      # The strict-concurrency analyser only runs to completion in
+      # release mode. Failing here on a `@Sendable` capture diagnostic
+      # is the whole point of this job.
+      - name: Build release
+        run: swift build -c release
+
+  # `swift test` job intentionally omitted — see the file header for
+  # the macOS-26-Tahoe FileWalker bug blocking it. Add the job back
+  # in a follow-up PR after the FileWalker fix lands.
