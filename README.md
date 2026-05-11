@@ -99,12 +99,14 @@ knit zip   <input> [-o out.zip]   [--level 6] [--parallel] [--chunk-kb 1024]
                                   [--heatmap] [--heatmap-image map.ppm]
 knit pack  <input> [-o out.knit]  [--level 3] [--block-kb 1024]
                                   [--heatmap] [--heatmap-image map.ppm]
-knit unpack <archive> [-o output_dir] [--no-gpu-verify]
+knit unpack <archive> [-o output_dir] [--no-gpu-verify] [--no-post-verify]
 ```
 
 Add `--parallel` to use the pigz-style chunk-parallel ZIP backend. This is the path to use for a single very large file. Add `--heatmap` to either `zip` or `pack` to print the compressibility map after the run, and `--heatmap-image <path>` to also save a portable PPM image you can open in Preview.app.
 
 By default `unpack` verifies every entry's CRC32 on the GPU for entries ≥ 4 MiB and falls through to libdeflate's CPU path otherwise. Use `--no-gpu-verify` to force the CPU path (debugging or comparison only).
+
+`--no-post-verify` skips the post-write CRC re-read pass entirely. Decode-side CRC still runs on every batch (catching every decode-bug class and any in-memory corruption between decode and write), so output bytes are still verified against the archive's stored CRC. What `--no-post-verify` drops is the additional pass that re-reads the freshly written file from disk and re-CRCs it — defence-in-depth against disk-write corruption, which on APFS + modern NVMe is effectively impossible (the filesystem block-checksums independently). For a single 80 GB entry the re-read pass dominates wall time (~60 s of ~90 s on M5 Max); skipping it gives 2-3× speedup at the cost of dropping a layer most archive tools (`tar`, `unzip`) don't have to begin with.
 
 ## Hybrid CPU + GPU pipeline
 

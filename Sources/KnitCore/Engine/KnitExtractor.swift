@@ -48,6 +48,24 @@ public final class KnitExtractor {
     /// hot so the cost is dominated by the GPU dispatch + compute, not I/O.
     public var useGPUVerify: Bool
 
+    /// PR #75. When true (the default), each extracted entry is
+    /// re-read from disk after the write completes and its CRC32 is
+    /// recomputed against the archive's stored CRC. This is
+    /// belt-and-braces defence-in-depth on top of the decode-side
+    /// CRC (`HybridZstdBatchDecoder.decode → expectedCRC32`), which
+    /// already catches every bug class except "disk lost bytes after
+    /// my write(2) returned". On APFS + modern NVMe the latter is
+    /// effectively impossible (the filesystem block-checksums
+    /// independently), so the cost — ~60 s of wall on the user's
+    /// 80 GB .pvm.knit, dominating total unpack time at 88 s — is
+    /// pure paranoia tax.
+    ///
+    /// Setting this to `false` skips the post-write re-read pass
+    /// entirely. Decode-side verification still runs on every
+    /// batch, so silent decode bugs / memory corruption still
+    /// throw. The CLI exposes this as `--no-post-verify`.
+    public var postWriteVerify: Bool
+
     /// Optional progress sink. Receives one `advance(by:)` call per
     /// decompressed block, plus a final per-entry catch-up so the line
     /// reaches 100% even when the verify path runs.
@@ -78,11 +96,13 @@ public final class KnitExtractor {
     public var literalTypeAnalytics: LiteralTypeAnalytics?
 
     public init(useGPUVerify: Bool = true,
+                postWriteVerify: Bool = true,
                 progressReporter: ProgressReporter? = nil,
                 concurrency: Int = ProcessInfo.processInfo.activeProcessorCount,
                 analytics: StageAnalytics? = nil,
                 literalTypeAnalytics: LiteralTypeAnalytics? = nil) {
         self.useGPUVerify = useGPUVerify
+        self.postWriteVerify = postWriteVerify
         self.progressReporter = progressReporter
         self.concurrency = max(1, concurrency)
         self.analytics = analytics
@@ -156,6 +176,8 @@ public final class KnitExtractor {
         let gpuCRCLocal = gpuCRC
         let readerLocal = reader
         let destDirLocal = destDir
+        // PR #75: capture the flag for the @Sendable closure below.
+        let postWriteVerifyLocal = postWriteVerify
         // Inner-decoder concurrency = 1 in the parallel-batch path:
         // outer entry-level parallelism already saturates the worker
         // pool, and nested 16-way × 16-way `concurrentMap` would just
@@ -185,7 +207,8 @@ public final class KnitExtractor {
                     to: outURL,
                     gpuCRC: gpuCRC,
                     progressReporter: progressReporter,
-                    stagedDecoder: serialDecoder
+                    stagedDecoder: serialDecoder,
+                    postWriteVerify: postWriteVerify
                 )
                 bytesOut += entry.uncompressedSize
                 if gpuCRC != nil, entry.uncompressedSize >= 4 * 1024 * 1024 {
@@ -225,7 +248,8 @@ public final class KnitExtractor {
                     to: outURL,
                     gpuCRC: gpuCRCLocal,
                     progressReporter: reporter,
-                    stagedDecoder: perWorkerDecoder
+                    stagedDecoder: perWorkerDecoder,
+                    postWriteVerify: postWriteVerifyLocal
                 )
                 return entry.uncompressedSize
             }
