@@ -82,6 +82,52 @@ final class MetalCRC32Tests: XCTestCase {
     /// effective per-dispatch limit (rounded down to sliceSize) forces
     /// at least three chunks, so we exercise both "first chunk" and
     /// "subsequent chunk combine" paths.
+    /// PR #72. `parallelCRC32` must produce the same CRC as the
+    /// single-threaded backend across the threshold (small inputs
+    /// fall through to serial; large inputs split into chunks and
+    /// combine via `crc32Combine`). Verified on both sides of the
+    /// 64 MiB threshold and on a deliberately-unaligned tail.
+    func testParallelCRC32MatchesSerialAcrossThreshold() throws {
+        let cpu = CPUDeflate()
+        // Cross the 64 MiB threshold so the parallel split fires.
+        // Add 17 bytes of unaligned tail to confirm the last chunk
+        // doesn't shave off bytes.
+        let sizes = [
+            1024,                              // serial path (< threshold)
+            64 * 1024 * 1024 - 1,              // just under threshold (serial)
+            64 * 1024 * 1024 + 17,             // just over threshold (parallel)
+            128 * 1024 * 1024 + 13,            // parallel, multi-chunk
+        ]
+        for size in sizes {
+            let bytes = makeBuffer(size: size, seed: UInt8(size & 0xFF))
+            let serial = bytes.withUnsafeBufferPointer { cpu.crc32($0, seed: 0) }
+            let parallel = bytes.withUnsafeBufferPointer { buf in
+                parallelCRC32(buf, using: cpu, concurrency: 4)
+            }
+            XCTAssertEqual(serial, parallel,
+                           "parallelCRC32 mismatch at size=\(size)")
+        }
+    }
+
+    /// Edge cases: empty buffer and concurrency=1 must short-circuit
+    /// to the serial backend without touching the dispatch machinery.
+    func testParallelCRC32EdgeCases() throws {
+        let cpu = CPUDeflate()
+        // Empty input.
+        let empty = [UInt8]()
+        let r0 = empty.withUnsafeBufferPointer { parallelCRC32($0, using: cpu, concurrency: 8) }
+        XCTAssertEqual(r0, 0)
+
+        // concurrency=1 → forced serial; identical math to the
+        // single-threaded backend call.
+        let mid = makeBuffer(size: 128 * 1024 * 1024 + 7, seed: 0x55)
+        let serial = mid.withUnsafeBufferPointer { cpu.crc32($0, seed: 0) }
+        let serialViaParallel = mid.withUnsafeBufferPointer {
+            parallelCRC32($0, using: cpu, concurrency: 1)
+        }
+        XCTAssertEqual(serial, serialViaParallel)
+    }
+
     func testChunkedAcrossDispatchesMatchesSingleShot() throws {
         guard let gpu = MetalCRC32(sliceSize: 4 * 1024) else {
             throw XCTSkip("No Metal device on this host")
