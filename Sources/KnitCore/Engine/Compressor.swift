@@ -111,17 +111,34 @@ public final class ZipCompressor: Sendable {
 
         // Stage 1: concurrently produce per-entry compressed payloads.
         // Stage 2: write to ZIP serially in walk order.
+        //
+        // Progress reporting plumbs an `onProgress(bytes)` closure all
+        // the way down into the backend's `compress(_:level:onProgress:)`.
+        // For `ParallelDeflate` (the `--parallel` Quick Action path) the
+        // closure fires per chunk, so a single multi-gigabyte file
+        // produces a steady tick instead of a single "0 % → 100 %" jump
+        // at the very end of the codec pass — PR #54 fix. For the
+        // `.stored` paths (level 0, entropy-too-high, or
+        // compression-grew-the-buffer) the backend isn't called at all,
+        // so `prepare(...)` advances explicitly on those branches.
         let reporter = options.progressReporter
+        // Build the per-chunk progress closure as an explicit `if let`
+        // assignment rather than via `Optional.map { … }`. Swift 6's
+        // type inferencer fails to reconcile the @Sendable annotation
+        // with the closure-returning-closure shape via `map` and emits
+        // a "failed to produce diagnostic" internal error. The
+        // unrolled form below is byte-equivalent and compiles cleanly.
+        let onProgress: (@Sendable (UInt64) -> Void)?
+        if let r = reporter {
+            onProgress = { bytes in r.advance(by: bytes) }
+        } else {
+            onProgress = nil
+        }
         let prepared: [PreparedEntry] = try concurrentMap(
             entries,
             concurrency: options.concurrency
         ) { entry in
-            let p = try self.prepare(entry: entry)
-            // ZIP path is per-entry; advance by uncompressed size as
-            // each entry finishes its codec pass. The reporter sees
-            // bumps roughly in walk order modulo concurrency.
-            reporter?.advance(by: p.uncompressedSize)
-            return p
+            return try self.prepare(entry: entry, onProgress: onProgress)
         }
 
         for p in prepared {
@@ -162,7 +179,8 @@ public final class ZipCompressor: Sendable {
         return Data(bytes: base, count: buf.count)
     }
 
-    private func prepare(entry: FileEntry) throws -> PreparedEntry {
+    private func prepare(entry: FileEntry,
+                         onProgress: (@Sendable (UInt64) -> Void)?) throws -> PreparedEntry {
         let descriptor = ZipWriter.EntryDescriptor(
             name: entry.relativePath,
             modificationDate: entry.modificationDate,
@@ -171,6 +189,8 @@ public final class ZipCompressor: Sendable {
         )
 
         if entry.isDirectory {
+            // Directory entries don't contribute payload bytes — nothing
+            // to advance for.
             return PreparedEntry(
                 descriptor: descriptor,
                 method: .stored,
@@ -187,6 +207,11 @@ public final class ZipCompressor: Sendable {
         // try-then-fallback) or level == 0.
         if options.level.raw == 0 || buf.count == 0 {
             let crcVal = buf.count == 0 ? 0 : crc.crc32(buf, seed: 0)
+            // .stored short-circuit: backend.compress(onProgress:) is
+            // skipped, so we have to advance manually here. Otherwise a
+            // run with `--level 0` (or many tiny files) would show 0 %
+            // for the entire run.
+            onProgress?(UInt64(buf.count))
             return PreparedEntry(
                 descriptor: descriptor,
                 method: .stored,
@@ -215,6 +240,9 @@ public final class ZipCompressor: Sendable {
                                originalBytes: buf.count,
                                storedBytes: buf.count,
                                disposition: .stored)
+            // Entropy-driven .stored: same situation as level==0 above,
+            // backend is skipped — advance here for the bar to tick.
+            onProgress?(UInt64(buf.count))
             return PreparedEntry(
                 descriptor: descriptor,
                 method: .stored,
@@ -224,10 +252,22 @@ public final class ZipCompressor: Sendable {
             )
         }
 
-        let compressed = try backend.compress(buf, level: options.level.clampedForDeflate())
+        // The codec path: backend.compress(onProgress:) fires the
+        // callback itself as it makes progress. ParallelDeflate fires
+        // per chunk; CPUDeflate fires once at the end via the protocol
+        // extension default. Either way the per-entry contribution
+        // sums to buf.count when this call returns successfully.
+        let compressed = try backend.compress(
+            buf,
+            level: options.level.clampedForDeflate(),
+            onProgress: onProgress
+        )
         let crcVal = crc.crc32(buf, seed: 0)
 
         // If compression made it larger, store uncompressed instead (ZIP spec encourages this).
+        // The backend already advanced the reporter by buf.count during
+        // its compress() pass, so we DON'T re-advance here — the
+        // entry's bytes are already accounted for.
         if compressed.count >= buf.count {
             recordEntryHeatmap(probe: probeResults,
                                originalBytes: buf.count,
