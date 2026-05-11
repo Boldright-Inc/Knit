@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Component plist for `pkgbuild --component-plist`.
+
+    Why this file exists (PR #63).
+    `pkgbuild` auto-detects the Knit.app bundle inside the payload and
+    inserts metadata into the component .pkg's PackageInfo. The default
+    is `BundleIsRelocatable=YES`, which tells macOS Installer:
+
+        "if a bundle with this CFBundleIdentifier already exists on the
+         system, treat THAT path as the install target — even if the
+         BOM says /Applications/Knit.app."
+
+    With `co.boldright.knit` Knit.app bundles scattered in any
+    developer's source-tree `dist/` directories (a normal state for
+    anyone who has worked on the project from multiple checkouts) the
+    installer happily "registers" one of those scratch copies as the
+    canonical install location and silently skips materialising
+    /Applications/Knit.app. The receipt is created (so pkgutil reports
+    `co.boldright.knit` as installed) but the actual app file never
+    lands at /Applications. The Uninstall command, which has no
+    bundle identifier, was never subject to relocation and survived
+    — producing the bizarre "Uninstall Knit.command present but
+    Knit.app missing" state real users hit.
+
+    Setting `BundleIsRelocatable=false` forces install at the
+    BOM-specified path, ignoring any pre-existing copy of the bundle.
+
+    See `man pkgbuild` (--component-plist / --analyze) and Apple TN2206
+    ("macOS Code Signing In Depth") for the keys' semantics.
+-->
+<plist version="1.0">
+<array>
+    <dict>
+        <key>RootRelativeBundlePath</key>
+        <string>Applications/Knit.app</string>
+
+        <!-- The fix: disable bundle relocation. -->
+        <key>BundleIsRelocatable</key>
+        <false/>
+
+        <!-- Defaults retained for clarity. `upgrade` means subsequent
+             installs at the same path replace the existing bundle
+             rather than refusing or duplicating. -->
+        <key>BundleHasStrictIdentifier</key>
+        <true/>
+        <key>BundleIsVersionChecked</key>
+        <true/>
+        <key>BundleOverwriteAction</key>
+        <string>upgrade</string>
+        <key>ChildBundles</key>
+        <array/>
+    </dict>
+</array>
+</plist>
