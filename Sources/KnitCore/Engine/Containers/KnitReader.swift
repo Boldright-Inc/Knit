@@ -145,7 +145,8 @@ public final class KnitReader: @unchecked Sendable {
                         to outURL: URL,
                         gpuCRC: MetalCRC32? = nil,
                         progressReporter: ProgressReporter? = nil,
-                        stagedDecoder: HybridZstdBatchDecoder? = nil) throws {
+                        stagedDecoder: HybridZstdBatchDecoder? = nil,
+                        postWriteVerify: Bool = true) throws {
         if entry.isDirectory {
             try FileManager.default.createDirectory(at: outURL,
                                                     withIntermediateDirectories: true)
@@ -184,7 +185,22 @@ public final class KnitReader: @unchecked Sendable {
             // overhead — at 100 k tiny entries that's ~3 s of wall
             // time on the 9 GB github corpus, all spent waiting on
             // a no-op flush. Removed.
-            try verifyCRC(entry: entry, outURL: outURL, gpuCRC: gpuCRC)
+            //
+            // PR #75: post-write verifyCRC is opt-out via the
+            // `postWriteVerify` flag. The decode-side rolling CRC
+            // (HybridZstdBatchDecoder.decode → expectedCRC32 check)
+            // already verifies the decoded bytes against the
+            // archive's stored CRC; re-reading the output file and
+            // re-CRC'ing only catches disk-write corruption, which
+            // on APFS + modern NVMe is effectively impossible (the
+            // filesystem block-checksums independently). For large
+            // entries the verifyCRC pass dominates wall (~60s of
+            // ~88s on the user's 80 GB .pvm.knit), so skipping it
+            // gives 2-3× speedup at the cost of dropping a
+            // defence-in-depth layer most archive tools don't have.
+            if postWriteVerify {
+                try verifyCRC(entry: entry, outURL: outURL, gpuCRC: gpuCRC)
+            }
             return
         }
 
@@ -253,7 +269,12 @@ public final class KnitReader: @unchecked Sendable {
         // No `outHandle.synchronize()` — see commentary on the staged
         // path above for the rationale (macOS unified buffer cache
         // makes write↔mmap coherent on the same file without fsync).
-        try verifyCRC(entry: entry, outURL: outURL, gpuCRC: gpuCRC)
+        // PR #75: post-write verify is opt-out — same rationale as
+        // the staged path. See the staged-path doc-block for the
+        // full trade-off discussion.
+        if postWriteVerify {
+            try verifyCRC(entry: entry, outURL: outURL, gpuCRC: gpuCRC)
+        }
     }
 
     /// Drive the entry's decode through a `HybridZstdBatchDecoder`. The

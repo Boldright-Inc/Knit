@@ -354,6 +354,16 @@ extension KnitCommand {
               help: "Disable GPU-accelerated CRC32 verification (forces CPU verify).")
         var noGpuVerify: Bool = false
 
+        @Flag(name: .customLong("no-post-verify"),
+              help: """
+                Skip the post-write CRC re-read pass. Decode-side CRC is unchanged \
+                (still verifies decoded bytes against the archive's stored CRC). \
+                On modern APFS + NVMe the post-write pass adds ~60s of wall on an \
+                80 GB entry without catching any real-world bug class the decode \
+                pass doesn't already cover (PR #75).
+                """)
+        var noPostVerify: Bool = false
+
         @Flag(name: .long,
               help: "Force the live progress bar on (overrides the default TTY-based detection).")
         var progress: Bool = false
@@ -415,6 +425,7 @@ extension KnitCommand {
             // diff in the PR description.
             let literalTypeAnalytics: LiteralTypeAnalytics? = analyze ? LiteralTypeAnalytics() : nil
             let extractor = KnitExtractor(useGPUVerify: !noGpuVerify,
+                                          postWriteVerify: !noPostVerify,
                                           progressReporter: reporter,
                                           analytics: analytics,
                                           literalTypeAnalytics: literalTypeAnalytics)
