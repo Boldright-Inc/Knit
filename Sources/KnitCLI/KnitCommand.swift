@@ -22,6 +22,28 @@ struct KnitCommand: ParsableCommand {
         version: Knit.version,
         subcommands: [Info.self, Zip.self, Pack.self, Unpack.self, MetalInfo.self]
     )
+
+    /// Override `ParsableCommand.main(_:)` so we can run process-wide
+    /// setup before any subcommand parses its arguments — currently
+    /// just the FD-limit raise (PR #80). Calls through to
+    /// `parseAsRoot` + `run()` afterwards, matching ArgumentParser's
+    /// default `main` implementation byte-for-byte.
+    public static func main(_ arguments: [String]? = nil) {
+        // PR #80: raise the OS default `RLIMIT_NOFILE` soft limit
+        // from 256 toward the kernel hard cap so multi-thousand-file
+        // workloads (notably `knit zip <git-repo>` which fans out
+        // `MappedFile` opens across `concurrentMap` workers) don't
+        // hit `EMFILE` mid-pack. See `Sources/KnitCLI/FDLimit.swift`
+        // for the rationale and the matching small-file
+        // FD-conservation fix in `Compressor.swift`.
+        FDLimit.raiseToMax()
+        do {
+            var command = try parseAsRoot(arguments)
+            try command.run()
+        } catch {
+            exit(withError: error)
+        }
+    }
 }
 
 extension KnitCommand {
