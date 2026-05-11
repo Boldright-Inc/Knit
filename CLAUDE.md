@@ -383,6 +383,48 @@ Backlog action items (not gated on this rule):
   cool-start). Either change makes the harness comparable
   across runs at the cost of total bench time.
 
+#### Rule 4.4 — Design for base Apple Silicon, not the dev machine
+
+The dev machine is M5 Max (18-core, ~5 GB/s SSD, 128 GB RAM).
+The **majority of real users** are on **base M1 / M2 / M3** with
+~1.5 GB/s SSDs, 4 performance cores, and 8 GB RAM. Knit is ~3×
+slower on that hardware. Design decisions calibrated against the
+dev machine — particularly UX thresholds expressed in bytes or
+seconds — silently fail for the user base they're supposed to
+serve.
+
+Concrete instances in repo history where this went wrong (PR #55
+audit):
+
+| PR | Decision | M5 Max view | base M1 reality |
+|---|---|---|---|
+| #50 | Quick Action Terminal threshold = **100 MiB** | 100 MiB packs in 0.02 s → silent is fine | 100 MiB packs can take 1–3 s → user sees dead air |
+| #48 | Progress bar poll = **0.5 s** | matches pigz convention | typical Quick Action input completes in 0.3–1 s → only 0% / 100% visible, "何も表示されない" |
+| #54 | "operations < 0.5 s show only start/end, out of scope" | true on M5 Max for ~95 % of typical inputs | true on base M1 for ~10 % of typical inputs — the 90 % majority *would* benefit |
+
+Rules for future PRs that introduce a byte-size threshold or a
+time-window heuristic:
+
+1. **State the design target explicitly.** "base M1 / M2 (4
+   p-core, ~1.5 GB/s SSD, 8 GB RAM)" is the default unless a
+   reason is given to deviate.
+2. **Quote both numbers** — what the threshold means on the dev
+   machine *and* on base hardware. The dev-machine number is the
+   sanity check ("does the Terminal flash for trivial sizes?");
+   the base-hardware number is the design number ("does the user
+   actually see progress at this size?").
+3. **Err toward more UX feedback.** A Terminal window flashing
+   briefly on a fast Mac is a minor cost; dead air on a slow Mac
+   is a UX bug.
+4. **README's "Benchmark" table is M5 Max.** Don't quote those
+   numbers as universal — most users won't reproduce them.
+   Rule 4.3's thermal caveat already covers this for cool-vs-warm
+   variance; the hardware caveat is broader.
+
+The M5 Max bench reference in this document stays as a calibration
+point for codec-change regressions (where same-hardware comparison
+is the right test). It is not the design baseline for UX choices.
+
 ### 5. Threading model conventions
 
 #### Rule 5.1 — Use `concurrentMap` (in `Compressor.swift`) for parallel work
