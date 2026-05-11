@@ -47,6 +47,16 @@ BIN="${ROOT_DIR}/.build/release/knit"
 rm -rf "${STAGING}"
 mkdir -p "${STAGING}/bin" "${STAGING}/QuickActions"
 cp "${BIN}" "${STAGING}/bin/knit"
+# PR #63: ship the SwiftPM-generated Metal resource bundle next to the
+# binary. install.sh expects it at ${SCRIPT_DIR}/bin/Knit_KnitCore.bundle
+# under the DMG layout. See build-pkg.sh / install.sh for the rationale.
+if [[ -d "${ROOT_DIR}/.build/release/Knit_KnitCore.bundle" ]]; then
+    cp -R "${ROOT_DIR}/.build/release/Knit_KnitCore.bundle" \
+          "${STAGING}/bin/Knit_KnitCore.bundle"
+else
+    echo "error: Knit_KnitCore.bundle missing from .build/release/" >&2
+    exit 1
+fi
 cp -R "${DIST}/Knit.app" "${STAGING}/Knit.app"
 cp -R "${DIST}/QuickActions/"*.workflow "${STAGING}/QuickActions/"
 cp "${SCRIPT_DIR}/install.sh"   "${STAGING}/install.sh"

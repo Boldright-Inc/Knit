@@ -20,12 +20,14 @@ QA_DST="${HOME}/Library/Services"
 BIN_SRC=""
 QA_SRC=""
 APP_SRC=""
+BUNDLE_SRC=""
 
 # DMG layout: SCRIPT_DIR contains Knit.app, bin/, and QuickActions/
 if [[ -x "${SCRIPT_DIR}/bin/knit" ]]; then
     BIN_SRC="${SCRIPT_DIR}/bin/knit"
     QA_SRC="${SCRIPT_DIR}/QuickActions"
     APP_SRC="${SCRIPT_DIR}/Knit.app"
+    BUNDLE_SRC="${SCRIPT_DIR}/bin/Knit_KnitCore.bundle"
 fi
 
 # Repo layout
@@ -35,12 +37,14 @@ if [[ -z "${BIN_SRC}" ]]; then
         BIN_SRC="${REPO_ROOT}/.build/release/knit"
         QA_SRC="${REPO_ROOT}/dist/QuickActions"
         APP_SRC="${REPO_ROOT}/dist/Knit.app"
+        BUNDLE_SRC="${REPO_ROOT}/.build/release/Knit_KnitCore.bundle"
     elif [[ -f "${REPO_ROOT}/Package.swift" ]]; then
         echo ">> Building knit release..."
         ( cd "${REPO_ROOT}" && swift build -c release )
         BIN_SRC="${REPO_ROOT}/.build/release/knit"
         QA_SRC="${REPO_ROOT}/dist/QuickActions"
         APP_SRC="${REPO_ROOT}/dist/Knit.app"
+        BUNDLE_SRC="${REPO_ROOT}/.build/release/Knit_KnitCore.bundle"
     fi
 
     if [[ -n "${QA_SRC}" && ! -d "${QA_SRC}/Knit Compress (ZIP).workflow" ]]; then
@@ -68,6 +72,29 @@ fi
 # --- Install ----------------------------------------------------------------
 echo ">> Installing CLI to ${BIN_DST} (sudo)"
 sudo install -m 0755 -o root -g wheel "${BIN_SRC}" "${BIN_DST}"
+
+# PR #63 fix. SwiftPM emits a `Knit_KnitCore.bundle` next to the
+# binary containing the Metal kernel sources (`crc32_block.metal`,
+# `entropy_probe.metal`). MetalContext.loadRuntimeLibrary reads
+# them via Bundle.module, whose accessor looks first at
+# `Bundle.main.bundleURL/Knit_KnitCore.bundle` — for an executable
+# at /usr/local/bin/knit that resolves to
+# /usr/local/bin/Knit_KnitCore.bundle. If absent, the accessor
+# falls back to a build-time path baked into the binary
+# (/Users/<builder>/...) which only exists on the build machine.
+# Recipients then SIGTRAP at first Metal touch. Ship the bundle
+# alongside the binary so resolution succeeds on every machine.
+BUNDLE_DST="/usr/local/bin/Knit_KnitCore.bundle"
+if [[ -n "${BUNDLE_SRC}" && -d "${BUNDLE_SRC}" ]]; then
+    echo ">> Installing Metal resource bundle to ${BUNDLE_DST} (sudo)"
+    sudo rm -rf "${BUNDLE_DST}"
+    sudo cp -R "${BUNDLE_SRC}" "${BUNDLE_DST}"
+    sudo chown -R root:wheel "${BUNDLE_DST}"
+else
+    echo "error: Knit_KnitCore.bundle not found (expected at ${BUNDLE_SRC:-<unset>})." >&2
+    echo "       Did 'swift build -c release' run? CLI will SIGTRAP on Metal init." >&2
+    exit 1
+fi
 
 LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
