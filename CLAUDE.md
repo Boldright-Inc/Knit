@@ -321,6 +321,68 @@ large-file corpora:
 Don't reach for a GPU optimisation when the workload looks like the
 second one.
 
+#### Rule 4.3 — `Scripts/bench.sh` is biased; bisects through it are not trustworthy without cool-down
+
+`bench.sh` runs an 11-tool sequence back-to-back without sleep
+between tools (`ditto`, `zip -6`, `tar+pigz`, `knit CPU lvl=1/6/9`,
+`knit PAR lvl=1/6/9`, `knit pack lvl=1/3/9`). `knit CPU lvl=9`
+alone burns a P-core for ~5 s and `ditto` burns one for ~9 s
+before any `knit pack` measurement starts. On M5 Max the SoC is
+already in **thermal-throttled state** by the time pack is being
+measured — and worse, the throttle persists across a fresh
+`bench.sh` invocation if you keep calling it back-to-back.
+
+Two empirical findings (PR #47 investigation) document the
+effect:
+
+- **Same `dbdaa32` commit, two states, 1.84× difference.** The
+  very first measurement at the start of a 7-commit bisect
+  reported `knit pack lvl=3` at **0.19 s** wall on a 1 GB
+  3-file corpus. The same binary invoked later (after
+  `f22e31a`'s 3 hot runs and a 60 s sleep) reported
+  **0.34–0.39 s**. Pure thermal/state effect, zero code delta.
+- **60 s shell sleep does not cool the system down.** After
+  `sleep 60` between hot and "cool" measurements, throughput
+  did not recover. M5 Max either needs much longer cool-down,
+  or there is a secondary SSD-controller / page-cache effect
+  compounding. The harness is **unreliable for any
+  back-to-back commit comparison**.
+
+Implications for `--analyze`-driven bisects:
+
+- **Never bisect a pack-side perf regression by running
+  `bench.sh` at successive commits in one session.** The 6th
+  commit you reach will look ~2× slower than the 1st even
+  if the code is byte-identical. PR #47's investigation
+  initially mistook this for a real `PR #33` regression
+  before catching the artifact via a same-code repeat
+  measurement.
+- **For a real pack speed measurement**, isolate one tool:
+  build the target commit, idle the machine for several
+  minutes, then run `knit pack` directly (not via `bench.sh`).
+  Compare across commits only when each commit is measured
+  from the same fresh state.
+- **The synthetic-corpus walls in README's "Benchmark" table
+  and elsewhere are cool-start single-shot numbers.** They
+  will not reproduce on a system that has been bench-driving
+  for the past few minutes. If a measurement drifts 1.5–2×
+  between sessions and the `--analyze` stage shape is
+  unchanged, suspect thermal before suspecting code.
+
+For real codec regression detection, lean on `bench-corpora.sh`
+against the large `Tests/TestData/test1.pvm` corpus — wall there
+is dominated by SSD writes (~3 GB/s ceiling), not the encoder,
+so thermal jitter on the codec phase is amortised under the
+write phase and the wall is much more reproducible.
+
+Backlog action items (not gated on this rule):
+
+- Insert `sleep 60–120` between tools in `bench.sh`, or
+  reorder the script so `knit pack` runs *first* (so the
+  measurement the README most cares about is taken from
+  cool-start). Either change makes the harness comparable
+  across runs at the cost of total bench time.
+
 ### 5. Threading model conventions
 
 #### Rule 5.1 — Use `concurrentMap` (in `Compressor.swift`) for parallel work
