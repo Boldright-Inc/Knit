@@ -233,8 +233,27 @@ public final class ZipWriter {
         currentOffset += UInt64(data.count)
     }
 
+    /// Write chunk size for the payload-drain path. Bumped 8 MiB → 64
+    /// MiB in PR #73 — `sample`-trace evidence on the user's M5 Max,
+    /// post-PR-#72 (parallel CRC), pinned the residual cost on the
+    /// raw `write(2)` syscall: 100 % of main-thread time goes there,
+    /// no userspace overhead left to shave. 64 MiB chunks cut the
+    /// syscall count for an 80 GB write from ~10 000 → ~1 250 (a
+    /// 0.5 s base-overhead reduction on its own) and give the kernel
+    /// a longer contiguous range to drive into the NVMe queue, which
+    /// matters for sustained throughput on the F_NOCACHE path
+    /// (uncached writes hit the controller directly so queue depth +
+    /// per-IO byte budget become the primary throttle, vs the cached
+    /// path's coalescing-then-flush behaviour).
+    ///
+    /// Trade-off: progress callback fires ~50 times/sec at 3 GB/s
+    /// (was ~370/sec with 8 MiB), still far above the 60 Hz the UI
+    /// needs to look smooth — no perceptible regression on the
+    /// progress bar's tick rate.
+    fileprivate static let payloadWriteChunkSize: Int = 64 * 1024 * 1024
+
     /// PR #70. Stream a `MappedFile`'s mmap-backed bytes straight to
-    /// the output FD in 8 MiB chunks. No intermediate `Data` copy —
+    /// the output FD in `payloadWriteChunkSize`-byte chunks. No intermediate `Data` copy —
     /// the previous `.stored`-entry path went through
     /// `Self.dataFromBuffer(buf)` → `Data(bytes:count:)` →
     /// `vm_copy(80 GB)`, which a `sample` trace of the user's M5 Max
@@ -250,7 +269,7 @@ public final class ZipWriter {
     /// until `cpt_mapcnt` overflows the kernel's refcount). With
     /// PR #68's `F_NOCACHE` on the writer FD that path is bypassed
     /// — writes go straight to the NVMe controller, no page-cache
-    /// aliasing, no vm_remap accumulation. Chunking at 8 MiB also
+    /// aliasing, no vm_remap accumulation. Chunking also
     /// bounds the aliased range per syscall, so even in a
     /// degraded-fallback (no F_NOCACHE honoured) situation we'd
     /// accumulate vm_remap refs in proportion to chunk count, far
@@ -263,7 +282,7 @@ public final class ZipWriter {
             // declared zero payload bytes, so this is a valid result.
             return
         }
-        let chunkSize = 8 * 1024 * 1024
+        let chunkSize = Self.payloadWriteChunkSize
         if onProgress == nil || buf.count <= chunkSize {
             // Single-shot path. Wrap the whole mmap as a no-copy Data
             // for the one write call. (For a small entry this matches
@@ -298,18 +317,16 @@ public final class ZipWriter {
     }
 
     /// Chunked variant of `writeRaw` that fires `onProgress` after each
-    /// `chunkSize` bytes have been written to disk. Used by `writeEntry`
-    /// for the payload write (PR #65) so the progress bar ticks during
-    /// the serial write phase of a ZIP build, instead of sitting at 100 %
-    /// while a multi-gigabyte payload drains to NVMe.
+    /// `payloadWriteChunkSize` bytes have been written to disk. Used by
+    /// `writeEntry` for the payload write (PR #65) so the progress bar
+    /// ticks during the serial write phase of a ZIP build, instead of
+    /// sitting at 100 % while a multi-gigabyte payload drains to NVMe.
     ///
-    /// 8 MiB is a deliberate trade-off: small enough that a ~5 GB/s SSD
-    /// fires `onProgress` ~600 times/sec (smooth bar), large enough that
-    /// per-write syscall overhead stays negligible vs. the ~50 µs base
-    /// per-`write(2)` cost on APFS.
+    /// See `payloadWriteChunkSize`'s doc-block for the 8 MiB → 64 MiB
+    /// rationale (PR #73).
     private func writeRawChunked(_ data: Data,
                                   onProgress: (@Sendable (UInt64) -> Void)?) throws {
-        let chunkSize = 8 * 1024 * 1024
+        let chunkSize = Self.payloadWriteChunkSize
         // Fast path: no progress wanted or small payload — single write.
         if onProgress == nil || data.count <= chunkSize {
             try handle.write(contentsOf: data)
