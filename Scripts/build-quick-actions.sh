@@ -156,9 +156,16 @@ trap 'rm -rf "${TMP}"' EXIT
 cat > "${TMP}/zip.sh" <<'BS'
 #!/bin/zsh
 # Knit Compress (ZIP) — delegates to Knit.app which drives the native
-# NSProgress + Finder file-icon overlay. CLI invocations from a
+# NSProgress + a custom progress panel. CLI invocations from a
 # terminal still work via /usr/local/bin/knit zip … --progress.
-exec /usr/bin/open -a /Applications/Knit.app --args \
+#
+# `-n` forces a fresh Knit.app instance per invocation. Without it
+# `open` reuses an already-running Knit.app and silently drops the
+# new --args, so a second Quick Action triggered while the first is
+# still running would show no UI. With `-n` each operation gets its
+# own short-lived process; the Dock briefly shows multiple icons
+# if the user runs concurrent operations.
+exec /usr/bin/open -n -a /Applications/Knit.app --args \
     --operation zip --level 6 --inputs "$@"
 BS
 
@@ -166,7 +173,7 @@ cat > "${TMP}/bzx.sh" <<'BS'
 #!/bin/zsh
 # Knit Compress (.knit) — see Knit Compress (ZIP) for the
 # Knit.app-delegated UX rationale.
-exec /usr/bin/open -a /Applications/Knit.app --args \
+exec /usr/bin/open -n -a /Applications/Knit.app --args \
     --operation pack --level 3 --inputs "$@"
 BS
 
@@ -174,7 +181,7 @@ cat > "${TMP}/extract.sh" <<'BS'
 #!/bin/zsh
 # Knit Extract — accepts both .knit and .zip; Knit.app routes based
 # on the file extension (`.zip` falls back to /usr/bin/unzip there).
-exec /usr/bin/open -a /Applications/Knit.app --args \
+exec /usr/bin/open -n -a /Applications/Knit.app --args \
     --operation extract --inputs "$@"
 BS
 

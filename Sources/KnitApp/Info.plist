@@ -28,8 +28,22 @@
     <string>public.app-category.utilities</string>
     <key>NSHighResolutionCapable</key>
     <true/>
-    <key>LSUIElement</key>
-    <true/>
+    <!--
+        Knit.app is intentionally NOT marked as LSUIElement (PR #58 fix).
+        macOS does not show the published-NSProgress floating widget or
+        the Finder file-icon overlay for background utilities — they
+        require a regular foreground app for the system to attach UI to.
+        Compare Finder / Safari / Mail / Archive Utility, none of which
+        are LSUIElement.
+
+        Trade-off: a Dock icon appears briefly while Knit.app is running
+        an operation, then disappears when the operation finishes and
+        the app exits. For sub-second operations the icon may flicker
+        in and out; for multi-second ones it's visible the whole time
+        — which matches what users see for Finder's built-in Compress
+        and Archive Utility.
+    -->
+
 
     <!-- Declare .knit as a new UTI owned by Knit. -->
     <key>UTExportedTypeDeclarations</key>

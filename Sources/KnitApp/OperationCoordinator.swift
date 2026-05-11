@@ -154,9 +154,46 @@ final class OperationCoordinator: NSObject, @unchecked Sendable {
     /// "Compressing 5 items" widget for a 5-file batch).
     private let parentProgress: Progress
 
+    /// Custom always-visible progress window. The published NSProgress
+    /// is best-effort (the system widget may or may not appear); the
+    /// ProgressWindow is guaranteed visible.
+    private let window = ProgressWindow()
+
+    /// Aggregate counters for the ProgressWindow's render. NSProgress
+    /// itself tracks the same numbers, but observing it via KVO from
+    /// Swift is awkward — we update these in `applyProgressLine`.
+    private var totalBytes: UInt64 = 0
+    private var processedBytes: UInt64 = 0
+    private var lastETASeconds: Double = .infinity
+
     /// Per-input child progresses + their subprocesses. Keyed by
     /// index into `operation.plannedRuns()`.
+    ///
+    /// Post-PR-#58 hotfix: there is at most ONE entry here at any
+    /// time — runs are executed serially (see `pendingRuns`). The map
+    /// shape is retained to keep the index-keyed cleanup paths in
+    /// `handleChildExit` unchanged, but it now functions as a singleton.
     private var children: [Int: (progress: Progress, process: Process)] = [:]
+
+    /// Runs that haven't been launched yet. Drained one-at-a-time by
+    /// `launchNextIfNeeded()` from `start()` and from `handleChildExit`.
+    ///
+    /// **Why serial, not parallel:** Earlier revisions launched every
+    /// run in `start()`'s `for`-loop synchronously, producing one
+    /// concurrent `knit` subprocess per input. When a Finder Quick
+    /// Action is invoked on a multi-file selection, `"$@"` in the
+    /// `.workflow` shell script expands to every selected path, all
+    /// of which `parseQuickActionArgs` accepts via the greedy
+    /// `--inputs` clause. A 500-file selection therefore produced
+    /// 500 concurrent `knit pack` subprocesses inside a single
+    /// Knit.app — each mmap'ing its input, each spinning up its own
+    /// worker pool with per-worker block buffers — easily exhausting
+    /// system memory and crashing the host. (Reported during PR #58
+    /// smoke testing.) Knit CLI already saturates all cores via its
+    /// internal worker pool, so parallelising across inputs delivered
+    /// zero throughput win for the risk it carried. One subprocess at
+    /// a time is strictly better.
+    private var pendingRuns: [(Int, Run)] = []
 
     private let lock = NSLock()
     private var pendingCount = 0
@@ -197,6 +234,16 @@ final class OperationCoordinator: NSObject, @unchecked Sendable {
         parent.cancellationHandler = { [weak self] in
             self?.handleCancel()
         }
+
+        // Custom-window cancel goes through the same path so partial
+        // outputs are wiped uniformly regardless of which UI surface
+        // the user clicked. Dispatched off the main queue because
+        // handleCancel does SIGTERM bookkeeping.
+        window.onCancel = { [weak self] in
+            DispatchQueue.main.async {
+                self?.handleCancel()
+            }
+        }
     }
 
     /// Launch every input's subprocess and start reading its
@@ -214,16 +261,49 @@ final class OperationCoordinator: NSObject, @unchecked Sendable {
 
         lock.lock()
         pendingCount = runs.count
+        pendingRuns = Array(runs.enumerated())
         lock.unlock()
+
+        // Configure the custom progress window with the first run's
+        // metadata — for a multi-input batch this is approximate
+        // (only the first input's name shows in the title), but
+        // batch compresses are uncommon enough that handling them
+        // perfectly isn't worth the layout cost.
+        let first = runs.first!
+        let verb: ProgressWindow.Verb
+        switch operation {
+        case .packToKnit, .zipParallel: verb = .compressing
+        case .extractArchive:           verb = .extracting
+        }
+        let outputForWindow = (verb == .compressing) ? first.outputURL : nil
+        window.configure(sourceURL: first.sourceURL,
+                          outputURL: outputForWindow,
+                          verb: verb)
+        window.show()
 
         parentProgress.publish()
 
-        // Spawn each subprocess. We don't serialise — Finder is fine
-        // with multiple concurrent published progresses. For batch
-        // compresses the user gets parallel speed-up.
-        for (idx, run) in runs.enumerated() {
-            launchChild(index: idx, run: run)
+        // Launch the first run. Subsequent runs follow sequentially
+        // via `handleChildExit` → `launchNextIfNeeded`. See the
+        // `pendingRuns` doc-block for the rationale (PR #58 hotfix:
+        // parallel launch crashed Macs on multi-file Quick Action
+        // selections).
+        launchNextIfNeeded()
+    }
+
+    /// Pop the next queued run and launch it. No-op when the queue is
+    /// empty (we've reached the last run, or `start()` got nothing to
+    /// do). Called from `start()` for the first run and from
+    /// `handleChildExit` for every subsequent one.
+    private func launchNextIfNeeded() {
+        lock.lock()
+        guard !pendingRuns.isEmpty else {
+            lock.unlock()
+            return
         }
+        let next = pendingRuns.removeFirst()
+        lock.unlock()
+        launchChild(index: next.0, run: next.1)
     }
 
     // MARK: - Per-input subprocess
@@ -311,6 +391,32 @@ final class OperationCoordinator: NSObject, @unchecked Sendable {
             child.totalUnitCount = Int64(json.total)
         }
         child.completedUnitCount = min(Int64(json.processed), max(child.totalUnitCount, 0))
+
+        // Update aggregate counters for the custom window. With one
+        // run (the typical Quick Action case) these track the run
+        // directly; with multiple runs the aggregate is approximate
+        // but still useful — the bar reflects total work done across
+        // the batch.
+        lock.lock()
+        if totalBytes < json.total {
+            totalBytes = max(totalBytes, json.total)
+        }
+        processedBytes = max(processedBytes, json.processed)
+        // ETA is taken straight from the freshest tick — close enough
+        // for the user's "is this going to take a while?" question.
+        // The CLI's ProgressReporter already throttles ETA to "stable
+        // after 0.5 % of work done", so even sub-second snapshots
+        // here are reasonable.
+        lastETASeconds = json.etaSeconds
+        let processedSnapshot = processedBytes
+        let totalSnapshot = totalBytes
+        let eta = lastETASeconds
+        lock.unlock()
+        DispatchQueue.main.async { [weak self] in
+            self?.window.update(processed: processedSnapshot,
+                                  total: totalSnapshot,
+                                  etaSeconds: eta)
+        }
         if json.done {
             // Don't unpublish here — the terminationHandler does that
             // after the process actually exits.
@@ -348,6 +454,12 @@ final class OperationCoordinator: NSObject, @unchecked Sendable {
 
         if pending == 0 {
             finishAll()
+        } else {
+            // Serial execution: kick the next queued run now that this
+            // one is done. If `pendingRuns` is empty (the failure path
+            // hit, but other workers are still in flight from a prior
+            // parallel-launch revision), this is a no-op.
+            launchNextIfNeeded()
         }
     }
 
@@ -361,6 +473,9 @@ final class OperationCoordinator: NSObject, @unchecked Sendable {
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            // Dismiss the custom progress window before any alert
+            // so the alert isn't competing with the panel for focus.
+            self.window.dismiss()
             if let msg = failureMessage, !wasCancelled {
                 let alert = NSAlert()
                 alert.messageText = "Knit"
@@ -379,6 +494,16 @@ final class OperationCoordinator: NSObject, @unchecked Sendable {
         lock.lock()
         cancelled = true
         let snapshot = Array(children.values)
+        // Drain remaining queued runs so `launchNextIfNeeded` (called
+        // from the terminated child's `handleChildExit`) becomes a
+        // no-op. Without this, cancelling part-way through a batch
+        // would still march on through the rest of the queue.
+        let drained = pendingRuns.count
+        pendingRuns.removeAll()
+        // Each cancelled-from-queue entry still counts toward
+        // pendingCount; decrement so finishAll fires once the
+        // currently-running child exits rather than waiting forever.
+        pendingCount -= drained
         lock.unlock()
         // SIGTERM each child. knit's signal handling is lazy — it
         // doesn't install a SIGTERM trap — but the kernel default
@@ -414,6 +539,9 @@ struct ProgressJSONLine {
     let phase: String
     let processed: UInt64
     let total: UInt64
+    /// `.infinity` when the CLI emitted `etaSeconds: null` (initial
+    /// snapshot, less than 0.5 % complete, or otherwise unknown).
+    let etaSeconds: Double
     let done: Bool
 }
 
@@ -458,7 +586,18 @@ final class NDJSONLineParser: @unchecked Sendable {
         let processed = (obj["processed"] as? NSNumber)?.uint64Value ?? 0
         let total = (obj["total"] as? NSNumber)?.uint64Value ?? 0
         let done = (obj["done"] as? Bool) ?? false
+        // `etaSeconds` is either a number or JSON `null` (which
+        // JSONSerialization decodes to `NSNull`). Treat null as
+        // unknown — the ProgressWindow renders no ETA suffix when
+        // the value is `.infinity`.
+        let etaSeconds: Double
+        if let n = obj["etaSeconds"] as? NSNumber {
+            etaSeconds = n.doubleValue
+        } else {
+            etaSeconds = .infinity
+        }
         return ProgressJSONLine(phase: phase, processed: processed,
-                                total: total, done: done)
+                                total: total, etaSeconds: etaSeconds,
+                                done: done)
     }
 }
