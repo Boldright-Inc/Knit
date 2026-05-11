@@ -43,14 +43,17 @@ cp "${ROOT_DIR}/Sources/KnitApp/Info.plist" "${APP}/Contents/Info.plist"
 cp "${ICONS_TMP}/AppIcon.icns"      "${APP}/Contents/Resources/AppIcon.icns"
 cp "${ICONS_TMP}/KnitDocument.icns" "${APP}/Contents/Resources/KnitDocument.icns"
 
-# 4. Compile the launcher.
+# 4. Compile the launcher. Glob every .swift in Sources/KnitApp/ so
+#    new files (e.g. OperationCoordinator.swift, PR #57) get picked up
+#    without having to update this list each time.
 echo ">> Compiling launcher (swiftc)"
+KNIT_APP_SOURCES=("${ROOT_DIR}/Sources/KnitApp/"*.swift)
 swiftc -O \
     -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
     -target arm64-apple-macos15.0 \
     -framework AppKit \
     -o "${APP}/Contents/MacOS/Knit" \
-    "${ROOT_DIR}/Sources/KnitApp/main.swift"
+    "${KNIT_APP_SOURCES[@]}"
 
 # 5. PkgInfo (legacy but harmless; some tools still check for it).
 printf 'APPL????' > "${APP}/Contents/PkgInfo"

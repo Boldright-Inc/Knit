@@ -2,6 +2,21 @@
 # Generate Quick Action (.workflow) bundles for compression/decompression
 # under dist/QuickActions/. The workflows shell out to /usr/local/bin/knit
 # which Scripts/install.sh places on PATH.
+#
+# PR #57: workflows now delegate to Knit.app via `open -a` instead of
+# opening a Terminal window directly. Knit.app drives the knit CLI as
+# a subprocess and surfaces progress through a native `NSProgress`
+# (which Finder decorates the output file's icon with, plus shows in
+# the system menu-bar progress widget). Net effect: no Terminal
+# pop-up, no "terminate processes?" dialog, file-icon overlay during
+# the operation, modern macOS UX.
+#
+# The 30 MiB size threshold from PR #55 is no longer needed —
+# NSProgress is light enough to publish for any size, including a
+# 5 MB zip. A trivial operation just produces a brief progress flash;
+# nothing as intrusive as a Terminal window. The CLI itself is
+# unchanged and can still be invoked directly from a terminal with
+# `--progress` for the text-bar UX.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -121,332 +136,46 @@ PYEOF
 TMP="$(mktemp -d)"
 trap 'rm -rf "${TMP}"' EXIT
 
-# Each Quick Action spawns a temporary Terminal window so the user can
-# see Knit's `--progress` bar for long-running operations. The window
-# auto-closes when the runner finishes — AppleScript polls the new
-# tab's `busy` property and closes the window when the shell exits,
-# regardless of the user's Terminal "Close window when shell exits"
-# preference.
+# Each Quick Action delegates to Knit.app via `open -a` with the
+# operation flag + input paths. Knit.app is responsible for the
+# progress UI (native NSProgress + Finder file-icon overlay) and for
+# running the knit CLI subprocess. The Quick Action script itself
+# stays trivial: assemble args, fork open, exit.
 #
-# The osascript invocation is backgrounded with `& disown` so the
-# Automator workflow returns immediately while Terminal does its
-# thing — otherwise Finder's Quick Action spinner would stay up for
-# the whole run.
-
-# The runner script:
-#   1. Runs the actual knit command(s) so the user sees `--progress`.
-#   2. Prints "[Done.]" and then `sleep 3` — the sleep keeps the tab
-#      "busy" for three more seconds so the user can read the result
-#      summary before the window vanishes.
-#   3. Removes itself and exits.
+# `open -a /Applications/Knit.app --args …` will:
+#   * launch Knit.app if not already running
+#   * pass `--args …` through to the new process's ARGV
+#   * return immediately, so the Finder spinner doesn't linger
 #
-# The `do script` invocation appends `; exit` to the runner path so the
-# *outer* interactive zsh that Terminal opened also exits when the
-# runner is done. Without that step, Terminal's "Ask before closing"
-# preference still considers the tab to be running processes (the
-# interactive shell + the just-ran knit binary) and pops up a
-# confirmation dialog when AppleScript tries to close the window. With
-# the outer shell exited, the tab has no processes and `close … saving
-# no` succeeds silently regardless of the user's preference.
+# We pass:
+#   --operation pack | zip | extract
+#   --inputs <path>...     (selected files; consumed until next --flag)
+#   --level <N>            (compression level; pack→3, zip→6 default)
+# Knit.app parses these in `parseQuickActionArgs()` (Sources/KnitApp/main.swift).
 
-# --------------------------------------------------------------------
-# Shared shell helpers (sourced into every Quick Action via heredoc).
-# Sizes inputs and chooses between two paths:
-#
-#   * Silent background: input total < SIZE_THRESHOLD_BYTES.
-#       knit runs detached, stdout/stderr to /dev/null, no Terminal
-#       window, no notification. The user gets quiet success.
-#
-#   * Terminal-displayed: input total >= SIZE_THRESHOLD_BYTES.
-#       The existing osascript path opens Terminal.app, runs knit with
-#       --progress, auto-closes the window when the runner finishes.
-#
-# Threshold: 30 MiB. The design target is **base Apple Silicon**
-# (M1 / M2 base models, ~1.5 GB/s SSDs, 4 performance cores), not
-# this M5 Max dev machine. On base hardware:
-#
-#   pack of 30 MiB compressible content   ≈ 0.5 – 1.0 s
-#   pack of 30 MiB tiny-files folder      ≈ 1 – 3 s (FS overhead)
-#   unpack of a 30 MiB .knit              ≈ 0.5 – 2 s
-#
-# i.e. 30 MiB is the size at which a *base Mac user* starts to want
-# "is it doing something?" feedback. On M5 Max the same byte count
-# is sub-100 ms — the Terminal window briefly flashes but doesn't
-# linger, which is a tolerable cost to give base-hardware users the
-# UX they need. The earlier 100 MiB value (PR #50) was tuned for
-# M5 Max-style hardware and produced no-feedback dead air on slower
-# Macs — fixed in PR #55.
-#
-# Larger values shift more operations to silent. 30 MiB is the
-# documented "design for the slowest realistic Apple Silicon"
-# baseline (CLAUDE.md Rule 4.4).
-SHARED_PRELUDE='
-SIZE_THRESHOLD_BYTES=$((30 * 1024 * 1024))
-
-input_total_bytes() {
-    # Sum the size of every regular file under each argument. Handles
-    # mixed selections of files + directories. Directories are
-    # recursed via `find -type f` so we count payload bytes only
-    # (directory inodes themselves arent compressed).
-    local total=0
-    local arg s
-    for arg in "$@"; do
-        if [[ -d "$arg" ]]; then
-            s=$(/usr/bin/find "$arg" -type f -print0 2>/dev/null \
-                  | /usr/bin/xargs -0 /usr/bin/stat -f "%z" 2>/dev/null \
-                  | /usr/bin/awk "{ s += \$1 } END { print s+0 }")
-        elif [[ -f "$arg" ]]; then
-            s=$(/usr/bin/stat -f "%z" "$arg" 2>/dev/null || echo 0)
-        else
-            s=0
-        fi
-        total=$((total + s))
-    done
-    echo "$total"
-}
-
-should_show_terminal() {
-    # Echo 1 if Terminal should be opened, 0 if the run should be
-    # silent. Threshold-only; no time-based heuristic because we cant
-    # retroactively attach a Terminal to a process we already started.
-    local bytes
-    bytes=$(input_total_bytes "$@")
-    if (( bytes >= SIZE_THRESHOLD_BYTES )); then
-        echo 1
-    else
-        echo 0
-    fi
-}
-'
-
-cat > "${TMP}/zip.sh" <<BS
-${SHARED_PRELUDE}
-
-if [[ "\$(should_show_terminal "\$@")" = "0" ]]; then
-    # Small input: run silently in the background. The user gets a
-    # quick visual cue from Finder (the new .zip appears alongside
-    # the source) without a Terminal pop-up.
-    for f in "\$@"; do
-        /usr/local/bin/knit zip "\$f" --parallel --level 6 -o "\${f}.zip" \\
-            >/dev/null 2>&1 &
-    done
-    disown
-    exit 0
-fi
-
-RUNNER="\$(mktemp -t knit_zip_runner)"
-{
-  echo '#!/bin/zsh'
-  echo 'set -u'
-  for f in "\$@"; do
-    printf '/usr/local/bin/knit zip %q --parallel --level 6 --progress -o %q\n' "\$f" "\${f}.zip"
-  done
-  echo 'printf "\\n[Done.]\\n"'
-  echo 'sleep 3'
-  echo "rm -f -- '\${RUNNER}'"
-  echo 'exit 0'
-} > "\${RUNNER}"
-chmod +x "\${RUNNER}"
-{
-  osascript <<APPLESCRIPT
-tell application "Terminal"
-    activate
-    set theTab to do script "\${RUNNER}; exit"
-    -- \`do script\` without an \`in\` clause always opens a fresh window,
-    -- so the front window right after the call is ours to close later.
-    set theWindowID to id of front window
-
-    -- Stage 1: wait for the runner script (the foreground command) to
-    -- return. \`busy\` flips false the instant the foreground process
-    -- yields the prompt back to the outer zsh.
-    repeat while busy of theTab
-        delay 0.2
-    end repeat
-
-    -- Stage 2: wait for the outer zsh's exit cleanup to finish. PR #56:
-    -- on macOS 26 Tahoe Terminal prompts more aggressively than older
-    -- releases about "kill running processes?" if any non-default
-    -- process is still listed in the tab's process table when close is
-    -- sent — including processes that are in the middle of their
-    -- shutdown sequence. Just waiting on \`busy\` and then a short
-    -- \`delay\` (the pre-fix approach) races against zsh's
-    -- "Saving session…" cleanup, and the close request lands before
-    -- the process table has drained. Polling \`processes of theTab\`
-    -- until it's empty closes the race.
-    --
-    -- Cap at 10 s (50 × 0.2) so a wedged shell can't hang the
-    -- AppleScript indefinitely; on timeout we close anyway and accept
-    -- the dialog as a rare fallback.
-    set drainIterations to 50
-    repeat drainIterations times
-        try
-            if (count of (processes of theTab)) is 0 then exit repeat
-        on error
-            -- The tab may have already vanished if the user's
-            -- Terminal profile is set to auto-close-on-exit.
-            exit repeat
-        end try
-        delay 0.2
-    end repeat
-
-    -- Settling tick so Terminal commits the empty-process state to
-    -- whatever its close-confirmation logic reads.
-    delay 0.3
-
-    try
-        repeat with w in windows
-            if id of w is theWindowID then
-                close w saving no
-                exit repeat
-            end if
-        end repeat
-    end try
-end tell
-APPLESCRIPT
-} >/dev/null 2>&1 &
-disown
+cat > "${TMP}/zip.sh" <<'BS'
+#!/bin/zsh
+# Knit Compress (ZIP) — delegates to Knit.app which drives the native
+# NSProgress + Finder file-icon overlay. CLI invocations from a
+# terminal still work via /usr/local/bin/knit zip … --progress.
+exec /usr/bin/open -a /Applications/Knit.app --args \
+    --operation zip --level 6 --inputs "$@"
 BS
 
-cat > "${TMP}/bzx.sh" <<BS
-${SHARED_PRELUDE}
-
-if [[ "\$(should_show_terminal "\$@")" = "0" ]]; then
-    for f in "\$@"; do
-        /usr/local/bin/knit pack "\$f" --level 3 -o "\${f}.knit" \\
-            >/dev/null 2>&1 &
-    done
-    disown
-    exit 0
-fi
-
-RUNNER="\$(mktemp -t knit_pack_runner)"
-{
-  echo '#!/bin/zsh'
-  echo 'set -u'
-  for f in "\$@"; do
-    printf '/usr/local/bin/knit pack %q --level 3 --progress -o %q\n' "\$f" "\${f}.knit"
-  done
-  echo 'printf "\\n[Done.]\\n"'
-  echo 'sleep 3'
-  echo "rm -f -- '\${RUNNER}'"
-  echo 'exit 0'
-} > "\${RUNNER}"
-chmod +x "\${RUNNER}"
-{
-  osascript <<APPLESCRIPT
-tell application "Terminal"
-    activate
-    set theTab to do script "\${RUNNER}; exit"
-    set theWindowID to id of front window
-
-    -- See zip.sh's AppleScript above for the full rationale. Two-stage
-    -- wait: (1) \`busy\` flips false when the foreground runner
-    -- returns, (2) \`processes\` drains when the outer zsh has fully
-    -- exited. Closing in between stages races against zsh's exit
-    -- cleanup and triggers Terminal's "kill running processes?"
-    -- dialog on macOS 26 Tahoe (PR #56 fix).
-    repeat while busy of theTab
-        delay 0.2
-    end repeat
-    set drainIterations to 50
-    repeat drainIterations times
-        try
-            if (count of (processes of theTab)) is 0 then exit repeat
-        on error
-            exit repeat
-        end try
-        delay 0.2
-    end repeat
-    delay 0.3
-    try
-        repeat with w in windows
-            if id of w is theWindowID then
-                close w saving no
-                exit repeat
-            end if
-        end repeat
-    end try
-end tell
-APPLESCRIPT
-} >/dev/null 2>&1 &
-disown
+cat > "${TMP}/bzx.sh" <<'BS'
+#!/bin/zsh
+# Knit Compress (.knit) — see Knit Compress (ZIP) for the
+# Knit.app-delegated UX rationale.
+exec /usr/bin/open -a /Applications/Knit.app --args \
+    --operation pack --level 3 --inputs "$@"
 BS
 
-cat > "${TMP}/extract.sh" <<BS
-${SHARED_PRELUDE}
-
-# For Extract the input is the compressed archive itself, so the size
-# threshold uses the archive's on-disk size. A 100 MiB .knit
-# decompresses to anywhere from ~100 MB to ~3 GB depending on ratio;
-# treating the archive size as the gate keeps the decision simple
-# without parsing the footer.
-if [[ "\$(should_show_terminal "\$@")" = "0" ]]; then
-    for f in "\$@"; do
-        dir="\$(dirname "\$f")"
-        case "\$f" in
-          *.knit) /usr/local/bin/knit unpack "\$f" -o "\$dir" >/dev/null 2>&1 & ;;
-          *.zip)  /usr/bin/unzip -o "\$f" -d "\$dir" >/dev/null 2>&1 & ;;
-        esac
-    done
-    disown
-    exit 0
-fi
-
-RUNNER="\$(mktemp -t knit_extract_runner)"
-{
-  echo '#!/bin/zsh'
-  echo 'set -u'
-  for f in "\$@"; do
-    dir="\$(dirname "\$f")"
-    case "\$f" in
-      *.knit) printf '/usr/local/bin/knit unpack %q --progress -o %q\n' "\$f" "\$dir" ;;
-      *.zip)  printf '/usr/bin/unzip -o %q -d %q\n' "\$f" "\$dir" ;;
-    esac
-  done
-  echo 'printf "\\n[Done.]\\n"'
-  echo 'sleep 3'
-  echo "rm -f -- '\${RUNNER}'"
-  echo 'exit 0'
-} > "\${RUNNER}"
-chmod +x "\${RUNNER}"
-{
-  osascript <<APPLESCRIPT
-tell application "Terminal"
-    activate
-    set theTab to do script "\${RUNNER}; exit"
-    set theWindowID to id of front window
-
-    -- See zip.sh's AppleScript above for the full rationale. Two-stage
-    -- wait: (1) \`busy\` flips false when the foreground runner
-    -- returns, (2) \`processes\` drains when the outer zsh has fully
-    -- exited. Closing in between stages races against zsh's exit
-    -- cleanup and triggers Terminal's "kill running processes?"
-    -- dialog on macOS 26 Tahoe (PR #56 fix).
-    repeat while busy of theTab
-        delay 0.2
-    end repeat
-    set drainIterations to 50
-    repeat drainIterations times
-        try
-            if (count of (processes of theTab)) is 0 then exit repeat
-        on error
-            exit repeat
-        end try
-        delay 0.2
-    end repeat
-    delay 0.3
-    try
-        repeat with w in windows
-            if id of w is theWindowID then
-                close w saving no
-                exit repeat
-            end if
-        end repeat
-    end try
-end tell
-APPLESCRIPT
-} >/dev/null 2>&1 &
-disown
+cat > "${TMP}/extract.sh" <<'BS'
+#!/bin/zsh
+# Knit Extract — accepts both .knit and .zip; Knit.app routes based
+# on the file extension (`.zip` falls back to /usr/bin/unzip there).
+exec /usr/bin/open -a /Applications/Knit.app --args \
+    --operation extract --inputs "$@"
 BS
 
 emit_workflow "Knit Compress (ZIP)"  "${TMP}/zip.sh"

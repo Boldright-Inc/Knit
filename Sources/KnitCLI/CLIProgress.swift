@@ -2,6 +2,15 @@ import Foundation
 import Darwin
 import KnitCore
 
+/// Common interface shared by `CLIProgress.Printer` (text bar) and
+/// `CLIProgress.JSONProgressPrinter` (ndjson for Knit.app). Lets each
+/// CLI subcommand hold whichever printer is active in a single
+/// variable without branching on `--progress-json` everywhere.
+protocol ProgressPrinting: AnyObject {
+    func start()
+    func waitUntilFlushed()
+}
+
 /// CLI-side helpers for the `--progress` flag: a printer thread that
 /// renders a live single-line progress bar to stderr, plus utilities for
 /// computing the input total-bytes denominator that the bar needs.
@@ -33,6 +42,36 @@ enum CLIProgress {
         if noProgress { return false }
         if progress { return true }
         return isInteractiveStderr
+    }
+
+    /// True when we need to construct a `ProgressReporter` at all.
+    /// Mirrors `shouldShowProgress` but also fires when
+    /// `--progress-json` is set — Knit.app needs the reporter so its
+    /// JSON stream has something to publish. PR #57.
+    static func shouldHaveReporter(progress: Bool,
+                                   noProgress: Bool,
+                                   progressJSON: Bool) -> Bool {
+        if progressJSON { return true }
+        return shouldShowProgress(progress: progress, noProgress: noProgress)
+    }
+
+    /// Pick the right concrete printer for a given subcommand based
+    /// on its three progress flags. `--progress-json` wins over
+    /// `--progress`: a parent process (Knit.app) explicitly asking
+    /// for JSON should never get text-bar output mixed in. Returns
+    /// nil when no reporter or no flag asked for output.
+    static func makePrinter(reporter: ProgressReporter?,
+                            progress: Bool,
+                            noProgress: Bool,
+                            progressJSON: Bool) -> ProgressPrinting? {
+        guard let r = reporter else { return nil }
+        if progressJSON {
+            return CLIProgress.JSONProgressPrinter(reporter: r)
+        }
+        if shouldShowProgress(progress: progress, noProgress: noProgress) {
+            return CLIProgress.Printer(reporter: r)
+        }
+        return nil
     }
 
     /// Recursively sum file sizes under `inputURL`. Used as the
@@ -155,7 +194,7 @@ enum CLIProgress {
         /// Block until the printer thread has emitted its final line.
         /// Defer-callable from `run()` — keeps the progress bar visible
         /// up to the moment the CLI starts printing the result summary.
-        func waitUntilFlushed(timeout: TimeInterval = 1.0) {
+        func waitUntilFlushed(timeout: TimeInterval) {
             doneCondition.lock()
             defer { doneCondition.unlock() }
             let deadline = Date(timeIntervalSinceNow: timeout)
@@ -327,4 +366,127 @@ enum CLIProgress {
             return String(format: "%6.0f B ", v)
         }
     }
+
+    /// Machine-readable progress printer. Sister of `Printer`, used when
+    /// the CLI is invoked by Knit.app (or any other parent process that
+    /// wants to consume progress without parsing terminal escape codes).
+    /// One newline-delimited JSON object per snapshot, written to
+    /// stderr.
+    ///
+    /// JSON shape:
+    ///
+    ///     {"phase":"pack","processed":1048576,"total":314572800,
+    ///      "bytesPerSecond":..., "etaSeconds":..., "done":false}
+    ///
+    /// On the final write `done` is `true`. The parent can use that as
+    /// the signal to call `NSProgress.unpublish()`.
+    ///
+    /// Why a sibling printer instead of folding both formats into
+    /// `Printer`: the text Printer carries terminal-width-aware
+    /// truncation logic, ANSI escape sequences, and the
+    /// `\r\033[2K`-overwrite contract — none of which apply to a JSON
+    /// stream. Separate types keep each path's invariants legible.
+    /// PR #57 adds this so Knit.app can drive a native `NSProgress`
+    /// from the CLI subprocess's output.
+    final class JSONProgressPrinter: @unchecked Sendable {
+        private let reporter: ProgressReporter
+        private let interval: TimeInterval
+        private var thread: Thread?
+        private let doneCondition = NSCondition()
+        private var threadDidExit = false
+
+        init(reporter: ProgressReporter, interval: TimeInterval = 0.2) {
+            self.reporter = reporter
+            self.interval = interval
+        }
+
+        func start() {
+            let me = self
+            let t = Thread {
+                let r = me.reporter
+                while !r.isFinished {
+                    let snap = r.snapshot()
+                    Self.write(jsonLine: Self.encode(snap, done: false))
+                    Thread.sleep(forTimeInterval: me.interval)
+                }
+                // Final snapshot marked done — the parent uses this as
+                // the signal to unpublish the NSProgress and exit its
+                // OperationCoordinator.
+                let snap = r.snapshot()
+                Self.write(jsonLine: Self.encode(snap, done: true))
+                me.markExit()
+            }
+            t.start()
+            self.thread = t
+        }
+
+        func waitUntilFlushed(timeout: TimeInterval) {
+            doneCondition.lock()
+            defer { doneCondition.unlock() }
+            let deadline = Date(timeIntervalSinceNow: timeout)
+            while !threadDidExit {
+                if !doneCondition.wait(until: deadline) { break }
+            }
+        }
+
+        private func markExit() {
+            doneCondition.lock()
+            threadDidExit = true
+            doneCondition.broadcast()
+            doneCondition.unlock()
+        }
+
+        // MARK: - JSON encoding
+
+        private static func write(jsonLine: String) {
+            // ndjson: one JSON object per line, newline-terminated.
+            // Stderr (fd 2) because stdout is already used for the
+            // final entries/out/time/verify summary on success.
+            FileHandle.standardError.write(Data((jsonLine + "\n").utf8))
+        }
+
+        /// Hand-rolled JSON encoder — keeps the dependency surface
+        /// minimal (no JSONEncoder import, no Codable struct). The
+        /// shape is fixed and tiny so a few string interpolations
+        /// produce stable, parseable output. Escaping is deliberately
+        /// trivial because the only string field is the phase enum
+        /// (`pack`/`unpack`/`zip`), all known-safe ASCII.
+        static func encode(_ snap: ProgressReporter.Snapshot,
+                           done: Bool) -> String {
+            let phase = snap.phase.rawValue
+            let processed = snap.processed
+            let total = snap.total
+            let bps = snap.bytesPerSecond
+            let eta = snap.etaSeconds
+            // Use %g for floats so values like ".Infinity" don't end up
+            // in the stream; clamp the ETA explicitly.
+            let etaStr: String
+            if eta.isFinite {
+                etaStr = String(format: "%.3f", eta)
+            } else {
+                etaStr = "null"
+            }
+            return "{\"phase\":\"\(phase)\","
+                + "\"processed\":\(processed),"
+                + "\"total\":\(total),"
+                + "\"bytesPerSecond\":\(String(format: "%.0f", bps)),"
+                + "\"etaSeconds\":\(etaStr),"
+                + "\"done\":\(done ? "true" : "false")}"
+        }
+    }
+}
+
+// MARK: - Protocol conformances
+
+extension CLIProgress.Printer: ProgressPrinting {
+    /// Protocol witness — delegates to the timeout variant with the
+    /// standard 1.0 s safety cap. Without this, callers holding a
+    /// `ProgressPrinting` reference would have no `waitUntilFlushed()`
+    /// to call.
+    func waitUntilFlushed() { waitUntilFlushed(timeout: 1.0) }
+}
+
+extension CLIProgress.JSONProgressPrinter: ProgressPrinting {
+    /// Same protocol-witness shim as the text printer.
+    func waitUntilFlushed() { waitUntilFlushed(timeout: 1.0) }
 }

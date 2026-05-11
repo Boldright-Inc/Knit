@@ -1,61 +1,67 @@
-// Knit.app — minimal AppKit launcher.
+// Knit.app — AppKit launcher that drives the knit CLI from Finder.
 //
-// Two responsibilities:
-//   1. Provide a registered .app bundle so macOS Launch Services can apply
-//      the .knit UTI declaration + document icon (declared in Info.plist).
-//   2. When the user double-clicks a .knit file (or drags one onto the app
-//      icon), invoke `/usr/local/bin/knit unpack` for them.
+// Three roles:
+//   1. Register the .knit UTI + document icon via the Info.plist.
+//   2. Handle file-double-click + drag-onto-app → run `knit unpack`
+//      and surface progress through a native NSProgress (which Finder
+//      decorates the output's file icon with, plus shows in the menu-
+//      bar progress widget).
+//   3. Handle Quick Action invocations from
+//      `Scripts/build-quick-actions.sh` → run `knit pack` / `knit zip`
+//      / `knit unpack` with the same NSProgress wiring.
 //
-// Compiled stand-alone via swiftc inside Scripts/build-app.sh — kept out of
-// Package.swift so KnitCore doesn't gain an AppKit dependency.
+// PR #57: rewritten around `OperationCoordinator` + `NSProgress`.
+// Previously Knit.app spawned Terminal.app and shoved an ANSI bar
+// into it; the new flow stays GUI-side. The CLI still works
+// standalone — Knit.app uses the hidden `--progress-json` flag to
+// drive its own NSProgress.
+//
+// Compiled stand-alone via swiftc inside Scripts/build-app.sh —
+// kept out of Package.swift so KnitCore doesn't gain an AppKit
+// dependency.
 
 import AppKit
+import Foundation
 
-// 30 MiB. Archives at or above this size open a Terminal window so
-// the user sees `knit unpack --progress`; smaller archives extract
-// silently in the background with no notification.
-//
-// The design target is **base Apple Silicon** (M1 / M2 base models,
-// ~1.5 GB/s SSDs, 4 performance cores) — not the M5 Max this code
-// is being written on. On base hardware a 30 MiB archive takes
-// ~0.5–2 s to extract depending on entry shape (one big file vs.
-// many small files vs. SSD-write-bound layouts). That's the size at
-// which a base-Mac user starts to want "is it doing something?"
-// feedback. On M5 Max the same archive extracts in ~50 ms — the
-// Terminal window briefly flashes but doesn't linger, a tolerable
-// cost to give base-hardware users the UX they need.
-//
-// The earlier 100 MiB value (PR #50) was M5 Max-tuned and produced
-// no-feedback dead air for base-Mac extractions; PR #55 lowered it
-// to 30 MiB to match the Quick Action build script. Both files
-// reference each other so a future change should keep them in sync.
-// See CLAUDE.md Rule 4.4 for the broader "design for base Apple
-// Silicon" rule.
-private let kTerminalSizeThresholdBytes: UInt64 = 30 * 1024 * 1024
-
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var pendingExtractions = 0
+/// `@unchecked Sendable` because the only mutation (`coordinators`,
+/// `openFileEverFired`) happens on the main queue, and the only
+/// off-main entry point is the `onAllDone` closure handed to each
+/// coordinator — which immediately hops back to main before touching
+/// any AppDelegate state. The Swift 6 strict-concurrency analyser
+/// can't prove that statically; this annotation is the standard
+/// `CLAUDE.md` Rule 1.3 escape hatch for "the invariant is enforced
+/// by call-site discipline, not the type system".
+final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
+    /// Active operations. We stay alive while at least one is in
+    /// flight, then `NSApp.terminate(nil)` once the array drains.
+    private var coordinators: [OperationCoordinator] = []
     private var openFileEverFired = false
 
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
         openFileEverFired = true
-        pendingExtractions += filenames.count
-        for path in filenames {
-            extract(path: path) { [weak self] in
-                guard let self = self else { return }
-                self.pendingExtractions -= 1
-                if self.pendingExtractions == 0 {
-                    NSApp.reply(toOpenOrPrint: .success)
-                    NSApp.terminate(nil)
-                }
-            }
-        }
+        // openFiles is the LaunchServices entrypoint — double-click on
+        // .knit / .zip, drag onto app icon, `open file.knit` from CLI.
+        // Treat each as an extract operation.
+        let urls = filenames.map { URL(fileURLWithPath: $0) }
+        startOperation(.extractArchive(inputs: urls, outputDir: nil))
+        NSApp.reply(toOpenOrPrint: .success)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // openFiles is delivered after applicationWillFinishLaunching but
-        // possibly slightly after didFinishLaunching. Wait briefly, then
-        // either show a help message or exit.
+        // The Quick Action invocation path uses
+        // `open -a Knit.app --args --operation pack ...`. ArgumentParser
+        // would be overkill here — we hand-parse the small flag set.
+        if let op = Self.parseQuickActionArgs() {
+            openFileEverFired = true   // suppress the "drop a file" alert
+            startOperation(op)
+            return
+        }
+
+        // openFiles is delivered shortly after didFinishLaunching but
+        // possibly slightly *after*, depending on Launch Services
+        // scheduling. Give it 0.6 s to fire; if neither openFiles nor
+        // Quick Action args showed up, the user double-clicked the
+        // bare app icon — show the help alert.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
             guard let self = self, !self.openFileEverFired else { return }
             self.showHelpAlert()
@@ -63,176 +69,116 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Route the extraction either through a Terminal window (when the
-    /// archive is large enough that the user benefits from a live
-    /// `--progress` bar) or through a silent background `Process`
-    /// (small archives — over before the Terminal window would have
-    /// finished opening). Neither path emits a completion notification,
-    /// matching the rest of the Quick Action surface (PR #50 spec).
-    private func extract(path: String, completion: @escaping () -> Void) {
-        let size: UInt64 = {
-            let attrs = try? FileManager.default.attributesOfItem(atPath: path)
-            return (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
-        }()
+    // MARK: - Quick Action arg parsing
 
-        if size >= kTerminalSizeThresholdBytes {
-            extractViaTerminal(path: path, completion: completion)
-        } else {
-            extractSilent(path: path, completion: completion)
+    /// Recognises:
+    ///   --operation pack | zip | extract
+    ///   --inputs <path>...
+    ///   --output <dir>            (optional)
+    ///   --level <int>             (optional, default 3 for pack, 6 for zip)
+    ///
+    /// `--inputs` consumes all following args until the next flag or
+    /// end-of-args. This matches how the Quick Action's
+    /// `open -a Knit.app --args ...` invocation lays out its tail.
+    static func parseQuickActionArgs() -> KnitOperation? {
+        // ProcessInfo skips argv[0] (the executable path); subsequent
+        // entries are the --args payload we got from `open`.
+        let raw = Array(ProcessInfo.processInfo.arguments.dropFirst())
+        var op: String?
+        var inputs: [URL] = []
+        var output: URL?
+        var level: Int?
+        var i = 0
+        while i < raw.count {
+            let a = raw[i]
+            switch a {
+            case "--operation":
+                if i + 1 < raw.count {
+                    op = raw[i + 1]
+                    i += 2
+                } else { i += 1 }
+            case "--inputs":
+                i += 1
+                while i < raw.count && !raw[i].hasPrefix("--") {
+                    inputs.append(URL(fileURLWithPath: raw[i]))
+                    i += 1
+                }
+            case "--output":
+                if i + 1 < raw.count {
+                    output = URL(fileURLWithPath: raw[i + 1])
+                    i += 2
+                } else { i += 1 }
+            case "--level":
+                if i + 1 < raw.count, let n = Int(raw[i + 1]) {
+                    level = n
+                    i += 2
+                } else { i += 1 }
+            default:
+                // Unknown flag/arg — skip. Includes Launch Services'
+                // own injections like `-NSDocumentRevisionsDebugMode`.
+                i += 1
+            }
+        }
+        guard let op = op, !inputs.isEmpty else { return nil }
+        switch op {
+        case "pack":
+            return .packToKnit(inputs: inputs, outputDir: output, level: level ?? 3)
+        case "zip":
+            return .zipParallel(inputs: inputs, outputDir: output, level: level ?? 6)
+        case "extract":
+            return .extractArchive(inputs: inputs, outputDir: output)
+        default:
+            return nil
         }
     }
 
-    /// Silent fast path: spawn the unpacker, wait for it, complete. No
-    /// Terminal window, no notification, no UI other than an error
-    /// alert if the binary is missing or the run fails.
-    private func extractSilent(path: String, completion: @escaping () -> Void) {
-        let url = URL(fileURLWithPath: path)
-        let outDir = url.deletingLastPathComponent().path
+    // MARK: - Operation dispatch
 
+    private func startOperation(_ operation: KnitOperation) {
         guard let knit = Self.locateKnitCLI() else {
-            DispatchQueue.main.async {
-                self.alert(title: "Knit CLI not found",
-                           message: "Couldn't find /usr/local/bin/knit. Run install.sh from the Knit DMG to install the CLI.")
-                completion()
-            }
+            let alert = NSAlert()
+            alert.messageText = "Knit CLI not found"
+            alert.informativeText = "Couldn't find /usr/local/bin/knit. Run the installer (or install.sh) to install the CLI."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            _ = alert.runModal()
+            NSApp.terminate(nil)
             return
         }
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            let proc = Process()
-            proc.executableURL = knit
-            let lower = path.lowercased()
-            if lower.hasSuffix(".zip") {
-                // knit doesn't ship a zip extractor yet — fall back to
-                // /usr/bin/unzip. Same policy the Terminal path takes
-                // (see Scripts/build-quick-actions.sh's extract.sh).
-                proc.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-                proc.arguments = ["-q", "-o", path, "-d", outDir]
-            } else {
-                proc.arguments = ["unpack", path, "-o", outDir]
-            }
-            do {
-                try proc.run()
-                proc.waitUntilExit()
-                let ok = proc.terminationStatus == 0
-                DispatchQueue.main.async {
-                    if !ok {
-                        self.alert(title: "Extraction failed",
-                                   message: "knit unpack exited with status \(proc.terminationStatus) for \(url.lastPathComponent).")
-                    }
-                    completion()
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.alert(title: "Couldn't launch knit",
-                               message: error.localizedDescription)
-                    completion()
-                }
-            }
-        }
-    }
-
-    /// Large-archive path: open Terminal.app via AppleScript and run
-    /// `knit unpack … --progress` there. Mirrors the Quick Action
-    /// runner shape — print "[Done.]" + sleep 3, then have AppleScript
-    /// close the window once the shell exits. Knit.app doesn't block
-    /// on the Terminal session; once `osascript` returns, we call
-    /// completion and let the app terminate.
-    private func extractViaTerminal(path: String, completion: @escaping () -> Void) {
-        let url = URL(fileURLWithPath: path)
-        let outDir = url.deletingLastPathComponent().path
-        let lower = path.lowercased()
-
-        // Build the command the runner shell will execute. We
-        // intentionally don't shell-quote here via `escaped` because
-        // the values are already path strings and we pipe them through
-        // a heredoc into a runner script file below. Each path gets
-        // single-quoted with any embedded `'` doubled, which is the
-        // standard POSIX-safe quoting for shell strings.
-        func sqQuote(_ s: String) -> String {
-            return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        }
-        let qPath = sqQuote(path)
-        let qOutDir = sqQuote(outDir)
-        let knitCmd: String
-        if lower.hasSuffix(".zip") {
-            knitCmd = "/usr/bin/unzip -o \(qPath) -d \(qOutDir)"
-        } else {
-            knitCmd = "/usr/local/bin/knit unpack \(qPath) --progress -o \(qOutDir)"
-        }
-
-        // Write the runner script to a temp file. AppleScript's
-        // `do script` will execute it, then we close the Terminal
-        // window when the tab is no longer busy.
-        let runner = (try? Self.writeRunner(knitCmd: knitCmd)) ?? "/tmp/knit-runner-failed.sh"
-
-        let appleScript = """
-        tell application "Terminal"
-            activate
-            set theTab to do script "\(runner); exit"
-            set theWindowID to id of front window
-            repeat while busy of theTab
-                delay 0.5
-            end repeat
-            delay 0.3
-            repeat with w in windows
-                if id of w is theWindowID then
-                    close w saving no
-                    exit repeat
-                end if
-            end repeat
-        end tell
-        """
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            let osa = Process()
-            osa.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            osa.arguments = ["-e", appleScript]
-            try? osa.run()
-            // Don't wait — Knit.app exiting is fine. Terminal owns the
-            // session and its AppleScript loop closes the window when
-            // the runner finishes. The user-perceived completion is
-            // when the Terminal window goes away, not when Knit.app
-            // exits.
+        // The coordinator captures `self` weakly so the deallocator
+        // for the last coordinator can fire even from one of the
+        // subprocess threads. We hold a strong ref in `coordinators`
+        // for the operation's lifetime.
+        var coordinator: OperationCoordinator!
+        coordinator = OperationCoordinator(
+            operation: operation,
+            knitURL: knit
+        ) { [weak self] in
             DispatchQueue.main.async {
-                completion()
+                self?.coordinatorFinished(coordinator)
             }
         }
-        _ = url  // silence unused warning if path lookups change later
+        coordinators.append(coordinator)
+        coordinator.start()
     }
 
-    /// Write a small zsh runner script to a tempfile and return its
-    /// path. The runner prints "[Done.]" + sleeps 3 so the user can
-    /// read the final summary before the Terminal window auto-closes,
-    /// then deletes itself.
-    private static func writeRunner(knitCmd: String) throws -> String {
-        let tmp = NSTemporaryDirectory()
-        let path = (tmp as NSString).appendingPathComponent("knit_unpack_runner_\(UUID().uuidString).sh")
-        let body = """
-        #!/bin/zsh
-        set -u
-        \(knitCmd)
-        printf "\\n[Done.]\\n"
-        sleep 3
-        rm -f -- '\(path)'
-        exit 0
-        """
-        try body.write(toFile: path, atomically: true, encoding: .utf8)
-        var attrs = [FileAttributeKey: Any]()
-        attrs[.posixPermissions] = NSNumber(value: 0o755)
-        try? FileManager.default.setAttributes(attrs, ofItemAtPath: path)
-        return path
+    private func coordinatorFinished(_ coordinator: OperationCoordinator) {
+        coordinators.removeAll { $0 === coordinator }
+        if coordinators.isEmpty {
+            NSApp.terminate(nil)
+        }
     }
+
+    // MARK: - CLI lookup
 
     private static func locateKnitCLI() -> URL? {
         let candidates = [
             "/usr/local/bin/knit",
             "/opt/homebrew/bin/knit",
         ]
-        for c in candidates {
-            if FileManager.default.isExecutableFile(atPath: c) {
-                return URL(fileURLWithPath: c)
-            }
+        for c in candidates where FileManager.default.isExecutableFile(atPath: c) {
+            return URL(fileURLWithPath: c)
         }
         // Fallback: knit binary bundled inside the .app
         if let bundled = Bundle.main.url(forAuxiliaryExecutable: "knit"),
@@ -242,19 +188,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return nil
     }
 
-    private func alert(title: String, message: String) {
-        let a = NSAlert()
-        a.messageText = title
-        a.informativeText = message
-        a.alertStyle = .warning
-        a.addButton(withTitle: "OK")
-        a.runModal()
-    }
+    // MARK: - Help
 
     private func showHelpAlert() {
         let a = NSAlert()
         a.messageText = "Knit"
-        a.informativeText = "Knit is a command-line tool. Right-click any .knit or .zip file in Finder and choose a Knit Quick Action, or drag a file onto this app icon to extract it."
+        a.informativeText = "Knit is a command-line tool. Right-click any file or folder in Finder and choose a Knit Quick Action, or drag a .knit / .zip onto this app icon to extract it."
         a.alertStyle = .informational
         a.addButton(withTitle: "OK")
         _ = a.runModal()
