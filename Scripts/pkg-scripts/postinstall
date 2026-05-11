@@ -1,7 +1,8 @@
 #!/bin/bash
 # Runs as root after the PKG installer copies Knit's payload onto disk.
-# Refreshes Launch Services, clears the icon cache, restarts Finder/Dock so
-# the .knit document icon and Quick Actions appear immediately.
+# Refreshes Launch Services, clears the icon cache, and pokes the Services
+# menu cache so the .knit document icon and Quick Actions appear without
+# requiring a logout.
 #
 # Failures here should never block a successful install — every command is
 # wrapped to ignore errors.
@@ -12,14 +13,27 @@ LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchService
 "$LSREG" -kill -r -domain local -domain user >/dev/null 2>&1 || true
 "$LSREG" -f /Applications/Knit.app >/dev/null 2>&1 || true
 
-# Force the system icon cache to repopulate.
+# Force the system icon cache to repopulate so the new .knit document icon
+# replaces the generic-doc fallback from a previous install (or first
+# launch on a fresh system).
 rm -rf /Library/Caches/com.apple.iconservices.store >/dev/null 2>&1 || true
 killall iconservicesagent iconservicesd >/dev/null 2>&1 || true
 
 # Refresh the Services menu so Quick Actions show up in Finder right-click.
 /System/Library/CoreServices/pbs -update >/dev/null 2>&1 || true
 
-# Bounce Finder and Dock so the changes are visible without a logout.
-killall Finder Dock >/dev/null 2>&1 || true
+# Intentionally NOT calling `killall Finder Dock` (PR #64).
+#
+# An earlier revision did, with the rationale "bounce Finder and Dock so
+# the changes are visible without a logout." In practice the three steps
+# above are sufficient — Launch Services notifies Finder/Dock through
+# LSRegistrationStream within 1-3 s, and iconservicesd's relaunch flushes
+# the icon overlay automatically. Killing Finder buys at most a couple of
+# seconds of "instant" visibility while costing the user every open
+# Finder window, a desktop redraw flash, and a momentary Dock dead zone.
+#
+# Industry convention agrees: Xcode Installer, App Store, Homebrew casks,
+# Microsoft Office, and Apple's own first-party .pkg flows all leave
+# Finder running. We follow suit.
 
 exit 0
