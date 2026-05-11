@@ -297,6 +297,32 @@ final class ProgressWindow: NSPanel {
         detailLabel.stringValue = "\(processedStr) of \(totalStr)\(etaStr)"
     }
 
+    /// Show a "waiting for another Knit operation to finish" state.
+    /// Used by `OperationCoordinator` while the cross-instance
+    /// `flock` (PR #79) blocks. The progress bar stays indeterminate
+    /// — animation visible to confirm the panel is alive — and the
+    /// detail label carries the wait status and elapsed time. The
+    /// next determinate `update(...)` call (when the lock is
+    /// acquired and the subprocess starts emitting progress) clears
+    /// this state automatically.
+    ///
+    /// `elapsedSeconds == 0` is a special case that suppresses the
+    /// elapsed-time suffix, so the very first paint right after the
+    /// non-blocking acquire failed reads "Waiting for another Knit
+    /// operation..." rather than "Waiting... 0s".
+    func showWaitingForLock(elapsedSeconds: TimeInterval) {
+        if !progressBar.isIndeterminate {
+            progressBar.isIndeterminate = true
+            progressBar.startAnimation(nil)
+        }
+        if elapsedSeconds < 1 {
+            detailLabel.stringValue = "Waiting for another Knit operation to finish…"
+        } else {
+            let secs = Int(elapsedSeconds.rounded())
+            detailLabel.stringValue = "Waiting for another Knit operation to finish… (\(secs)s)"
+        }
+    }
+
     /// Show the panel. Called after `configure(...)`.
     func show() {
         // orderFrontRegardless avoids needing keyboard focus — the
