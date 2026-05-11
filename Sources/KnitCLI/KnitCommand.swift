@@ -381,9 +381,19 @@ extension KnitCommand {
             // overlap?). Without this flag the decoder pays no
             // instrumentation cost.
             let analytics: StageAnalytics? = analyze ? StageAnalytics() : nil
+            // Phase 1b.0 spike accumulator. Constructed alongside the
+            // stage accumulator so they share the `--analyze` gate;
+            // every block's zstd frame gets walked by the literal
+            // classifier inside the parallel decode worker. The
+            // classifier never throws and the cost is small enough
+            // that `parallel.decode` wall should not regress
+            // measurably — to be confirmed by the bench-corpora.sh
+            // diff in the PR description.
+            let literalTypeAnalytics: LiteralTypeAnalytics? = analyze ? LiteralTypeAnalytics() : nil
             let extractor = KnitExtractor(useGPUVerify: !noGpuVerify,
                                           progressReporter: reporter,
-                                          analytics: analytics)
+                                          analytics: analytics,
+                                          literalTypeAnalytics: literalTypeAnalytics)
             let stats = try extractor.extract(archive: inputURL, to: outURL)
             // Drain the printer thread before the result summary — see the
             // matching comment in the `Zip` subcommand for rationale.
@@ -400,6 +410,11 @@ extension KnitCommand {
                                                      extractElapsed: stats.elapsed,
                                                      bytesOut: stats.bytesOut,
                                                      entries: stats.entries)
+                FileHandle.standardError.write(Data(report.utf8))
+            }
+            if let literalTypeAnalytics = literalTypeAnalytics {
+                let snap = literalTypeAnalytics.snapshot()
+                let report = CLIAnalyze.renderUnpackLiteralTypes(snap)
                 FileHandle.standardError.write(Data(report.utf8))
             }
         }
