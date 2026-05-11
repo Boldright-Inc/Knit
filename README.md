@@ -132,6 +132,8 @@ In a 24-bit-capable terminal (Terminal.app, iTerm2, VS Code's integrated termina
 
 Reproduce with `./Scripts/bench.sh [size_mb=1024]`.
 
+**About these numbers (caveat).** The table above is a *cool-start single-shot* measurement. `Scripts/bench.sh` runs an 11-tool sequence back-to-back without sleep between tools — by the time it reaches `knit pack`, the M5 Max has already been driven hard by `ditto` (~9 s burn) and `knit CPU lvl=9` (~5 s burn), so the SoC is in a partially thermally-throttled state. Re-running `bench.sh` on a warm system can produce numbers **~1.5–2× slower for the same binary** — a same-code bisect documented a 0.19 s → 0.35 s swing on identical commits between cool and warm states (60 s `sleep` between runs did not fully cool the system back down). The relative ordering of the tools stays stable, but absolute throughput is reproducible only from a near-idle system. See `CLAUDE.md` Rule 4.3 for the full investigation.
+
 ## Choosing a format
 
 | Use case | Recommended |
