@@ -18,9 +18,25 @@ public final class MappedFile: @unchecked Sendable {
     public let count: Int
     private let fd: Int32
 
-    public init(url: URL) throws {
-        let path = url.path
-        let fd = open(path, O_RDONLY | O_CLOEXEC)
+    public convenience init(url: URL) throws {
+        // Legacy URL-based init. NFD-normalizes the path string via
+        // `URL.path` on macOS — fine for ASCII paths (tests, the
+        // common CLI case) but breaks for filenames with non-ASCII
+        // characters where the on-disk encoding is NFC (e.g. files
+        // unpacked via the PR #82 byte-preserving path). New code
+        // should prefer `init(path:)` which preserves bytes verbatim.
+        try self.init(path: url.path)
+    }
+
+    /// Byte-preserving mmap. `path`'s UTF-8 bytes flow straight to
+    /// `open(2)` via `withCString` — no Foundation `URL`/`NSString`
+    /// round-trip in the middle, so on-disk filenames with NFC bytes
+    /// (the typical Unicode form for cross-platform filenames) are
+    /// found rather than refused with ENOENT because Foundation
+    /// helpfully NFD'd the lookup string. See `POSIXFile.swift`
+    /// header for the full analysis. PR #82.
+    public init(path: String) throws {
+        let fd = path.withCString { open($0, O_RDONLY | O_CLOEXEC) }
         if fd < 0 {
             throw KnitError.ioFailure(path: path, message: "open failed: \(String(cString: strerror(errno)))")
         }

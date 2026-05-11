@@ -127,28 +127,48 @@ public final class KnitExtractor {
 
         let entries = reader.archive.entries
 
+        // PR #82: compute every entry's destination path as a
+        // byte-preserving String via `POSIXFile.joinPath`. URL-based
+        // composition (`destDir.appendingPathComponent(name).path`)
+        // applies macOS Foundation's NFD canonical-decomposition
+        // normalization to path strings, silently rewriting
+        // non-ASCII filenames (e.g. Japanese `プ` U+30D7 → `フ゜`
+        // U+30D5 + U+309A) so the unpacked tree no longer
+        // byte-matches the input. See `POSIXFile.swift` header for
+        // the full analysis.
+        let destDirPath = destDir.path
+
         // Pre-create every parent directory in a single serial pass
         // before kicking off the parallel-extract phase. Without this,
-        // 16 workers concurrently call `createDirectory` and
-        // `createFile` on the same parent inodes — APFS serialises on
-        // the parent's b-tree lock, so concurrent calls effectively
-        // queue inside the kernel. On a 100 k-entry github tree where
-        // many entries share a parent (`node_modules/foo/...`), the
-        // contention dominated the parallel-extract win and produced
-        // a wall-time *regression* relative to the serial path the
-        // PR #31 work replaced. Doing the dir creates up front is
-        // O(distinct parents) and runs single-threaded so APFS sees
-        // a clean queue depth of 1 — fast and contention-free. The
-        // per-entry `createDirectory(withIntermediateDirectories:
-        // true)` calls inside `KnitReader.extract` then become cheap
+        // 16 workers concurrently call `mkdir(2)` on the same parent
+        // inodes — APFS serialises on the parent's b-tree lock, so
+        // concurrent calls effectively queue inside the kernel. On a
+        // 100 k-entry github tree where many entries share a parent
+        // (`node_modules/foo/...`), the contention dominated the
+        // parallel-extract win and produced a wall-time *regression*
+        // relative to the serial path the PR #31 work replaced.
+        // Doing the dir creates up front is O(distinct parents) and
+        // runs single-threaded so APFS sees a clean queue depth of
+        // 1 — fast and contention-free. The per-entry mkdir-safety-net
+        // calls inside `KnitReader.extract` then become cheap
         // already-exists no-ops.
         var parentPaths: Set<String> = []
+        // Each entry's outPath is the byte-preserving destination
+        // path; we cache it in the parent-path build pass and reuse
+        // below in the extract loop so the SafePath validation +
+        // string join is paid once per entry.
+        var perEntryOutPaths: [String] = []
+        perEntryOutPaths.reserveCapacity(entries.count)
         for entry in entries {
-            let outURL = try SafePath.resolve(name: entry.name, into: destDir)
+            let outPath = try SafePath.resolvePath(name: entry.name,
+                                                    into: destDirPath)
+            perEntryOutPaths.append(outPath)
             if entry.isDirectory {
-                parentPaths.insert(outURL.path)
+                parentPaths.insert(outPath)
             }
-            parentPaths.insert(outURL.deletingLastPathComponent().path)
+            if let slash = outPath.lastIndex(of: "/") {
+                parentPaths.insert(String(outPath[..<slash]))
+            }
         }
         for parentPath in parentPaths {
             // Best-effort: any individual create failure (e.g. EEXIST
@@ -156,10 +176,11 @@ public final class KnitExtractor {
             // ignored here and re-attempted lazily inside
             // `KnitReader.extract`. We only care about the bulk-of-the-
             // tree case where pre-creating eliminates contention.
-            try? FileManager.default.createDirectory(
-                atPath: parentPath,
-                withIntermediateDirectories: true
-            )
+            // `POSIXFile.mkdirParents` uses raw `mkdir(2)` with
+            // `withCString` so the segment's UTF-8 bytes flow
+            // verbatim to the kernel — no NFD round-trip via
+            // Foundation. PR #82.
+            _ = POSIXFile.mkdirParents(parentPath)
         }
         let start = ContinuousClock.now
         var bytesOut: UInt64 = 0
@@ -175,9 +196,11 @@ public final class KnitExtractor {
         let reporter = progressReporter
         let gpuCRCLocal = gpuCRC
         let readerLocal = reader
-        let destDirLocal = destDir
         // PR #75: capture the flag for the @Sendable closure below.
         let postWriteVerifyLocal = postWriteVerify
+        // PR #82: `destDirLocal` removed — destination paths are
+        // now precomputed into `perEntryOutPaths` so the closure
+        // doesn't need to recompose them per entry.
         // Inner-decoder concurrency = 1 in the parallel-batch path:
         // outer entry-level parallelism already saturates the worker
         // pool, and nested 16-way × 16-way `concurrentMap` would just
@@ -201,10 +224,12 @@ public final class KnitExtractor {
 
             // Large entry: serial across entries, parallel within.
             if entry.uncompressedSize >= Self.largeEntryThreshold {
-                let outURL = try SafePath.resolve(name: entry.name, into: destDir)
+                // Reuse the byte-preserving path computed in the
+                // pre-create pass above. PR #82.
+                let outPath = perEntryOutPaths[i]
                 try reader.extract(
                     entry,
-                    to: outURL,
+                    toPath: outPath,
                     gpuCRC: gpuCRC,
                     progressReporter: progressReporter,
                     stagedDecoder: serialDecoder,
@@ -230,11 +255,16 @@ public final class KnitExtractor {
             }
             let batch = Array(entries[i..<j])
 
+            // Capture the relevant slice of byte-preserving paths.
+            // Per-entry outPath is indexed by absolute entry index `k`,
+            // computed in the pre-create pass above. PR #82.
+            let batchOutPaths = Array(perEntryOutPaths[i..<j])
             let _: [UInt64] = try concurrentMap(
-                batch,
+                Array(batch.indices),
                 concurrency: outerConcurrency
-            ) { entry in
-                let outURL = try SafePath.resolve(name: entry.name, into: destDirLocal)
+            ) { k in
+                let entry = batch[k]
+                let outPath = batchOutPaths[k]
                 // Per-worker decoder: cheap to construct (just stores
                 // refs), avoids racing on shared
                 // `consecutiveSlowBatches` / `poisonedThisEntry` state.
@@ -245,7 +275,7 @@ public final class KnitExtractor {
                 )
                 try readerLocal.extract(
                     entry,
-                    to: outURL,
+                    toPath: outPath,
                     gpuCRC: gpuCRCLocal,
                     progressReporter: reporter,
                     stagedDecoder: perWorkerDecoder,
