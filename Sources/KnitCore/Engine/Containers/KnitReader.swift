@@ -141,22 +141,61 @@ public final class KnitReader: @unchecked Sendable {
     /// to disk — that staging discipline is what makes the GPU path safe
     /// later. Pass `nil` (default) to use the existing direct-libzstd
     /// loop with no batching overhead.
+    /// Legacy URL-based extract — wraps the byte-preserving String
+    /// path variant by going through `outURL.path` (which
+    /// NFD-normalizes on macOS, see `POSIXFile.swift` header for
+    /// why). Fine for ASCII paths; for non-ASCII entry names use
+    /// `extract(_:toPath:...)` directly. KnitExtractor uses the
+    /// String variant; this overload exists for the existing test
+    /// suite and any callers that already hold a URL.
     public func extract(_ entry: KnitEntry,
                         to outURL: URL,
                         gpuCRC: MetalCRC32? = nil,
                         progressReporter: ProgressReporter? = nil,
                         stagedDecoder: HybridZstdBatchDecoder? = nil,
                         postWriteVerify: Bool = true) throws {
+        try extract(entry,
+                    toPath: outURL.path,
+                    gpuCRC: gpuCRC,
+                    progressReporter: progressReporter,
+                    stagedDecoder: stagedDecoder,
+                    postWriteVerify: postWriteVerify)
+    }
+
+    /// Byte-preserving extract. `outPath`'s UTF-8 bytes flow
+    /// straight to `open(2)` and `mkdir(2)` via POSIX, bypassing
+    /// Foundation's NFD canonical-decomposition normalization of
+    /// path strings. Required for round-tripping non-ASCII
+    /// filenames (most notably Japanese, Korean, accented Latin
+    /// scripts) without silently rewriting the on-disk encoding.
+    /// See `POSIXFile.swift` for the full analysis. PR #82.
+    public func extract(_ entry: KnitEntry,
+                        toPath outPath: String,
+                        gpuCRC: MetalCRC32? = nil,
+                        progressReporter: ProgressReporter? = nil,
+                        stagedDecoder: HybridZstdBatchDecoder? = nil,
+                        postWriteVerify: Bool = true) throws {
         if entry.isDirectory {
-            try FileManager.default.createDirectory(at: outURL,
-                                                    withIntermediateDirectories: true)
+            if !POSIXFile.mkdirParents(outPath) {
+                throw KnitError.ioFailure(path: outPath, message: "could not create directory")
+            }
             return
         }
 
-        try FileManager.default.createDirectory(at: outURL.deletingLastPathComponent(),
-                                                withIntermediateDirectories: true)
-        FileManager.default.createFile(atPath: outURL.path, contents: nil)
-        let outHandle = try FileHandle(forWritingTo: outURL)
+        // Parent-dir safety net. KnitExtractor.swift pre-creates
+        // every parent path in a single serial pass before kicking
+        // off the parallel-extract phase (to dodge APFS b-tree
+        // contention on shared parent inodes), so this call is
+        // expected to be a no-op for the common case. It catches
+        // the edge case where the caller didn't run the pre-create
+        // pass (tests, ad-hoc usage).
+        if let lastSlash = outPath.lastIndex(of: "/") {
+            let parentPath = String(outPath[..<lastSlash])
+            if !parentPath.isEmpty {
+                _ = POSIXFile.mkdirParents(parentPath)
+            }
+        }
+        let outHandle = try POSIXFile.openForWriting(outPath)
         defer { try? outHandle.close() }
 
         // Opt-in staged path: build (frame, uncompressedSize) per block
@@ -199,7 +238,7 @@ public final class KnitReader: @unchecked Sendable {
             // gives 2-3× speedup at the cost of dropping a
             // defence-in-depth layer most archive tools don't have.
             if postWriteVerify {
-                try verifyCRC(entry: entry, outURL: outURL, gpuCRC: gpuCRC)
+                try verifyCRC(entry: entry, outPath: outPath, gpuCRC: gpuCRC)
             }
             // PR #81: release the input-mmap pages this entry consumed.
             // See `releaseInputPagesFor(entry:)` doc-block for the
@@ -282,7 +321,7 @@ public final class KnitReader: @unchecked Sendable {
         // the staged path. See the staged-path doc-block for the
         // full trade-off discussion.
         if postWriteVerify {
-            try verifyCRC(entry: entry, outURL: outURL, gpuCRC: gpuCRC)
+            try verifyCRC(entry: entry, outPath: outPath, gpuCRC: gpuCRC)
         }
     }
 
@@ -442,8 +481,13 @@ public final class KnitReader: @unchecked Sendable {
     /// Recompute the CRC32 of the just-written file and compare against
     /// the value baked into the archive header. Routes large entries to the
     /// optional GPU implementation.
+    ///
+    /// `outPath` is byte-preserving — see `POSIXFile.swift` /
+    /// `MappedFile.init(path:)` for why we don't take a `URL`
+    /// here (would NFD-normalize and miss NFC files we just wrote).
+    /// PR #82.
     private func verifyCRC(entry: KnitEntry,
-                           outURL: URL,
+                           outPath: String,
                            gpuCRC: MetalCRC32?) throws {
         guard entry.uncompressedSize > 0 else {
             // Empty file: by .knit convention the stored CRC is 0.
@@ -455,7 +499,7 @@ public final class KnitReader: @unchecked Sendable {
             return
         }
 
-        let outMap = try MappedFile(url: outURL)
+        let outMap = try MappedFile(path: outPath)
         let buf = outMap.buffer
 
         // Threshold mirrors MetalCRC32's documented amortization point —
