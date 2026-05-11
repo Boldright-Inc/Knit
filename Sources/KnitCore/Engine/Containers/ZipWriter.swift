@@ -306,6 +306,20 @@ public final class ZipWriter {
             try handle.write(contentsOf: chunkData)
             currentOffset += UInt64(written)
             onProgress?(UInt64(written))
+            // PR #76 (companion to the pack-side fix in
+            // StreamingBlockCompressor): release the just-written
+            // input-mmap pages from kernel residency so a sustained
+            // multi-GB write doesn't accumulate ~80 GB of resident
+            // mmap → memory-compressor activity → vm_remap of
+            // compressed pages → `cpt_mapcnt` refcount overflow →
+            // kernel panic. Without this hint, the kernel keeps
+            // sequential-read pages resident on M5 Max (128 GB RAM)
+            // even with the MappedFile.swift MADV_SEQUENTIAL set at
+            // open time — the SEQUENTIAL advice biases readahead but
+            // doesn't actively evict.
+            _ = madvise(UnsafeMutableRawPointer(mutating: chunkPtr),
+                        written,
+                        MADV_DONTNEED)
             offset = end
         }
         // Touching `mapped` here keeps the MappedFile alive for the
