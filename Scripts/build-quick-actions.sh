@@ -107,7 +107,21 @@ wflow = {
         "serviceOutputTypeIdentifier": "com.apple.Automator.nothing",
         "serviceProcessesInput": 0,
         "useAutomaticInputType": 0,
-        "workflowTypeIdentifier": "com.apple.Automator.servicesMenu",
+        # Quick Action vs. Service: both ship as .workflow bundles under
+        # /Library/Services, but the type identifier decides where Finder
+        # surfaces them in the right-click menu.
+        #
+        #   * servicesMenu   → "Services >" submenu (2nd-level, dim, easy to miss)
+        #   * quickActionMenu → "Quick Actions >" submenu (still 2nd-level, but
+        #                       sibling of Services rather than nested under it,
+        #                       AND Quick Actions also appear in Finder's preview
+        #                       pane on the right and in the Touch Bar)
+        #
+        # Truly top-level placement (alongside "Open With" etc.) would
+        # require a FinderSync app extension — a separate .appex bundle
+        # with sandbox + entitlements + manual user activation. PR #51
+        # explored that and we chose this lighter promotion instead.
+        "workflowTypeIdentifier": "com.apple.Automator.quickActionMenu",
     },
 }
 with open(out_path, "wb") as f:
