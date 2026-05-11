@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="1">
+    <title>Knit</title>
+    <organization>co.boldright</organization>
+
+    <!-- Welcome / conclusion HTML pages shown in the installer -->
+    <welcome    file="welcome.html"    mime-type="text/html"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+
+    <!-- No customisation; install everything by default. -->
+    <options
+        customize="never"
+        require-scripts="true"
+        rootVolumeOnly="true"
+        hostArchitectures="arm64"
+        allow-external-scripts="no"/>
+
+    <!-- macOS 15 Sequoia or later, Apple Silicon only -->
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="15.0"/>
+        </allowed-os-versions>
+    </volume-check>
+
+    <!-- Single component -->
+    <pkg-ref id="co.boldright.knit"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="co.boldright.knit"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="co.boldright.knit" visible="false">
+        <pkg-ref id="co.boldright.knit"/>
+    </choice>
+    <pkg-ref id="co.boldright.knit"
+             version="0.1.0"
+             onConclusion="none">Knit.component.pkg</pkg-ref>
+</installer-gui-script>

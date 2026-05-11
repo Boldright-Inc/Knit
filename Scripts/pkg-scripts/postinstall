@@ -1,0 +1,25 @@
+#!/bin/bash
+# Runs as root after the PKG installer copies Knit's payload onto disk.
+# Refreshes Launch Services, clears the icon cache, restarts Finder/Dock so
+# the .knit document icon and Quick Actions appear immediately.
+#
+# Failures here should never block a successful install — every command is
+# wrapped to ignore errors.
+
+LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+
+# Re-seed Launch Services and re-register Knit.app so the .knit UTI is active.
+"$LSREG" -kill -r -domain local -domain user >/dev/null 2>&1 || true
+"$LSREG" -f /Applications/Knit.app >/dev/null 2>&1 || true
+
+# Force the system icon cache to repopulate.
+rm -rf /Library/Caches/com.apple.iconservices.store >/dev/null 2>&1 || true
+killall iconservicesagent iconservicesd >/dev/null 2>&1 || true
+
+# Refresh the Services menu so Quick Actions show up in Finder right-click.
+/System/Library/CoreServices/pbs -update >/dev/null 2>&1 || true
+
+# Bounce Finder and Dock so the changes are visible without a logout.
+killall Finder Dock >/dev/null 2>&1 || true
+
+exit 0
