@@ -86,11 +86,41 @@ final class ProgressWindow: NSPanel {
         flipped.addSubview(titleLabel)
 
         progressBar.style = .bar
-        progressBar.isIndeterminate = true
+        // PR #69. Initialise as DETERMINATE (not indeterminate) with
+        // value=0/max=1. The bar draws as an empty fill until the
+        // first `update(...)` call rescales it to the real total.
+        //
+        // The previous default — `isIndeterminate = true` +
+        // `startAnimation(nil)` — was intended as a "we're working,
+        // but don't know the total yet" affordance for the ~50-200 ms
+        // gap before the first --progress-json line arrives. PR #66
+        // tried to fix the resulting indeterminate→determinate visual
+        // transition by adding `stopAnimation(nil)` in `update(...)`.
+        // It didn't work reliably on macOS 26 Tahoe: even with the
+        // documented stopAnimation + isIndeterminate=false sequence,
+        // the bar kept drawing the indeterminate "moving pulse"
+        // pattern on top of the determinate fill, so a multi-GB
+        // .knit pack appeared as a bouncing animation throughout
+        // (despite the `update(...)` numeric values being applied
+        // correctly underneath).
+        //
+        // Skipping the indeterminate phase entirely sidesteps the
+        // AppKit redraw quirk: an empty determinate bar can't
+        // "become" indeterminate visually because the indeterminate
+        // animation never starts. First JSON line → just update
+        // maxValue + doubleValue → bar fills proportionally,
+        // no animation state to clean up.
+        //
+        // Trade-off: for the first ~200 ms while the CLI is still
+        // computing the total, the bar shows a flat empty fill
+        // instead of any motion. Acceptable — the panel title bar
+        // ("Compressing ...") already signals "operation started",
+        // and the bar tick begins as soon as the first progress
+        // line arrives.
+        progressBar.isIndeterminate = false
         progressBar.minValue = 0
         progressBar.maxValue = 1
         progressBar.doubleValue = 0
-        progressBar.startAnimation(nil)
         flipped.addSubview(progressBar)
 
         detailLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
