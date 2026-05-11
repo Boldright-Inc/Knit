@@ -265,29 +265,88 @@ public final class HybridZstdBatchDecoder {
         var fallbackThisBatch = 0
         let primary = useGPU ? gpuPath! : cpuPath
 
-        do {
-            let decodeStart = ContinuousClock.now
-            try staging.withUnsafeMutableBufferPointer { stage in
-                fallbackThisBatch = try parallelDecodeBlocks(
-                    blocks: blocks,
-                    uncompressedSizes: uncompressedSizes,
-                    range: range,
-                    primary: primary,
-                    perBlockFallback: cpuPath,
-                    staging: stage
+        // PR #74: try the all-`Raw_Block`/`RLE_Block` inline fast path
+        // first. For incompressible inputs (VM disk images, encrypted
+        // blobs, already-compressed media) libzstd emits frames where
+        // ~99.7 % of inner blocks are `Raw_Block`; for those, decoding
+        // is essentially `memcpy` and the per-batch worker round-trip
+        // (semaphore + thread context switch + libzstd context init)
+        // dominates wall-clock time. Sample-trace of an 80 GB
+        // `.pvm.knit` unpack on M5 Max showed the main thread blocked
+        // 87 % of the time on `_dispatch_semaphore_wait_slow`. Running
+        // the parse + memcpy inline on the main thread skips that
+        // round-trip entirely.
+        //
+        // Strategy is all-or-nothing per batch: if any frame in the
+        // batch contains a `Compressed_Block`, fall back to the
+        // worker path for the whole batch. The mixed-batch case
+        // would need block-level dispatch (some inline, some
+        // worker-dispatched, drained in input order), which adds
+        // plumbing without much payoff for the canonical VM-image
+        // workload that motivated the fast path.
+        var fastPathHandled = false
+        let inlineStart = ContinuousClock.now
+        staging.withUnsafeMutableBufferPointer { stage in
+            var stagingOffset = 0
+            var allInlined = true
+            for blockIdx in range {
+                let outSize = uncompressedSizes[blockIdx]
+                let destination = UnsafeMutableBufferPointer<UInt8>(
+                    start: stage.baseAddress!.advanced(by: stagingOffset),
+                    count: outSize
                 )
+                switch RawFrameDecoder.decode(frame: blocks[blockIdx],
+                                              destination: destination) {
+                case .decoded(let written):
+                    if written != outSize {
+                        // Size mismatch — bail out, let the worker
+                        // path try (it has the per-block CPU fallback
+                        // for genuinely malformed frames).
+                        allInlined = false
+                    } else {
+                        stagingOffset += written
+                    }
+                case .needsFullDecoder, .parseError:
+                    allInlined = false
+                }
+                if !allInlined { break }
             }
-            analytics?.record(stage: "parallel.decode",
-                              seconds: (ContinuousClock.now - decodeStart).timeIntervalSeconds)
-        } catch {
-            // Whole-batch failure path: re-decode the entire batch
-            // through CPU and try again. If that also fails, propagate.
-            return try decodeBatchCPUOnly(blocks: blocks,
-                                          uncompressedSizes: uncompressedSizes,
-                                          range: range,
-                                          rollingCRC: rollingCRC,
-                                          fallbackSeed: range.count,
-                                          sink: sink)
+            fastPathHandled = allInlined
+        }
+        if fastPathHandled {
+            analytics?.record(stage: "inline.rawframe",
+                              seconds: (ContinuousClock.now - inlineStart).timeIntervalSeconds)
+        }
+
+        if !fastPathHandled {
+            do {
+                let decodeStart = ContinuousClock.now
+                try staging.withUnsafeMutableBufferPointer { stage in
+                    fallbackThisBatch = try parallelDecodeBlocks(
+                        blocks: blocks,
+                        uncompressedSizes: uncompressedSizes,
+                        range: range,
+                        primary: primary,
+                        perBlockFallback: cpuPath,
+                        staging: stage
+                    )
+                }
+                analytics?.record(stage: "parallel.decode",
+                                  seconds: (ContinuousClock.now - decodeStart).timeIntervalSeconds)
+            } catch {
+                // Whole-batch failure path: re-decode the entire batch
+                // through CPU and try again. If that also fails,
+                // propagate. (Note: the staging buffer may have been
+                // partially filled by the fast-path attempt above —
+                // decodeBatchCPUOnly re-allocates so any stale bytes
+                // don't leak.)
+                return try decodeBatchCPUOnly(blocks: blocks,
+                                              uncompressedSizes: uncompressedSizes,
+                                              range: range,
+                                              rollingCRC: rollingCRC,
+                                              fallbackSeed: range.count,
+                                              sink: sink)
+            }
         }
 
         // Fold the batch's CRC against the running entry CRC.

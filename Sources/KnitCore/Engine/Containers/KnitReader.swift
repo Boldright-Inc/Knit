@@ -315,20 +315,48 @@ public final class KnitReader: @unchecked Sendable {
         let stats = try decoder.decode(blocks: blocks,
                                        blockSizes: sizes,
                                        expectedCRC32: entry.crc32) { batchBytes in
-            // One write per batch (still ~64× fewer syscalls than the
-            // historical per-block path), but back to `Data(buffer:)`
-            // — i.e. a fresh ARC-managed copy each time. The previous
-            // `Data(bytesNoCopy:..., deallocator: .none)` lets
-            // Foundation alias the staging buffer's pages into kernel
-            // space via vm_remap for "zero-copy" writes; under the
-            // worker-concurrency this code drives, that path raised
-            // the per-page reference count fast enough to trip the
-            // kernel's `cpt_mapcnt` limit and panic the host. A copy
-            // costs ~3 s of memcpy across 80 GB on M5 Max, which is
-            // the safety margin we pay to keep user buffers and
-            // kernel buffers in disjoint physical pages.
-            try outHandle.write(contentsOf: Data(buffer: batchBytes))
-            progressReporter?.advance(by: UInt64(batchBytes.count))
+            // PR #74: switch back to `Data(bytesNoCopy:..., deallocator:
+            // .none)` to drop the per-batch memcpy.
+            //
+            // The historical reason for `Data(buffer:)` (the copying
+            // form) was CLAUDE.md Rule 3.1's `cpt_mapcnt` panic: under
+            // the cached-write path, Foundation's vm_remap aliasing
+            // accumulated VM references on shared physical pages until
+            // the kernel's per-task refcount overflowed. PR #17 added
+            // the `Data(buffer:)` copy to dodge it.
+            //
+            // CLAUDE.md Rule 3.1 addendum (PR #71) documents that the
+            // panic is specifically the page-cache code path's
+            // optimisation. With `F_NOCACHE` on the writer FD (set a
+            // few lines up — Rule 3.2 / PR #17), writes bypass the
+            // page cache entirely; vm_remap doesn't fire; no
+            // accumulation. Under those conditions `bytesNoCopy` is
+            // safe, and PR #70 already leans on the same exemption
+            // for the ZIP `.stored` mmap-streaming path.
+            //
+            // Sample-trace evidence for the rewrite: 5 % of unpack
+            // wall on an 80 GB `.pvm.knit` was `Data.init(bytes:)` →
+            // `_platform_memmove` (the staged-buffer copy here).
+            // Eliminating it saves the same percentage of wall in
+            // exchange for a single inline closure tweak.
+            //
+            // `withExtendedLifetime` ensures the underlying staging
+            // buffer (owned by `HybridZstdBatchDecoder.decodeBatch`)
+            // stays alive through the write call. The sink contract
+            // already requires the caller not to retain `batchBytes`
+            // past return, so this is belt-and-braces against future
+            // refactors of the staging-buffer lifetime.
+            let count = batchBytes.count
+            if count > 0, let base = batchBytes.baseAddress {
+                let aliased = Data(
+                    bytesNoCopy: UnsafeMutableRawPointer(mutating: base),
+                    count: count,
+                    deallocator: .none
+                )
+                try outHandle.write(contentsOf: aliased)
+            }
+            withExtendedLifetime(batchBytes) {}
+            progressReporter?.advance(by: UInt64(count))
         }
 
         if stats.totalBytes != entry.uncompressedSize {
