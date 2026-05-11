@@ -91,6 +91,27 @@ if [[ -d "${APP_SRC}" ]]; then
     "${LSREG}" -f "${APP_DST}" >/dev/null 2>&1 || true
 fi
 
+# Install the double-clickable uninstaller alongside Knit.app. macOS's
+# .pkg system has no native uninstall mechanism, so the standard Mac
+# pattern (Adobe / Microsoft / others) is a discoverable
+# "Uninstall <App>.command" file in /Applications that runs the
+# removal script when the user double-clicks it. PR #53 adds this.
+UNINSTALL_CMD_SRC="${SCRIPT_DIR}/uninstall-command-template.sh"
+UNINSTALL_CMD_DST="/Applications/Uninstall Knit.command"
+# DMG layout ships the template at the root of the mounted volume
+# alongside Knit.app / bin / QuickActions — adjust the lookup so
+# either layout works.
+if [[ ! -f "${UNINSTALL_CMD_SRC}" && -f "${SCRIPT_DIR}/uninstall-command-template.sh" ]]; then
+    UNINSTALL_CMD_SRC="${SCRIPT_DIR}/uninstall-command-template.sh"
+fi
+if [[ -f "${UNINSTALL_CMD_SRC}" ]]; then
+    echo ">> Installing uninstaller to ${UNINSTALL_CMD_DST} (sudo)"
+    sudo install -m 0755 -o root -g wheel \
+        "${UNINSTALL_CMD_SRC}" "${UNINSTALL_CMD_DST}"
+else
+    echo "warning: uninstaller template not found at ${UNINSTALL_CMD_SRC} — skipping" >&2
+fi
+
 echo ">> Installing Quick Actions to ${QA_DST}"
 mkdir -p "${QA_DST}"
 

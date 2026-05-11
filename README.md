@@ -42,11 +42,25 @@ swift build -c release
 ./Scripts/install.sh        # asks for sudo password
 ```
 
-After running `install.sh`, right-click any file or folder in Finder to find these entries under **Quick Actions**:
+After running `install.sh`, right-click any file or folder in Finder to find these entries under **Services**:
 
 - **Knit Compress (ZIP)** — produces a standard `.zip` (extractable anywhere)
 - **Knit Compress (.knit)** — produces the internal high-speed `.knit` format
 - **Knit Extract** — auto-detects `.zip` or `.knit` and extracts
+
+### Uninstall
+
+macOS's `.pkg` system has no native uninstall mechanism (unlike Windows MSI), so the installer drops a double-clickable uninstaller alongside the app:
+
+```
+/Applications/Uninstall Knit.command
+```
+
+Double-click it in Finder — Terminal opens, summarises what will be removed, asks for confirmation, then runs the cleanup (admin password prompt during the sudo steps). After success the uninstaller deletes itself.
+
+> **Dragging `Knit.app` to the Trash is not enough.** It leaves behind the CLI binary at `/usr/local/bin/knit`, the right-click menu items in `/Library/Services/`, and the installer receipt. Always use the uninstaller.
+
+From a repo checkout, `./Scripts/uninstall.sh` is the equivalent for developers.
 
 ## CLI
 
