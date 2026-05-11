@@ -255,19 +255,52 @@ tell application "Terminal"
     -- \`do script\` without an \`in\` clause always opens a fresh window,
     -- so the front window right after the call is ours to close later.
     set theWindowID to id of front window
+
+    -- Stage 1: wait for the runner script (the foreground command) to
+    -- return. \`busy\` flips false the instant the foreground process
+    -- yields the prompt back to the outer zsh.
     repeat while busy of theTab
-        delay 0.5
+        delay 0.2
     end repeat
-    -- Brief grace period so the outer zsh's \`exit\` finishes processing
-    -- before we send the close request — otherwise Terminal still sees
-    -- the shell as a "running process" and prompts the user.
-    delay 0.3
-    repeat with w in windows
-        if id of w is theWindowID then
-            close w saving no
+
+    -- Stage 2: wait for the outer zsh's exit cleanup to finish. PR #56:
+    -- on macOS 26 Tahoe Terminal prompts more aggressively than older
+    -- releases about "kill running processes?" if any non-default
+    -- process is still listed in the tab's process table when close is
+    -- sent — including processes that are in the middle of their
+    -- shutdown sequence. Just waiting on \`busy\` and then a short
+    -- \`delay\` (the pre-fix approach) races against zsh's
+    -- "Saving session…" cleanup, and the close request lands before
+    -- the process table has drained. Polling \`processes of theTab\`
+    -- until it's empty closes the race.
+    --
+    -- Cap at 10 s (50 × 0.2) so a wedged shell can't hang the
+    -- AppleScript indefinitely; on timeout we close anyway and accept
+    -- the dialog as a rare fallback.
+    set drainIterations to 50
+    repeat drainIterations times
+        try
+            if (count of (processes of theTab)) is 0 then exit repeat
+        on error
+            -- The tab may have already vanished if the user's
+            -- Terminal profile is set to auto-close-on-exit.
             exit repeat
-        end if
+        end try
+        delay 0.2
     end repeat
+
+    -- Settling tick so Terminal commits the empty-process state to
+    -- whatever its close-confirmation logic reads.
+    delay 0.3
+
+    try
+        repeat with w in windows
+            if id of w is theWindowID then
+                close w saving no
+                exit repeat
+            end if
+        end repeat
+    end try
 end tell
 APPLESCRIPT
 } >/dev/null 2>&1 &
@@ -305,16 +338,34 @@ tell application "Terminal"
     activate
     set theTab to do script "\${RUNNER}; exit"
     set theWindowID to id of front window
+
+    -- See zip.sh's AppleScript above for the full rationale. Two-stage
+    -- wait: (1) \`busy\` flips false when the foreground runner
+    -- returns, (2) \`processes\` drains when the outer zsh has fully
+    -- exited. Closing in between stages races against zsh's exit
+    -- cleanup and triggers Terminal's "kill running processes?"
+    -- dialog on macOS 26 Tahoe (PR #56 fix).
     repeat while busy of theTab
-        delay 0.5
+        delay 0.2
+    end repeat
+    set drainIterations to 50
+    repeat drainIterations times
+        try
+            if (count of (processes of theTab)) is 0 then exit repeat
+        on error
+            exit repeat
+        end try
+        delay 0.2
     end repeat
     delay 0.3
-    repeat with w in windows
-        if id of w is theWindowID then
-            close w saving no
-            exit repeat
-        end if
-    end repeat
+    try
+        repeat with w in windows
+            if id of w is theWindowID then
+                close w saving no
+                exit repeat
+            end if
+        end repeat
+    end try
 end tell
 APPLESCRIPT
 } >/dev/null 2>&1 &
@@ -364,16 +415,34 @@ tell application "Terminal"
     activate
     set theTab to do script "\${RUNNER}; exit"
     set theWindowID to id of front window
+
+    -- See zip.sh's AppleScript above for the full rationale. Two-stage
+    -- wait: (1) \`busy\` flips false when the foreground runner
+    -- returns, (2) \`processes\` drains when the outer zsh has fully
+    -- exited. Closing in between stages races against zsh's exit
+    -- cleanup and triggers Terminal's "kill running processes?"
+    -- dialog on macOS 26 Tahoe (PR #56 fix).
     repeat while busy of theTab
-        delay 0.5
+        delay 0.2
+    end repeat
+    set drainIterations to 50
+    repeat drainIterations times
+        try
+            if (count of (processes of theTab)) is 0 then exit repeat
+        on error
+            exit repeat
+        end try
+        delay 0.2
     end repeat
     delay 0.3
-    repeat with w in windows
-        if id of w is theWindowID then
-            close w saving no
-            exit repeat
-        end if
-    end repeat
+    try
+        repeat with w in windows
+            if id of w is theWindowID then
+                close w saving no
+                exit repeat
+            end if
+        end repeat
+    end try
 end tell
 APPLESCRIPT
 } >/dev/null 2>&1 &
