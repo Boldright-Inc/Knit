@@ -254,6 +254,59 @@ public final class ZipCompressor: Sendable {
         return Data(bytes: base, count: buf.count)
     }
 
+    /// Threshold above which a `.stored` entry's payload keeps its
+    /// `MappedFile` alive through the write phase (PR #70's streaming
+    /// optimisation); below it, the entry's bytes are copied into a
+    /// fresh `Data` during `prepare()` and the `MappedFile` is
+    /// released as soon as that returns.
+    ///
+    /// **Why this exists — PR #80.** Pre-PR-#80 every `.stored` entry
+    /// (regardless of size) kept its `MappedFile` alive in
+    /// `PreparedEntry.payload`. For workloads where `prepare()` runs
+    /// in parallel via `concurrentMap` and produces many `.stored`
+    /// entries — `.git/objects/` is the canonical case: zlib-deflated
+    /// objects classify as incompressible by the entropy probe and
+    /// fall to `.stored` — every prepared entry holds an open file
+    /// descriptor. The macOS default `RLIMIT_NOFILE` soft limit is
+    /// 256; a git repo with ~50 k objects blew past that and the
+    /// user saw "open failed: Too many open files" mid-pack.
+    ///
+    /// PR #70's streaming benefit applies only at sizes large enough
+    /// that the alternative — `Data(bytes:count:)` — would invoke
+    /// `vm_copy` for an 80 GB single-file VM image. For sub-threshold
+    /// entries the copy is a plain memcpy at memory bandwidth (sub-ms
+    /// for a few-MiB file) and the FD-release-on-`prepare`-return
+    /// keeps peak open-FD count bounded by `concurrency`, not by
+    /// total entry count.
+    ///
+    /// 4 MiB picked as: well below the page-cache pivot where
+    /// `Data(bytes:count:)` switches from memcpy to vm_copy on
+    /// Apple's allocator (~16 MiB on M-series), and well above the
+    /// typical small-file workload (git objects, source files, photo
+    /// thumbnails: 99 %+ smaller). Files between 4 MiB and ~80 GB
+    /// stay on the streaming path.
+    fileprivate static let storedStreamingThreshold: Int = 4 * 1024 * 1024
+}
+
+extension ZipCompressor {
+    /// Build a `.stored` payload, picking between
+    /// `.mapped(MappedFile)` (streams from the open fd at write time —
+    /// PR #70 optimisation for huge inputs) and `.data(Data)` (copies
+    /// bytes now, releases the fd when `prepare()` returns — PR #80
+    /// FD-conservation for many-small-file workloads). The threshold
+    /// is `storedStreamingThreshold`. See its doc-block for the
+    /// rationale.
+    fileprivate static func storedPayload(
+        mapped: MappedFile,
+        buf: UnsafeBufferPointer<UInt8>
+    ) -> ZipWriter.Payload {
+        if buf.count >= storedStreamingThreshold {
+            return .mapped(mapped)
+        } else {
+            return .data(dataFromBuffer(buf))
+        }
+    }
+
     private func prepare(entry: FileEntry,
                          probeOnProgress: (@Sendable (UInt64) -> Void)?,
                          codecOnProgress: (@Sendable (UInt64) -> Void)?) throws -> PreparedEntry {
@@ -298,13 +351,16 @@ public final class ZipCompressor: Sendable {
             // skipped AND the probe doesn't run for this branch. PR
             // #71: the writer is the only phase that contributes to
             // this entry's progress budget, so `.full` advance rate.
-            // PR #70 streams from mmap (no Data copy).
+            // PR #70 streams from mmap (no Data copy) for files large
+            // enough to benefit; PR #80 falls back to a copy for
+            // small files so the MappedFile (= open fd) doesn't
+            // outlive `prepare()`. See `storedStreamingThreshold`.
             return PreparedEntry(
                 descriptor: descriptor,
                 method: .stored,
                 crc: crcVal,
                 uncompressedSize: UInt64(buf.count),
-                payload: .mapped(mapped),
+                payload: Self.storedPayload(mapped: mapped, buf: buf),
                 payloadByteCount: UInt64(buf.count),
                 writeAdvanceRate: .full
             )
@@ -344,13 +400,16 @@ public final class ZipCompressor: Sendable {
                                disposition: .stored)
             // Entropy-driven .stored: backend skipped. Probe advanced
             // half the budget (PR #71); writer advances the other half.
-            // PR #70 streams from mmap, so no 80 GB Data copy.
+            // PR #70 streams from mmap (huge-file optimisation), PR
+            // #80 copies small `.stored` payloads instead to release
+            // the MappedFile's fd at `prepare()` return — see
+            // `storedPayload` for the size split.
             return PreparedEntry(
                 descriptor: descriptor,
                 method: .stored,
                 crc: crcVal,
                 uncompressedSize: UInt64(buf.count),
-                payload: .mapped(mapped),
+                payload: Self.storedPayload(mapped: mapped, buf: buf),
                 payloadByteCount: UInt64(buf.count),
                 writeAdvanceRate: .half
             )
@@ -379,7 +438,9 @@ public final class ZipCompressor: Sendable {
         // If compression made it larger, store uncompressed instead
         // (ZIP spec encourages this). Probe + codec together have
         // already accounted for `buf.count`, so write must NOT advance.
-        // PR #70 streams from mmap.
+        // PR #70 streams from mmap; PR #80's `storedPayload` falls
+        // back to a copy for small `.stored` entries so the
+        // MappedFile fd doesn't outlive `prepare()`.
         if compressed.count >= buf.count {
             recordEntryHeatmap(probe: probeResults,
                                originalBytes: buf.count,
@@ -390,7 +451,7 @@ public final class ZipCompressor: Sendable {
                 method: .stored,
                 crc: crcVal,
                 uncompressedSize: UInt64(buf.count),
-                payload: .mapped(mapped),
+                payload: Self.storedPayload(mapped: mapped, buf: buf),
                 payloadByteCount: UInt64(buf.count),
                 writeAdvanceRate: .none
             )
