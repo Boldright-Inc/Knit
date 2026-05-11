@@ -87,6 +87,177 @@ Codec libraries:
 
 ---
 
+## Knit.app launcher (GUI front-end)
+
+A separate AppKit launcher process living under `Sources/KnitApp/`.
+Built via `Scripts/build-app.sh` (swiftc directly) — **kept out of
+`Package.swift`** so `KnitCore` doesn't gain an AppKit dependency.
+Used by Finder Quick Actions and `.knit` / `.zip` double-click to
+provide a native progress UI without opening Terminal.
+
+```
+                       Finder Quick Action (right-click)
+                                    │
+              exec /usr/bin/open -n -a Knit.app --args
+                       --operation pack --inputs "$@"
+                                    │
+                                    ▼
+                     ┌──────────────────────────┐
+                     │        Knit.app          │  one instance per
+                     │  AppDelegate.main.swift  │  --args invocation
+                     │  parseQuickActionArgs    │  (`-n` flag)
+                     └─────────────┬────────────┘
+                                   │
+                ┌──────────────────┼─────────────────┐
+                ▼                  ▼                 ▼
+        NSProgress          ProgressWindow   OperationCoordinator
+        .publish()          (custom NSPanel)         │
+        (system widget +    guaranteed               │  serial subprocess
+        Finder file-icon    visible)                 │  via pendingRuns
+        overlay; best-                               ▼
+        effort)                              ┌────────────────────┐
+                                             │ knit CLI subprocess│
+                                             │ --progress-json    │
+                                             │ (one at a time)    │
+                                             └────────────────────┘
+```
+
+**Invariants — preserve these or break the UX (added during PR #58):**
+
+1. **Activation policy `.regular`, no `LSUIElement` in Info.plist.**
+   macOS only renders system NSProgress widgets + Finder file-icon
+   overlays for regular foreground apps (Archive Utility / Safari /
+   Mail all behave this way). Trade-off: brief Dock icon flash while
+   an operation runs — matches Apple's own utilities and is the
+   explicit design choice. Reverting to `.accessory` or adding back
+   `LSUIElement` silences both system UI surfaces.
+
+2. **Subprocesses run serially**, via `OperationCoordinator.pendingRuns`
+   drained one-at-a-time by `launchNextIfNeeded()`. **Reverting to a
+   parallel `for`-loop fan-out crashed the host Mac during PR #58
+   smoke testing** on a multi-file Quick Action selection — ~500
+   concurrent `knit` processes × ~64 MiB working set each → memory
+   exhaustion → kernel panic. The CLI internally saturates all cores
+   via its worker pool; outer parallelism delivers zero throughput
+   win for the risk it carries. Doc-block on the field captures this
+   so a future "let's parallelise for speed" PR doesn't regress it.
+
+3. **Two UI surfaces, belt-and-braces.** `NSProgress.publish()` is
+   best-effort — Finder can ignore it depending on state.
+   `ProgressWindow` (custom `.hudWindow` NSPanel, bottom-right of
+   screen) is always visible the moment `start()` runs. Don't remove
+   either surface.
+
+4. **`application(_:openFiles:)` early-returns when `--operation` is
+   in argv.** macOS Tahoe (26) calls openFiles with every `--args`
+   string whose syntax could pass as a path — including the literal
+   words `pack` and `unpack`. Without the guard, every Quick Action
+   invocation fires a spurious `extractArchive` on the flag names
+   (verified at PR #58 crash time: the progress widget showed
+   `Extracting "unpack"`). The guard also calls
+   `NSApp.reply(toOpenOrPrint: .success)` so LaunchServices doesn't
+   log unanswered-request warnings.
+
+5. **`parseQuickActionArgs` caps `--inputs` at 256** with an stderr
+   error + nil return. Defense in depth — `"$@"` from a Finder
+   selection expands to every selected file, so a careless right-
+   click on 1000 files could yield 1000 input URLs. The cap bounds
+   blast radius even if invariant 2 ever regresses.
+
+6. **CLI-missing alert is deferred via `DispatchQueue.main.async`.**
+   `alert.runModal()` called synchronously from
+   `applicationDidFinishLaunching` returns immediately when the run
+   loop isn't yet modal-eligible (e.g. backgrounded direct-binary
+   launch). The previous behaviour was a silent <1 s exit — no
+   alert, no stderr, no output. Now deferred to the next run-loop
+   tick + unconditional stderr write so terminal users see the
+   failure reason.
+
+**CLI ↔ Knit.app IPC** — `--progress-json` (private-visibility flag
+on every pack/zip/unpack subcommand) emits ndjson on stderr:
+
+```
+{"phase":"pack","processed":N,"total":M,"etaSeconds":N|null,"done":bool}\n
+```
+
+`NDJSONLineParser` in `OperationCoordinator` parses these and drives
+both `NSProgress.completedUnitCount` and `ProgressWindow.update(...)`.
+The human-facing `--progress` text bar (CLI default when stderr is a
+TTY, Rule 6.3) is untouched — `--progress-json` is a sibling output
+mode for the GUI consumer.
+
+**Quick Action workflows** (`Scripts/build-quick-actions.sh`) — each
+`.workflow` bundle is a 4-line shell snippet:
+
+```bash
+exec /usr/bin/open -n -a /Applications/Knit.app --args \
+    --operation pack --level 3 --inputs "$@"
+```
+
+`-n` forces a fresh Knit.app per invocation. Without it `open`
+reuses an existing instance and silently drops new `--args`,
+breaking concurrent operations. Trade-off: brief multi-Dock-icon if
+the user fires concurrent Quick Actions — acceptable for the
+correctness guarantee `-n` buys.
+
+**ProgressWindow icon** (`Sources/KnitApp/ProgressWindow.swift`,
+PR #59) — for the compressing verb, prefers the **output format's**
+icon (bundled `KnitDocument.icns` for `.knit`, `UTType` lookup for
+`.zip`) over the source file's icon. The bundled-resource path for
+`.knit` is necessary because Launch Services may not have registered
+our exported `co.boldright.knit.archive` UTI for a locally-built
+Knit.app, so the system lookup would silently return a generic doc
+icon. Extracting verb still uses the source archive icon (matches
+what the user clicked on in Finder).
+
+---
+
+## Distribution / signing (`Scripts/build-pkg.sh`)
+
+For `.pkg` files to install without Gatekeeper rejection on user
+Macs, three env vars must be set when running `build-pkg.sh`:
+
+```sh
+export APP_ID="Developer ID Application: <Org> (TEAMID)"
+export INSTALLER_ID="Developer ID Installer: <Org> (TEAMID)"
+export NOTARY_PROFILE="knit-notary"   # xcrun notarytool store-credentials
+./Scripts/build-pkg.sh
+```
+
+The script gates each of `codesign` / `productsign` / `notarytool
+submit + stapler staple` on these vars individually — any missing
+var skips its step and logs e.g. `"APP_ID not set — skipping
+codesign (PKG will install but Gatekeeper will prompt)"`. On macOS
+14 (Sonoma) and especially macOS 26 (Tahoe), an unsigned or
+unnotarized `.pkg` is rejected with the "Apple は…検証できません
+でした。ゴミ箱に入れる / 完了" dialog — the user cannot proceed.
+
+**Developer ID signing alone is no longer sufficient.** The notary
+submission (Apple-side malware scan) + ticket staple are both
+required. Common misconception: "I'm enrolled in the Apple
+Developer Program, so my pkg is trusted" — Apple's Gatekeeper does
+not look at developer enrollment; it looks at whether the artifact
+has been seen by the notary service.
+
+Post-build verification:
+
+```sh
+pkgutil --check-signature dist/Knit-Installer.pkg
+# expect: signed by a developer certificate issued by Apple for distribution
+xcrun stapler validate dist/Knit-Installer.pkg
+# expect: The validate action worked!
+spctl --assess --type install --verbose dist/Knit-Installer.pkg
+# expect: accepted
+```
+
+All three must succeed for distribution. `docs/SIGNING.md` covers
+keychain setup for the `NOTARY_PROFILE` entry and the app-specific
+password (different from the Apple ID password — generated at
+`appleid.apple.com` → Sign-In and Security → App-Specific
+Passwords).
+
+---
+
 ## Implementation rules
 
 ### 1. Swift 6 strict-concurrency
@@ -697,6 +868,22 @@ no-go data, one CI safety net + one correctness fix landed.
 | #43 | feat(unpack): Phase 1b.0 spike — zstd literal-section classifier | CPU-only RFC 8478 walker (`ZstdLiteralClassifier`) wired into `HybridZstdBatchDecoder.parallelDecodeBlocks` worker. Sibling `LiteralTypeAnalytics` accumulator with the same 32-shard pattern as `StageAnalytics`. Renders distribution + PASS/FAIL gate after `unpack --analyze`. **Result: both real corpora FAILED the ≥70 % `Compressed_4Stream` gate** — VM at 18.09 %, github-like at 49.22 %. Phase 1b kernel work retired (see "Investigated, no-go" below) |
 | #44 | ci: add release-mode build on `macos-15` | Single-job workflow: `swift build -c release` on every push to `main` and PR. Documented reason: PRs #26 and #28 both broke `package-dmg.sh` because debug builds don't run strict-concurrency to completion. `swift test` is gated on the FileWalker fix below + a tiny follow-up PR to wire the job |
 | #45 | fix(filewalker): use `realpath(3)` so firmlinks resolve consistently on macOS 26 | Real correctness regression discovered during CI workflow validation. macOS 26 Tahoe stopped resolving `/tmp` → `/private/tmp` in `URL.resolvingSymlinksInPath()`, but `FileManager.enumerator` still resolves them — mismatch breaks `FileWalker.enumerate`'s prefix-strip arithmetic, producing archives with mangled entry names (e.g. `src/foo/src/file_0.bin` instead of `src/file_0.bin`) for any input under `/tmp` or `/var/folders/...`. Real-world `/Users/...` paths were unaffected, which is why the bug shipped silently. Fix: use Darwin's `realpath(3)` instead of `URL.resolvingSymlinksInPath()`. Companion: same firmlink-mismatch existed in two test helpers, fixed in the same PR |
+
+## Recent landed work (PRs #46–#59)
+
+The post-#45 narrative is GUI / installer / distribution work, not
+codec perf. The project mandate ("push pack/unpack to I/O ceiling")
+was effectively met after PR #41; this block records the UX-side
+stream that shipped while the codec backlog was idle for new
+motivating data. New architectural shape: **Knit.app launcher**
+(see top of this file) added in #57, then hardened in #58/#59.
+
+| PR | Title | What it taught / what landed |
+|---|---|---|
+| #46–#56 | UX + installer stream | Installer `.pkg` + uninstaller flow (no native macOS uninstall; ship `Uninstall Knit.command` alongside the app per PR #53), English translations of installer pages, ZIP-side progress, terminate-dialog suppression, base-silicon threshold retuning (Rule 4.4 was distilled from this stream). Per-PR detail in `gh pr list --state merged` |
+| #57 | feat(ux): native NSProgress UI for Quick Actions | Replaced the Terminal-window progress flow with a published `NSProgress` + ndjson IPC. Added the hidden `--progress-json` flag (`.private` visibility) on pack / zip / unpack CLI subcommands. Knit.app drives the CLI as a `Process` subprocess. CLI behaviour for terminal-only users unchanged — `--progress` text bar still default on TTY (Rule 6.3) |
+| #58 | fix(knit-app): visible progress UI + bounded subprocess execution | Post-#57 hotfix surfacing two compounding bugs. (a) `LSUIElement` + `.accessory` activation silenced both system NSProgress and Finder file-icon overlay — `setActivationPolicy(.regular)` + remove LSUIElement, plus add custom `ProgressWindow` NSPanel as guaranteed-visible fallback. (b) `OperationCoordinator.start()`'s `for`-loop spawned one knit subprocess per input synchronously; combined with macOS Tahoe's openFiles double-fire (filenames included the literal flag strings "pack"/"unpack"), a single Quick Action fanned out to dozens of stuck Knit.app + ~120 knit subprocesses, crashing the host. Fix: `pendingRuns` serial queue, openFiles `--operation` guard, alert deferral via `DispatchQueue.main.async`, 256-input cap. **See "Knit.app launcher" architecture invariants** at top of this file for the constraints to preserve |
+| #59 | fix(ux): ProgressWindow shows output-format icon when compressing | User-reported: the panel showed the source file's icon (PVM disk image, PNG, etc.) when compressing to `.knit`. Switched to load bundled `KnitDocument.icns` directly for `.knit` output, `UTType` lookup for `.zip` and other system-known types. Bundled-resource path is required because Launch Services may not have registered our exported `co.boldright.knit.archive` UTI for a locally-built Knit.app — system lookup would silently return a generic doc icon |
 
 ## Current bench reference (M5 Max 18-core, post-PR-#45, 2026-05-10)
 
