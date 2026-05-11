@@ -179,6 +179,16 @@ public final class KnitReader: @unchecked Sendable {
             if !POSIXFile.mkdirParents(outPath) {
                 throw KnitError.ioFailure(path: outPath, message: "could not create directory")
             }
+            // PR #82: apply the archive's stored unixMode to the
+            // directory we just created. `mkdir(2)` itself respects
+            // the process umask, so calling `chmod(2)` afterwards
+            // is the way to land the exact mode bits the archive
+            // recorded. Pre-PR-#82 the legacy `FileManager.createDirectory`
+            // path silently ignored `entry.unixMode` and let umask
+            // pick — a round-trip drift for directories with
+            // non-default modes (e.g. APFS-stored `0o700`
+            // user-private dirs unpacking as `0o755`).
+            _ = outPath.withCString { chmod($0, mode_t(entry.unixMode)) }
             return
         }
 
@@ -195,7 +205,18 @@ public final class KnitReader: @unchecked Sendable {
                 _ = POSIXFile.mkdirParents(parentPath)
             }
         }
-        let outHandle = try POSIXFile.openForWriting(outPath)
+        // PR #82: apply the archive's stored unixMode at open
+        // time so the file lands with the original bits.
+        // Pre-PR-#82 the legacy `FileManager.createFile` path
+        // ignored `entry.unixMode` and used umask defaults —
+        // a Parallels VM's `0o600` (private) image would unpack
+        // as `0o644` (world-readable), a quiet security
+        // round-trip regression. `O_CREAT`'s `mode_t` argument
+        // is masked through umask, so we also call `chmod(2)`
+        // afterwards to land the literal recorded bits.
+        let outHandle = try POSIXFile.openForWriting(outPath,
+                                                      mode: mode_t(entry.unixMode))
+        _ = outPath.withCString { chmod($0, mode_t(entry.unixMode)) }
         defer { try? outHandle.close() }
 
         // Opt-in staged path: build (frame, uncompressedSize) per block
