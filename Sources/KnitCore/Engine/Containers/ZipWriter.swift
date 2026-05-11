@@ -69,12 +69,24 @@ public final class ZipWriter {
     /// Write a stored (uncompressed) or precompressed entry. The caller
     /// must have already produced the compressed bytes (or chosen `.stored`
     /// in which case `payload` is the raw data).
+    ///
+    /// `onProgress` fires repeatedly during the payload write — once per
+    /// `~8 MiB` chunk for large payloads, or once at completion for small
+    /// ones. The bytes reported are payload bytes actually written to the
+    /// FileHandle, summing to `payload.count` over the call. Callers that
+    /// don't want progress reporting can pass `nil` (or omit the arg) and
+    /// the writer falls back to a single `handle.write(contentsOf:)`. PR
+    /// #65: motivates the chunked path — a multi-gigabyte `.stored` entry
+    /// (e.g. a Parallels VM image inside a ZIP) used to drain to disk
+    /// silently while the progress bar sat at 100%; chunked progress lets
+    /// the bar tick smoothly through the write phase.
     public func writeEntry(
         descriptor: EntryDescriptor,
         method: CompressionMethod,
         crc32: UInt32,
         uncompressedSize: UInt64,
-        payload: Data
+        payload: Data,
+        onProgress: (@Sendable (UInt64) -> Void)? = nil
     ) throws {
         precondition(!closed, "writeEntry on closed ZipWriter")
 
@@ -123,7 +135,7 @@ public final class ZipWriter {
         }
 
         try writeRaw(lfh)
-        try writeRaw(payload)
+        try writeRawChunked(payload, onProgress: onProgress)
 
         entries.append(EntryResult(
             descriptor: descriptor,
@@ -167,6 +179,38 @@ public final class ZipWriter {
     private func writeRaw(_ data: Data) throws {
         try handle.write(contentsOf: data)
         currentOffset += UInt64(data.count)
+    }
+
+    /// Chunked variant of `writeRaw` that fires `onProgress` after each
+    /// `chunkSize` bytes have been written to disk. Used by `writeEntry`
+    /// for the payload write (PR #65) so the progress bar ticks during
+    /// the serial write phase of a ZIP build, instead of sitting at 100 %
+    /// while a multi-gigabyte payload drains to NVMe.
+    ///
+    /// 8 MiB is a deliberate trade-off: small enough that a ~5 GB/s SSD
+    /// fires `onProgress` ~600 times/sec (smooth bar), large enough that
+    /// per-write syscall overhead stays negligible vs. the ~50 µs base
+    /// per-`write(2)` cost on APFS.
+    private func writeRawChunked(_ data: Data,
+                                  onProgress: (@Sendable (UInt64) -> Void)?) throws {
+        let chunkSize = 8 * 1024 * 1024
+        // Fast path: no progress wanted or small payload — single write.
+        if onProgress == nil || data.count <= chunkSize {
+            try handle.write(contentsOf: data)
+            currentOffset += UInt64(data.count)
+            onProgress?(UInt64(data.count))
+            return
+        }
+        var offset = 0
+        while offset < data.count {
+            let end = min(offset + chunkSize, data.count)
+            let chunk = data[offset..<end]
+            try handle.write(contentsOf: chunk)
+            let written = UInt64(end - offset)
+            currentOffset += written
+            onProgress?(written)
+            offset = end
+        }
     }
 
     private func makeCentralDirectoryHeader(_ entry: EntryResult) -> Data {
