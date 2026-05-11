@@ -20,8 +20,8 @@ Right-click integration is included: installing Knit adds three Finder Quick Act
 - **Single-file parallelism** via zlib `Z_SYNC_FLUSH` stitching — one logical DEFLATE stream, full multi-core utilization
 - **Hybrid CPU + GPU pipeline** — Metal handles CRC32, entropy pre-screening, and extract-time verification; libdeflate / libzstd handle the codec itself
 - **Compressibility heatmap** — after every `--heatmap` run, Knit renders an entropy-coloured grid of every block in the archive (also exportable as PNG-style PPM)
-- **Finder right-click integration** through macOS Quick Actions
-- **Distribution-ready** — Developer ID code signing and Apple notarization wired into the packaging script
+- **Finder right-click integration** with a **native macOS progress panel** — Quick Actions delegate to a small AppKit launcher (`Knit.app`) that surfaces an `NSProgress` (system progress widget + file-icon overlay) while the CLI runs as a subprocess. No Terminal popup, no flashing window.
+- **Distribution-ready** — Developer ID code signing and Apple notarization wired into the packaging script (`Scripts/build-pkg.sh`). All three of signing, notary submission, and ticket stapling are required for Gatekeeper to accept the `.pkg` — set `APP_ID` / `INSTALLER_ID` / `NOTARY_PROFILE` env vars before running the script
 
 ## Requirements
 
@@ -31,6 +31,8 @@ Right-click integration is included: installing Knit adds three Finder Quick Act
 
 ## Build & Install
 
+### From source (developers)
+
 ```bash
 # Fetch vendored sources (libdeflate / zstd)
 ./Scripts/fetch-vendor.sh
@@ -38,15 +40,41 @@ Right-click integration is included: installing Knit adds three Finder Quick Act
 # Release build
 swift build -c release
 
-# Install Finder right-click menu items + /usr/local/bin/knit
+# Install Finder right-click menu items + /usr/local/bin/knit + Knit.app
 ./Scripts/install.sh        # asks for sudo password
 ```
 
-After running `install.sh`, right-click any file or folder in Finder to find these entries under **Services**:
+`install.sh` builds the CLI, the `Knit.app` launcher (via `build-app.sh`), and the three Quick Action workflows (via `build-quick-actions.sh`), then copies them into `/Applications/`, `/usr/local/bin/`, and `/Library/Services/` respectively.
+
+### Distributable `.pkg` (end users)
+
+```bash
+# Build a Gatekeeper-ready installer .pkg (signed + notarized)
+export APP_ID="Developer ID Application: <Org> (TEAMID)"
+export INSTALLER_ID="Developer ID Installer: <Org> (TEAMID)"
+export NOTARY_PROFILE="knit-notary"   # set up via `xcrun notarytool store-credentials`
+./Scripts/build-pkg.sh                # → dist/Knit-Installer.pkg
+```
+
+Without those env vars the script emits an **unsigned** `.pkg` that macOS 14+ (especially macOS 26 Tahoe) rejects with the "Apple は…検証できませんでした" dialog at install time. Enrolment in the Apple Developer Program is necessary but not sufficient — the notary submission + ticket staple are both required. Verify with:
+
+```bash
+pkgutil --check-signature dist/Knit-Installer.pkg
+xcrun stapler validate dist/Knit-Installer.pkg
+spctl --assess --type install --verbose dist/Knit-Installer.pkg
+```
+
+All three must succeed before redistributing.
+
+### Using the Quick Actions
+
+After install (either path), right-click any file or folder in Finder to find these entries under **Services** (or **Quick Actions** on newer macOS):
 
 - **Knit Compress (ZIP)** — produces a standard `.zip` (extractable anywhere)
 - **Knit Compress (.knit)** — produces the internal high-speed `.knit` format
 - **Knit Extract** — auto-detects `.zip` or `.knit` and extracts
+
+Each invocation launches a short-lived `Knit.app` instance that drives the `knit` CLI as a subprocess and surfaces native progress through `NSProgress` plus a custom floating panel. Multi-file selections are processed **serially** (one subprocess at a time per `Knit.app`) — the CLI internally saturates all cores, so outer parallelism would only waste memory.
 
 ### Uninstall
 
@@ -166,6 +194,7 @@ Reproduce with `./Scripts/bench.sh [size_mb=1024]`.
 - **Metal compute** — `crc32_per_slice` for extract-side integrity, `byte_histogram` for compressibility analysis; both are runtime-compiled and dispatched through a single shared `MetalContext`
 - **Pipelined GPU dispatch** — the entropy probe and (extract-side) CRC are kicked off on `DispatchQueue.global` *before* the worker fan-out, so the GPU compute overlaps with the CPU codec instead of stacking on top of it
 - **Sharded analytics** — `StageAnalytics` / `LiteralTypeAnalytics` use 32 lock-striped shards (Knuth-multiplicative hash on `Thread.current`) so per-block instrumentation doesn't contend across 16 worker threads
+- **`Knit.app` AppKit launcher** — small foreground GUI process that fronts the Finder Quick Actions. Launches the `knit` CLI as a subprocess, parses its `--progress-json` ndjson stream, and drives both a published `NSProgress` (system widget + Finder file-icon overlay) and a custom `ProgressWindow` NSPanel (guaranteed-visible fallback). Subprocesses run **serially** — one knit invocation at a time per Knit.app — because the CLI already saturates all cores internally. Built outside `Package.swift` via `Scripts/build-app.sh` to keep `KnitCore` free of AppKit dependency
 
 ```
 Sources/
@@ -182,6 +211,12 @@ Sources/
       Visualization/  CompressibilityHeatmap, HeatmapRenderer
       Progress/       ProgressReporter
   KnitCLI/           command-line entry point (`knit pack`, `unpack`, `zip`, …)
+                     hidden `--progress-json` flag emits ndjson for Knit.app IPC
+  KnitApp/           AppKit launcher for Finder Quick Actions
+                     main.swift (AppDelegate, arg parsing, openFiles guard)
+                     OperationCoordinator (serial subprocess execution via
+                       pendingRuns queue, NSProgress publication, ndjson parser)
+                     ProgressWindow (custom .hudWindow NSPanel)
   CDeflate/          libdeflate (vendored)
   CZstd/             zstd (vendored)
   CZlibBridge/       thin C bridge to system zlib (Z_SYNC_FLUSH)
@@ -190,8 +225,11 @@ Scripts/
   fetch-vendor.sh         pull libdeflate / zstd sources
   bench.sh                synthetic-corpus benchmark harness (random/repeating/mixed)
   bench-corpora.sh        real-corpus --analyze runner (defaults to Tests/TestData/)
-  build-quick-actions.sh  generate Finder Quick Actions
-  install.sh              local install
+  build-app.sh            compile Knit.app launcher (swiftc, out of Package.swift)
+  build-quick-actions.sh  generate Finder Quick Actions (each .workflow delegates
+                            to Knit.app via `open -n -a` for fresh-instance launch)
+  build-pkg.sh            distributable installer .pkg (sign + notarize + staple)
+  install.sh              local install (CLI + Knit.app + Quick Actions)
   package-dmg.sh          DMG build + sign + notarize
 
 .github/workflows/
