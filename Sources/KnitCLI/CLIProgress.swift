@@ -92,9 +92,21 @@ enum CLIProgress {
     }
 
     /// Background printer that renders one progress line to stderr at
-    /// ~500 ms cadence. Uses `\r` to overwrite the previous line; emits
+    /// ~200 ms cadence. Uses `\r` to overwrite the previous line; emits
     /// a final newline on `waitUntilFlushed()` so subsequent stdout
     /// from the CLI doesn't visually merge with the bar.
+    ///
+    /// **Cadence note**: the default was 0.5 s through PR #54, which
+    /// matched pigz / dd-style CLIs but missed sub-second operations
+    /// entirely (only the 0% and 100% snapshots fired). The user
+    /// reported "圧縮中なのかどうかわかりません" on Quick Action zips
+    /// — fast operations completing in 0.3–1.0 s are exactly where
+    /// base-Apple-Silicon (M1 / M2 base) users land for typical
+    /// inputs. 0.2 s yields 1.5–5 intermediate ticks for those
+    /// operations, which reads as "the bar is moving" instead of
+    /// dead air. The terminal escape-sequence churn from 5 renders/s
+    /// is invisible in practice. PR #55 set this; CLAUDE.md Rule 4.4
+    /// explains the broader hardware-target reasoning.
     ///
     /// `@unchecked Sendable` because all mutable state
     /// (`threadDidExit`) is guarded by `doneCondition`; `thread` and
@@ -107,7 +119,7 @@ enum CLIProgress {
         private let doneCondition = NSCondition()
         private var threadDidExit = false
 
-        init(reporter: ProgressReporter, interval: TimeInterval = 0.5) {
+        init(reporter: ProgressReporter, interval: TimeInterval = 0.2) {
             self.reporter = reporter
             self.interval = interval
         }

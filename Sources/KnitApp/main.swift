@@ -11,16 +11,27 @@
 
 import AppKit
 
-// 100 MiB. Inputs at or above this size open a Terminal window so the
-// user sees `knit unpack --progress`; smaller inputs extract silently
-// in the background with no notification. The threshold is intentionally
-// generous — on M5 Max a 100 MiB archive extracts in ~0.05 s and the
-// Terminal window's own appearance animation takes longer than that.
-// On slower Apple Silicon hardware (base M1 / M2, ~1.5 GB/s SSDs) it
-// approaches 0.2 s, still under the "noticeable enough to want a
-// progress bar" line. PR #50 set this value to match the matching
-// threshold inside `Scripts/build-quick-actions.sh`.
-private let kTerminalSizeThresholdBytes: UInt64 = 100 * 1024 * 1024
+// 30 MiB. Archives at or above this size open a Terminal window so
+// the user sees `knit unpack --progress`; smaller archives extract
+// silently in the background with no notification.
+//
+// The design target is **base Apple Silicon** (M1 / M2 base models,
+// ~1.5 GB/s SSDs, 4 performance cores) — not the M5 Max this code
+// is being written on. On base hardware a 30 MiB archive takes
+// ~0.5–2 s to extract depending on entry shape (one big file vs.
+// many small files vs. SSD-write-bound layouts). That's the size at
+// which a base-Mac user starts to want "is it doing something?"
+// feedback. On M5 Max the same archive extracts in ~50 ms — the
+// Terminal window briefly flashes but doesn't linger, a tolerable
+// cost to give base-hardware users the UX they need.
+//
+// The earlier 100 MiB value (PR #50) was M5 Max-tuned and produced
+// no-feedback dead air for base-Mac extractions; PR #55 lowered it
+// to 30 MiB to match the Quick Action build script. Both files
+// reference each other so a future change should keep them in sync.
+// See CLAUDE.md Rule 4.4 for the broader "design for base Apple
+// Silicon" rule.
+private let kTerminalSizeThresholdBytes: UInt64 = 30 * 1024 * 1024
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingExtractions = 0

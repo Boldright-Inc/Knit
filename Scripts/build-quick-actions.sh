@@ -161,17 +161,27 @@ trap 'rm -rf "${TMP}"' EXIT
 #       The existing osascript path opens Terminal.app, runs knit with
 #       --progress, auto-closes the window when the runner finishes.
 #
-# Threshold: 100 MiB. On M5 Max this is ~0.02 s of pack work and
-# ~0.05 s of unpack work — well under the "noticeable enough to want
-# feedback" line. Below the threshold the operation is over before
-# Terminal would have finished animating its window in. On lower-tier
-# Apple Silicon (base M1 / M2 with slower SSDs ≈ 1.5 GB/s) 100 MiB
-# is closer to 0.1–0.2 s — still imperceptible.
+# Threshold: 30 MiB. The design target is **base Apple Silicon**
+# (M1 / M2 base models, ~1.5 GB/s SSDs, 4 performance cores), not
+# this M5 Max dev machine. On base hardware:
 #
-# Larger values shift more operations to silent. 100 MiB is the
-# user-preferred value (PR #50 spec).
+#   pack of 30 MiB compressible content   ≈ 0.5 – 1.0 s
+#   pack of 30 MiB tiny-files folder      ≈ 1 – 3 s (FS overhead)
+#   unpack of a 30 MiB .knit              ≈ 0.5 – 2 s
+#
+# i.e. 30 MiB is the size at which a *base Mac user* starts to want
+# "is it doing something?" feedback. On M5 Max the same byte count
+# is sub-100 ms — the Terminal window briefly flashes but doesn't
+# linger, which is a tolerable cost to give base-hardware users the
+# UX they need. The earlier 100 MiB value (PR #50) was tuned for
+# M5 Max-style hardware and produced no-feedback dead air on slower
+# Macs — fixed in PR #55.
+#
+# Larger values shift more operations to silent. 30 MiB is the
+# documented "design for the slowest realistic Apple Silicon"
+# baseline (CLAUDE.md Rule 4.4).
 SHARED_PRELUDE='
-SIZE_THRESHOLD_BYTES=$((100 * 1024 * 1024))
+SIZE_THRESHOLD_BYTES=$((30 * 1024 * 1024))
 
 input_total_bytes() {
     # Sum the size of every regular file under each argument. Handles
