@@ -38,6 +38,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     private var openFileEverFired = false
 
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        // PR #58 bug: macOS Tahoe was found to ALSO call openFiles with
+        // every string in `--args` whose syntax could pass as a path —
+        // including the literal words "pack" and "unpack" plus the
+        // selected file. That caused a single Quick Action invocation
+        // to fire one packToKnit (via parseQuickActionArgs in
+        // didFinishLaunching) PLUS three extractArchive subprocesses,
+        // producing four parallel knit invocations and confusing
+        // pretty much everything downstream.
+        //
+        // The contract here: if ProcessInfo's argv contains
+        // `--operation`, the user is invoking us via Quick Action, and
+        // openFiles is spurious. Drop it. The Quick Action path
+        // through didFinishLaunching is authoritative.
+        if ProcessInfo.processInfo.arguments.contains("--operation") {
+            // Tell LaunchServices we acknowledged the request — without
+            // this it considers the open request unanswered and may
+            // log warnings. We discard the filenames because the
+            // Quick Action path through didFinishLaunching is the
+            // authoritative source.
+            NSApp.reply(toOpenOrPrint: .success)
+            return
+        }
         openFileEverFired = true
         // openFiles is the LaunchServices entrypoint — double-click on
         // .knit / .zip, drag onto app icon, `open file.knit` from CLI.
@@ -120,6 +142,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
             }
         }
         guard let op = op, !inputs.isEmpty else { return nil }
+        // Defensive cap. The `--inputs` parser above is greedy until
+        // the next `--` flag, and Finder Quick Actions expand `"$@"`
+        // to every selected file — so a careless right-click on a
+        // huge selection could yield hundreds-to-thousands of input
+        // URLs. `OperationCoordinator` now executes runs serially
+        // (one subprocess at a time), but capping here is defense in
+        // depth: even if a future refactor accidentally re-introduces
+        // parallel launch, the blast radius is bounded. 256 is well
+        // above any plausible "select files in Finder and compress"
+        // intent; users hitting this limit should pre-archive into a
+        // folder first.
+        let maxInputs = 256
+        if inputs.count > maxInputs {
+            FileHandle.standardError.write(Data(
+                "Knit: too many inputs (\(inputs.count) > \(maxInputs)). Pre-archive into a folder and try again.\n".utf8))
+            return nil
+        }
         switch op {
         case "pack":
             return .packToKnit(inputs: inputs, outputDir: output, level: level ?? 3)
@@ -136,15 +175,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
 
     private func startOperation(_ operation: KnitOperation) {
         guard let knit = Self.locateKnitCLI() else {
-            let alert = NSAlert()
-            alert.messageText = "Knit CLI not found"
-            alert.informativeText = "Couldn't find /usr/local/bin/knit. Run the installer (or install.sh) to install the CLI."
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "OK")
-            _ = alert.runModal()
-            NSApp.terminate(nil)
+            // PR #58 hotfix: this used to call `alert.runModal()`
+            // synchronously here, then `NSApp.terminate(nil)`. But
+            // `startOperation` is called from inside
+            // `applicationDidFinishLaunching`, BEFORE the run loop
+            // is fully in a state to host a modal session — and
+            // before `NSApp.activate(...)` runs (we early-return out
+            // of it via this guard). In a backgrounded direct-binary
+            // launch (e.g. a terminal smoke test) the modal session
+            // failed to enter and `runModal()` returned immediately,
+            // so the user saw no alert, no stderr, no output — just
+            // a silent <1s exit. This was the observation that made
+            // smoke tests appear broken even though the code path
+            // was being hit correctly.
+            //
+            // Two fixes:
+            //   1. Write to stderr unconditionally so terminal users
+            //      see what happened.
+            //   2. Defer the alert to the next runloop tick via
+            //      `DispatchQueue.main.async`, after didFinishLaunching
+            //      has fully completed. The modal session can then
+            //      enter properly.
+            FileHandle.standardError.write(Data(
+                "Knit: knit CLI not found. Run install.sh (or the installer pkg) to install /usr/local/bin/knit.\n".utf8))
+            DispatchQueue.main.async {
+                NSApp.activate(ignoringOtherApps: true)
+                let alert = NSAlert()
+                alert.messageText = "Knit CLI not found"
+                alert.informativeText = "Couldn't find /usr/local/bin/knit. Run the installer (or install.sh) to install the CLI."
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "OK")
+                _ = alert.runModal()
+                NSApp.terminate(nil)
+            }
             return
         }
+
+        // Force the app to activate. Without this the published
+        // NSProgress widget can appear, but Finder won't bring it
+        // forward and the user won't see anything happening — Knit.app
+        // gets stuck in the background of whatever app the user was
+        // last clicking in. Activating also unhides the Dock icon
+        // immediately, giving the user a visible cue that something
+        // is in progress even if the NSProgress UI is delayed.
+        NSApp.activate(ignoringOtherApps: true)
 
         // The coordinator captures `self` weakly so the deallocator
         // for the last coordinator can fire even from one of the
@@ -203,6 +277,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-// Don't show in the Dock — this is a helper app, not a foreground GUI.
-app.setActivationPolicy(.accessory)
+// PR #58: Knit.app must be a regular foreground app (not accessory)
+// for macOS to render its published `NSProgress` in the system
+// progress widget and as the Finder file-icon overlay. The accessory
+// activation policy that earlier revisions used silenced both of
+// those surfaces — same root cause as the LSUIElement key in
+// Info.plist (now removed).
+//
+// Consequence: the Dock icon appears while Knit.app is running an
+// operation, then disappears when the app exits at the end of the
+// operation. This matches how Archive Utility / Safari's
+// "downloading…" / Mail's "saving…" surfaces work: they're regular
+// apps that the system happens to terminate after their one
+// operation. For users invoking a Quick Action this means a brief
+// Dock-icon flash on fast operations and a steady Dock icon for the
+// duration of slow ones.
+app.setActivationPolicy(.regular)
 app.run()
