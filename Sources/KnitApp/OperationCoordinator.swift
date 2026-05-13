@@ -11,8 +11,12 @@
 //      file URL, and a file-operation kind. `publish()` makes
 //      Finder decorate the output file's icon while the operation
 //      runs and (system-defined) show a floating progress widget.
-//   2. Launch `/usr/local/bin/knit <subcmd> ... --progress-json`
+//   2. Launch the bundled `knit <subcmd> ... --progress-json`
 //      as a `Process`. Its stderr is a `Pipe` we read line-by-line.
+//      The CLI path is resolved by `locateKnitCLI()` in main.swift
+//      and prefers the binary embedded in
+//      Knit.app/Contents/Resources/bin/ so the GUI never accidentally
+//      invokes a stale system-wide install.
 //   3. Each line is one JSON object. Parse `processed` and update
 //      `progress.completedUnitCount`. Total is `total` from the
 //      first line (it's constant across the run).

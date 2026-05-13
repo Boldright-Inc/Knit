@@ -247,17 +247,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     // MARK: - CLI lookup
 
     private static func locateKnitCLI() -> URL? {
-        let candidates = [
-            "/usr/local/bin/knit",
-            "/opt/homebrew/bin/knit",
-        ]
+        // Prefer the CLI bundled inside Knit.app so the GUI always runs a
+        // binary built from the same source as itself. The previous order
+        // — /usr/local/bin/knit first — let a stale system-wide install
+        // (e.g. left over from a pre-PR-#57 .pkg) win and reject flags
+        // Knit.app passes, most visibly --progress-json (exit 64).
+        //
+        // The CLI lives under Contents/Resources/bin/ rather than
+        // Contents/MacOS/ because the case-insensitive default APFS
+        // would collide the lowercase "knit" with the launcher Mach-O
+        // "Knit"; see Scripts/build-app.sh step 3.5 for the rationale.
+        if let resourceURL = Bundle.main.resourceURL {
+            let bundled = resourceURL.appendingPathComponent("bin/knit")
+            if FileManager.default.isExecutableFile(atPath: bundled.path) {
+                return bundled
+            }
+        }
+        // Fallback for development / non-bundled launches only.
+        let candidates = ["/usr/local/bin/knit", "/opt/homebrew/bin/knit"]
         for c in candidates where FileManager.default.isExecutableFile(atPath: c) {
             return URL(fileURLWithPath: c)
-        }
-        // Fallback: knit binary bundled inside the .app
-        if let bundled = Bundle.main.url(forAuxiliaryExecutable: "knit"),
-           FileManager.default.isExecutableFile(atPath: bundled.path) {
-            return bundled
         }
         return nil
     }
