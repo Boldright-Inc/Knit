@@ -16,25 +16,27 @@ name: CI
 # `macos-latest` would also work but pinning a major version keeps
 # GitHub's runner upgrades from quietly turning the CI red.
 #
-# Scope of this initial CI: release-mode build only. `swift test` is
-# intentionally NOT wired up yet because several tests under
-# `KnitRoundTripTests` / `HybridZstdBatchDecoderTests` /
-# `HybridZstdBatchDecoderConcurrencyTests` / `RoundtripTests` fail on
-# macOS 26 Tahoe due to a real FileWalker bug: macOS 26 changed
-# `URL.resolvingSymlinksInPath()` to no longer resolve `/tmp` →
-# `/private/tmp`, but `FileManager.enumerator` still yields the
-# firmlink-resolved form. The prefix-stripping arithmetic in
-# `FileWalker.enumerate` then computes garbage relative paths
-# whenever the input is under `/tmp` or `/var/folders/...` — exactly
-# the temp dirs every test fixture uses. The fix lives in a separate
-# PR; once that lands a follow-up adds the `swift test` job.
+# Two jobs:
+#   1. `build-release` (since PR #44) — `swift build -c release` to
+#      catch the Swift-6 strict-concurrency footgun that the debug
+#      build silently lets through.
+#   2. `test` (this PR) — `./Scripts/run-tests.sh`. Tests were initially
+#      blocked by a macOS 26 Tahoe firmlink bug in `FileWalker.enumerate`
+#      (`URL.resolvingSymlinksInPath()` no longer resolves `/tmp` →
+#      `/private/tmp` on the default APFS volume layout). PR #45 fixed
+#      it via `realpath(3)`, which is what unblocked turning this on.
 #
-# Why ship CI without tests anyway: the documented motivation for
-# this workflow is catching the strict-concurrency footgun that
-# took down PRs #26 and #28's release builds. That footgun fires
-# during `swift build -c release` — the build job covers it on day
-# one. Waiting for a fully green test suite would leave that
-# footgun uncovered for longer.
+# `Scripts/run-tests.sh` exists because `Package.swift` intentionally
+# omits the test target so distribution clones build cleanly in Xcode.
+# The script temporarily swaps in a manifest that declares the
+# `KnitCoreTests` target, runs `swift test`, then restores the
+# original manifest. The CI job invokes the same script so what
+# devs run locally is exactly what CI runs.
+#
+# Local prerequisite: full Xcode (XCTest framework). Command Line
+# Tools alone are not enough — `swift test` will fail with
+# "no such module 'XCTest'". macOS GitHub runners have full Xcode
+# pre-installed so CI is unaffected.
 
 on:
   push:
@@ -67,6 +69,22 @@ jobs:
       - name: Build release
         run: swift build -c release
 
-  # `swift test` job intentionally omitted — see the file header for
-  # the macOS-26-Tahoe FileWalker bug blocking it. Add the job back
-  # in a follow-up PR after the FileWalker fix lands.
+  test:
+    name: ./Scripts/run-tests.sh
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcrun --show-sdk-version
+          xcode-select -p
+
+      # Tests run via the dev script so CI exercises the same
+      # manifest-swap path developers use locally. The script
+      # restores Package.swift on exit (trap), so a failed run
+      # leaves the working tree clean.
+      - name: Run tests
+        run: ./Scripts/run-tests.sh
