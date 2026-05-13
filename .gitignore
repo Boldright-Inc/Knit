@@ -36,3 +36,4 @@ Tests/TestData/
 # Local env
 .env
 .env.local
+/dist
