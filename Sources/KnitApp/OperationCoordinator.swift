@@ -581,8 +581,27 @@ final class OperationCoordinator: NSObject, @unchecked Sendable {
         let cancelled = self.cancelled
         let pending = pendingCount - 1
         pendingCount = pending
-        let status = process.terminationStatus
-        let reason = process.terminationReason
+        // `terminationStatus` and `terminationReason` raise an
+        // NSException when the Process never actually ran — which
+        // is exactly the state of every entry that takes one of
+        // the three launch-failure paths (proc.run() throws,
+        // cancelled-before-spawn in startSubprocess, or
+        // cancelled-during-cross-lock-acquire in launchChild). The
+        // exception is uncaught Swift-side and aborts the process
+        // with SIGABRT, reported by users as a crash when clicking
+        // the cancel × on a queued (not-yet-launched) operation in
+        // a multi-input Quick Action. Guard the reads so the
+        // failure-branch can rely on `launchError`'s message
+        // instead.
+        let status: Int32
+        let reason: Process.TerminationReason
+        if launchError == nil {
+            status = process.terminationStatus
+            reason = process.terminationReason
+        } else {
+            status = -1
+            reason = .exit
+        }
         if launchError != nil || (status != 0 && !cancelled) {
             // PR #67: build a useful failure message instead of the
             // cryptic "knit exited with status N".

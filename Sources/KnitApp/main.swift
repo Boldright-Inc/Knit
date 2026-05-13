@@ -38,19 +38,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     private var openFileEverFired = false
 
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
-        // PR #58 bug: macOS Tahoe was found to ALSO call openFiles with
-        // every string in `--args` whose syntax could pass as a path —
-        // including the literal words "pack" and "unpack" plus the
-        // selected file. That caused a single Quick Action invocation
-        // to fire one packToKnit (via parseQuickActionArgs in
-        // didFinishLaunching) PLUS three extractArchive subprocesses,
-        // producing four parallel knit invocations and confusing
-        // pretty much everything downstream.
+        // PR #58 bug: macOS Tahoe ALSO calls openFiles with every
+        // string in `--args` whose syntax could pass as a path —
+        // including the literal words "pack" / "unpack" / "zip" plus
+        // the selected file. That caused a single Quick Action
+        // invocation to fire one packToKnit (via parseQuickActionArgs
+        // in didFinishLaunching) PLUS spurious extractArchive
+        // subprocesses, producing parallel knit invocations and
+        // a stream of "Extracting 'unpack'" / "Extracting 'zip'"
+        // progress windows.
         //
-        // The contract here: if ProcessInfo's argv contains
-        // `--operation`, the user is invoking us via Quick Action, and
-        // openFiles is spurious. Drop it. The Quick Action path
-        // through didFinishLaunching is authoritative.
+        // PR #58 added a `--operation` argv guard here. That guard
+        // is still the primary defence (Quick Action path through
+        // didFinishLaunching is authoritative), but the user
+        // reproduced the symptom on macOS 26 anyway — openFiles
+        // had already been queued before the argv check could run
+        // for at least one delivery, or the argv check was bypassed
+        // by a delivery path we haven't characterised. Belt-and-
+        // braces: even after the argv guard fires, filter the
+        // filenames so that the words `pack` / `unpack` / `zip` /
+        // `extract` and any path that does not exist on disk are
+        // discarded. With the filter, the only thing that survives
+        // is a real file the user actually intended to open.
+        let filtered = Self.filterOpenFileDeliveries(filenames)
         if ProcessInfo.processInfo.arguments.contains("--operation") {
             // Tell LaunchServices we acknowledged the request — without
             // this it considers the open request unanswered and may
@@ -60,13 +70,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
             NSApp.reply(toOpenOrPrint: .success)
             return
         }
+        if filtered.isEmpty {
+            // openFiles was called with nothing but reserved words or
+            // non-existent paths — almost certainly a spurious macOS
+            // Tahoe redelivery of `--args` strings. Don't start any
+            // operation; just acknowledge.
+            NSApp.reply(toOpenOrPrint: .success)
+            return
+        }
         openFileEverFired = true
         // openFiles is the LaunchServices entrypoint — double-click on
         // .knit / .zip, drag onto app icon, `open file.knit` from CLI.
         // Treat each as an extract operation.
-        let urls = filenames.map { URL(fileURLWithPath: $0) }
+        let urls = filtered.map { URL(fileURLWithPath: $0) }
         startOperation(.extractArchive(inputs: urls, outputDir: nil))
         NSApp.reply(toOpenOrPrint: .success)
+    }
+
+    /// macOS Tahoe redelivers `--args` strings to `openFiles` even when
+    /// they were never intended as document paths. Drop:
+    ///
+    ///   1. Reserved Quick Action verbs (`pack` / `unpack` / `zip` /
+    ///      `extract`) — those are never valid filenames in the Quick
+    ///      Action shell-wrapper layout, so anything matching is
+    ///      definitionally a spurious redelivery.
+    ///   2. Paths that don't exist on disk — a real Finder double-click
+    ///      always hands us an existing file, so a missing path is
+    ///      another signal of a spurious string-as-path delivery.
+    ///
+    /// Applied in both openFiles and parseQuickActionArgs (Quick Action
+    /// `--inputs` clause) for symmetry. Defensive against the next
+    /// `--args`-string-as-document delivery quirk we haven't seen yet.
+    static let reservedQuickActionVerbs: Set<String> = [
+        "pack", "unpack", "zip", "extract",
+    ]
+
+    static func filterOpenFileDeliveries(_ filenames: [String]) -> [String] {
+        let fm = FileManager.default
+        return filenames.filter { name in
+            if Self.reservedQuickActionVerbs.contains(name.lowercased()) {
+                return false
+            }
+            return fm.fileExists(atPath: name)
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -122,7 +168,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
             case "--inputs":
                 i += 1
                 while i < raw.count && !raw[i].hasPrefix("--") {
-                    inputs.append(URL(fileURLWithPath: raw[i]))
+                    // Defense-in-depth: drop reserved Quick Action
+                    // verbs and non-existent paths before they reach
+                    // the operation dispatcher. A correctly-formed
+                    // Quick Action shell wrapper never puts these in
+                    // `--inputs`, so anything matching is either a
+                    // typo / mis-built workflow or a sign that argv
+                    // got mangled by `open` (e.g. `--args` parsing
+                    // drift between macOS versions).
+                    let candidate = raw[i]
+                    let isReserved = Self.reservedQuickActionVerbs
+                        .contains(candidate.lowercased())
+                    let exists = FileManager.default
+                        .fileExists(atPath: candidate)
+                    if !isReserved && exists {
+                        inputs.append(URL(fileURLWithPath: candidate))
+                    }
                     i += 1
                 }
             case "--output":
