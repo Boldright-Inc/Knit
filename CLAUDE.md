@@ -1333,7 +1333,6 @@ moved to the "Investigated, no-go" section above.
 
 | Item | Why | Sketch |
 |---|---|---|
-| **`swift test` CI job** | PR #44 added `swift build -c release` only; PR #45 unblocks tests (FileWalker firmlink fix). One-line follow-up adds the job | append a second job to `.github/workflows/ci.yml` running `./Scripts/run-tests.sh` |
 | **Atomic-on-success commit for `unpack`** | Streaming write + final-CRC mismatch leaves a partial output file on disk | write to `.tmp`, rename on CRC pass |
 | **Per-block CRCs in `.knit` v2** | Allows per-batch verify-before-commit instead of end-of-entry only | format version bump |
 | **Symlink preservation** | Currently always skipped; tar/zip preserve them | `.knit` v2 entry type, plus `--preserve-symlinks` flag |
