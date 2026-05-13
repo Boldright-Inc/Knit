@@ -377,8 +377,31 @@ public final class ZipWriter {
             extra.appendLE(entry.localHeaderOffset)
         }
 
-        // External attrs: high 16 bits = unix mode, low 16 = MS-DOS
-        let externalAttrs: UInt32 = (UInt32(entry.descriptor.unixMode) << 16)
+        // External attrs: high 16 bits = full POSIX `st_mode` (file-type
+        // bits OR'd with permission bits), low 16 bits = MS-DOS file
+        // attributes. ZIP spec §4.4.15: when `version made by`'s host
+        // system is Unix (3), the upper 16 bits are interpreted as
+        // `st_mode` per POSIX. That means strict readers (Claude's
+        // skill loader, Python's `zipfile.ZipInfo.external_attr` clients,
+        // libarchive's `bsdtar`, info-zip's `-X` mode) look at
+        // `(externalAttrs >> 16) & S_IFMT` to determine entry type.
+        // Without `S_IFDIR` / `S_IFREG` they fall back to host=2 (FAT)
+        // semantics or refuse the archive outright.
+        //
+        // Pre-PR-#83 bug: only `entry.descriptor.unixMode` (the 9-bit
+        // permission set, e.g. 0o755) was shifted into the upper 16
+        // bits, so the file-type field read as `0o0000` — "unknown".
+        // `unzip -v` rendered our directory entries as `?rwxr-xr-x`
+        // (the `?` marking unknown type) instead of `drwxr-xr-x`.
+        // macOS-built ZIPs of the same content correctly carried
+        // `040755` (S_IFDIR | 0o755), so the Claude skill loader
+        // accepted them but rejected ours despite byte-identical
+        // payload content.
+        let fileTypeBits: UInt32 = entry.descriptor.isDirectory
+            ? 0o040000  // S_IFDIR
+            : 0o100000  // S_IFREG
+        let unixStMode = fileTypeBits | UInt32(entry.descriptor.unixMode)
+        let externalAttrs: UInt32 = (unixStMode << 16)
             | (entry.descriptor.isDirectory ? 0x0010 : 0)
         let versionMadeBy: UInt16 = (3 /* unix */ << 8) | 63  // 6.3 of spec
 
