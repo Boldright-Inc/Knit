@@ -10,8 +10,7 @@ needs to know to use the tool".
 
 ## Project mission
 
-> Apple Silicon の余剰 GPU を圧縮 / 解凍に投入し、pack と unpack を
-> I/O 限界まで押し上げる。
+> Apple Siliconの余剰 GPU を圧縮 / 解凍に投入し、I/O限界まで性能を押し上げる。
 
 Concretely:
 
