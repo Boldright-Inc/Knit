@@ -16,25 +16,32 @@ name: CI
 # `macos-latest` would also work but pinning a major version keeps
 # GitHub's runner upgrades from quietly turning the CI red.
 #
-# Scope of this initial CI: release-mode build only. `swift test` is
-# intentionally NOT wired up yet because several tests under
-# `KnitRoundTripTests` / `HybridZstdBatchDecoderTests` /
-# `HybridZstdBatchDecoderConcurrencyTests` / `RoundtripTests` fail on
-# macOS 26 Tahoe due to a real FileWalker bug: macOS 26 changed
-# `URL.resolvingSymlinksInPath()` to no longer resolve `/tmp` →
-# `/private/tmp`, but `FileManager.enumerator` still yields the
-# firmlink-resolved form. The prefix-stripping arithmetic in
-# `FileWalker.enumerate` then computes garbage relative paths
-# whenever the input is under `/tmp` or `/var/folders/...` — exactly
-# the temp dirs every test fixture uses. The fix lives in a separate
-# PR; once that lands a follow-up adds the `swift test` job.
+# Scope of this CI: release-mode build only. `swift test` is
+# intentionally NOT in this workflow, by design — not pending a
+# fix.
 #
-# Why ship CI without tests anyway: the documented motivation for
-# this workflow is catching the strict-concurrency footgun that
-# took down PRs #26 and #28's release builds. That footgun fires
-# during `swift build -c release` — the build job covers it on day
-# one. Waiting for a fully green test suite would leave that
-# footgun uncovered for longer.
+# Why no test job:
+#   - `macos-15` GitHub-hosted runners are M1 with 3 vCPUs, roughly
+#     5–6× slower than the dev hardware (M5 Max) for this codebase.
+#     The full suite that runs in ~55 s locally took >11 minutes on
+#     the runner in PR #88's cancelled-mid-run attempt.
+#   - GitHub Actions bills macOS minutes at a **10× multiplier** vs
+#     Linux. An 11-minute test job = ~110 billable minutes per push.
+#     Across a typical PR (push, fix, push again) this trivially
+#     reaches tens of dollars per merge, which is not justifiable
+#     for a suite the developer already runs locally in under a
+#     minute via `./Scripts/run-tests.sh`.
+#   - Tests do not provide an incremental safety win over the local
+#     run. The dev-side workflow IS the test gate; CI's value is
+#     catching the *one* thing local debug builds miss — the
+#     strict-concurrency analyser, which only runs to completion in
+#     release mode (PRs #26 and #28 broke release builds while
+#     reviewing green on debug-only dev hosts).
+#
+# Do NOT add a `swift test` job to this workflow without a
+# documented change of facts (e.g. self-hosted Apple Silicon
+# runners, a free-tier macOS alternative, or a much faster test
+# subset). PR #88 attempted this and was closed as the wrong call.
 
 on:
   push:
@@ -67,6 +74,7 @@ jobs:
       - name: Build release
         run: swift build -c release
 
-  # `swift test` job intentionally omitted — see the file header for
-  # the macOS-26-Tahoe FileWalker bug blocking it. Add the job back
-  # in a follow-up PR after the FileWalker fix lands.
+  # No `swift test` job here, by design. See the file header for
+  # the cost reasoning (macOS Actions 10× billing, ~110 billable
+  # minutes per push observed in PR #88). Tests stay local-only
+  # via `./Scripts/run-tests.sh`.
