@@ -45,6 +45,72 @@ struct RoundtripTests {
         #expect(unzipExit == 0)
     }
 
+    /// PR #83 regression: pre-fix Knit-built ZIPs encoded the
+    /// central-directory `external_attr` field's high 16 bits as
+    /// just the POSIX permission bits (e.g. 0o755), omitting the
+    /// `S_IFDIR` / `S_IFREG` file-type bits. Strict ZIP readers
+    /// (Claude's skill loader, libarchive's `bsdtar`, info-zip's
+    /// `-X` mode) require the full `st_mode` per ZIP spec §4.4.15
+    /// when host system == Unix (3), and either refuse the archive
+    /// or treat directory entries as oddly-named files. `unzip -v`
+    /// renders the type field as `?` for unknown — a useful
+    /// signal we can parse without depending on a structured
+    /// ZIP-inspector library.
+    @Test("ZIP external_attr carries Unix file-type bits (PR #83)")
+    func zipExternalAttrFileType() throws {
+        let tmp = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        // Pack a directory with one file so we exercise BOTH
+        // entry types' external_attr encoding.
+        let inputDir = tmp.appendingPathComponent("skill-stub")
+        try FileManager.default.createDirectory(at: inputDir, withIntermediateDirectories: true)
+        let fileURL = inputDir.appendingPathComponent("SKILL.md")
+        try "stub".write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let zipURL = tmp.appendingPathComponent("out.zip")
+        let compressor = ZipCompressor(backend: CPUDeflate(),
+                                       options: .init(level: .default))
+        _ = try compressor.compress(input: inputDir, to: zipURL)
+
+        // Capture `zipinfo -v`'s verbose central-directory listing
+        // — its "Unix file attributes" rendering tells us whether
+        // the file-type bits are present. Format example for a
+        // directory:
+        //   "Unix file attributes (040755 octal):  drwxr-xr-x"
+        // The leading `d` (or `-` for files) is what we want.
+        // The pre-PR-#83 broken rendering looked like:
+        //   "Unix file attributes (000755 octal):  ?rwxr-xr-x"
+        // where the `?` means "unknown file type" because the
+        // S_IFMT bits in st_mode were all zero.
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/zipinfo")
+        p.arguments = ["-v", zipURL.path]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        try p.run()
+        p.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+
+        // Negative: no entry should render with a `?` file-type
+        // marker (the pre-fix bug signature).
+        #expect(!output.contains("?rwx"),
+                "ZIP central-directory external_attr is missing S_IFDIR/S_IFREG file-type bits — entries render as `?rwx*` per `zipinfo -v`. PR #83 regression.")
+        #expect(!output.contains("?rw-"),
+                "ZIP central-directory external_attr is missing S_IFREG for a regular file — `?rw-*` per `zipinfo -v`. PR #83 regression.")
+
+        // Positive: at least the directory entry should render
+        // as `drwx*` (S_IFDIR set), and the file as `-rw*` (S_IFREG
+        // set). The trailing permission bits depend on umask /
+        // FileManager defaults so we don't pin them exactly.
+        #expect(output.contains("drwx"),
+                "Expected the ZIP's directory entry to render as `drwx*` in `zipinfo -v` output (means S_IFDIR is set in external_attr).")
+        #expect(output.contains("-rw"),
+                "Expected the ZIP's file entry to render as `-rw*` in `zipinfo -v` output (means S_IFREG is set in external_attr).")
+    }
+
     @Test(".knit round-trips byte-identically")
     func bzxRoundtrip() throws {
         let tmp = try makeTempDir()
