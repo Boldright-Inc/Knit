@@ -112,6 +112,14 @@ internal func parallelCRC32(_ buffer: UnsafeBufferPointer<UInt8>,
         let length: Int
     }
 
+    // Sub-chunk size for the per-worker streaming walk. Each worker
+    // owns a contiguous `chunkSize` range (~total/N); inside that
+    // range we step in `subChunkSize` slices so we can hint
+    // `MADV_DONTNEED` after each slice's CRC has been computed. See
+    // the long doc-block right above the worker loop for the
+    // motivation.
+    let subChunkSize = 64 * 1024 * 1024
+
     // concurrentMap preserves input order, so the index in the
     // returned array equals the chunk index — exactly what
     // `crc32Combine`'s left-to-right fold needs.
@@ -123,13 +131,60 @@ internal func parallelCRC32(_ buffer: UnsafeBufferPointer<UInt8>,
             if off >= total {
                 return ChunkResult(crc: 0, length: 0)
             }
-            let len = min(chunkSize, total - off)
-            let chunkBuf = UnsafeBufferPointer<UInt8>(
-                start: basePtrSendable.value.advanced(by: off),
-                count: len
-            )
-            return ChunkResult(crc: crc.crc32(chunkBuf, seed: 0),
-                               length: len)
+            let chunkLen = min(chunkSize, total - off)
+
+            // Stream the worker's range in `subChunkSize` slices, folding
+            // each slice's CRC into `accum` via `crc32Combine`, and
+            // hinting `MADV_DONTNEED` immediately afterwards. Motivated
+            // by the 200 GB ZIP report (user on M3 Max / 128 GB RAM):
+            //
+            //   sample(1) caught the process with 92.5 GB resident,
+            //   all worker threads in `parallelCRC32 -> libdeflate_crc32`.
+            //   With the previous "one ~3 GB chunk per worker, no
+            //   release hint" shape, every worker's range stayed fully
+            //   resident for the entire CRC pass; on a 200 GB input
+            //   that meant ~64 × 3 GB ≈ 200 GB competing for 128 GB of
+            //   RAM, the memory compressor activated, and either the
+            //   `cpt_mapcnt` overflow path (PR #76) or plain OOM
+            //   tripped before the writer ever got to drain.
+            //
+            // Per-worker resident set with this loop: `subChunkSize`
+            // (64 MiB). Across N workers: `N × 64 MiB` ≈ 1 GiB for
+            // typical N = 16, regardless of total buffer size. The
+            // same `madvise(MADV_DONTNEED)` pattern as
+            // `StreamingBlockCompressor.swift:433` (PR #76) and
+            // `ZipWriter.writeRawChunkedMapped` (PR #76).
+            //
+            // Best-effort: macOS may ignore the hint when RAM is
+            // abundant (the kernel keeps cache-warm pages for the
+            // subsequent writer drain), and applies it under pressure
+            // (which is exactly when we want it). Either way, no
+            // worse than the pre-fix behaviour.
+            var accum: UInt32 = 0
+            var first = true
+            var subOff = 0
+            while subOff < chunkLen {
+                let subLen = min(subChunkSize, chunkLen - subOff)
+                let subPtr = basePtrSendable.value.advanced(by: off + subOff)
+                let subBuf = UnsafeBufferPointer<UInt8>(
+                    start: subPtr,
+                    count: subLen
+                )
+                let subCRC = crc.crc32(subBuf, seed: 0)
+                if first {
+                    accum = subCRC
+                    first = false
+                } else {
+                    accum = crc32Combine(crc1: accum,
+                                         crc2: subCRC,
+                                         len2: UInt(subLen))
+                }
+                _ = madvise(UnsafeMutableRawPointer(mutating: subPtr),
+                            subLen,
+                            MADV_DONTNEED)
+                subOff += subLen
+            }
+            return ChunkResult(crc: accum, length: chunkLen)
         }
     } catch {
         // concurrentMap's transform doesn't throw in our usage (the

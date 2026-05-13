@@ -135,6 +135,18 @@ public struct CPUEntropyProbe: EntropyProbing {
             // each worker contributes its block's byte count exactly
             // once, so the cumulative advance still sums to `total`.
             onProgress?(UInt64(len))
+            // Hint the kernel that this block's input pages are done.
+            // Same shape as the MetalEntropyProbe and parallelCRC32
+            // sub-chunk loops; see those for the full rationale (200 GB
+            // ZIP memory-error fix). Block sizes below 64 KiB don't
+            // benefit (page granularity defeats the hint) — skip the
+            // syscall there to keep CPU overhead bounded for
+            // small-block callers.
+            if len >= 64 * 1024 {
+                _ = madvise(UnsafeMutableRawPointer(mutating: p),
+                            len,
+                            MADV_DONTNEED)
+            }
             return EntropyResult(entropy: entropy, byteCount: len)
         }
         return results

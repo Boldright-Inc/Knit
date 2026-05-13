@@ -93,6 +93,22 @@ public final class MetalEntropyProbe: EntropyProbing, @unchecked Sendable {
             // 80 GB probe fires ~20 ticks, enough to show smooth
             // motion).
             onProgress?(UInt64(chunkLen))
+            // Release this dispatch's input mmap pages from kernel
+            // residency. Same pattern as `parallelCRC32`'s sub-chunk
+            // loop and PR #76's writer/pack hints. Motivated by the
+            // 200 GB ZIP report: the probe ran *before* parallelCRC32
+            // and already touched the entire entry, leaving ~all of
+            // RAM resident before CRC even started — by the time CRC
+            // got going the host was already in memory pressure.
+            //
+            // On memory-rich hosts the kernel typically defers the
+            // hint until pressure arrives, so the subsequent CRC pass
+            // still hits cache-warm pages. Under pressure (the 200 GB
+            // case) the hint is honoured: pages drop, CRC re-reads
+            // from NVMe — slower than cache but no OOM.
+            _ = madvise(UnsafeMutableRawPointer(mutating: chunkPtr),
+                        chunkLen,
+                        MADV_DONTNEED)
             off += chunkLen
         }
         return allResults
