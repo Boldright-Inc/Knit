@@ -32,6 +32,15 @@
 #   ./Scripts/bench-corpora.sh                # all corpora under default root
 #   ./Scripts/bench-corpora.sh test2          # one corpus by name
 #   KNIT_BENCH_CORPUS_ROOT=/path/to/data ./Scripts/bench-corpora.sh
+#   KNIT_BENCH_MODE=zip ./Scripts/bench-corpora.sh   # use `knit zip` + `knit unzip`
+#                                                    # instead of `knit pack` + `knit unpack`
+#
+# Mode selector:
+#   KNIT_BENCH_MODE=knit (default) — packs to `.knit`, unpacks via `knit unpack`.
+#   KNIT_BENCH_MODE=zip            — zips to `.zip`, unzips via `knit unzip`.
+#                                    Used to gather analyze data on the ZIP
+#                                    extractor path (CLAUDE.md "Investigated,
+#                                    no-go" / GPU-decode verification work).
 #
 # Exit status: non-zero on the first knit invocation that fails.
 
@@ -43,6 +52,32 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CORPUS_ROOT="${KNIT_BENCH_CORPUS_ROOT:-${ROOT_DIR}/Tests/TestData}"
 RESULTS_ROOT="${ROOT_DIR}/Tests/Benchmarks/results"
 KNIT="${ROOT_DIR}/.build/release/knit"
+MODE="${KNIT_BENCH_MODE:-knit}"
+
+# Validate the mode selector early — typo'd values would silently fall
+# through to `knit pack` which makes regression-bench results
+# misleading.
+case "${MODE}" in
+    knit|zip) ;;
+    *)
+        echo "error: KNIT_BENCH_MODE must be 'knit' or 'zip', got '${MODE}'" >&2
+        exit 2
+        ;;
+esac
+
+# Per-mode subcommand + extension names. Used in `run_one` below.
+case "${MODE}" in
+    knit)
+        PACK_CMD=pack
+        UNPACK_CMD=unpack
+        ARCHIVE_EXT=knit
+        ;;
+    zip)
+        PACK_CMD=zip
+        UNPACK_CMD=unzip
+        ARCHIVE_EXT=zip
+        ;;
+esac
 
 if [[ ! -d "${CORPUS_ROOT}" ]]; then
     echo "error: corpus root not found: ${CORPUS_ROOT}" >&2
@@ -129,22 +164,33 @@ run_one() {
     local name
     name="$(basename "${input}")"
 
-    local archive="${OUT_DIR}/${name}.knit"
+    local archive="${OUT_DIR}/${name}.${ARCHIVE_EXT}"
     local extract="${OUT_DIR}/${name}-unpacked"
-    local pack_log="${OUT_DIR}/${name}-pack-analyze.txt"
-    local unpack_log="${OUT_DIR}/${name}-unpack-analyze.txt"
+    local pack_log="${OUT_DIR}/${name}-${PACK_CMD}-analyze.txt"
+    local unpack_log="${OUT_DIR}/${name}-${UNPACK_CMD}-analyze.txt"
 
     mkdir -p "${extract}"
 
     local in_bytes
     in_bytes="$(size_of "${input}")"
 
-    local pack_rusage="${OUT_DIR}/${name}-pack-rusage.txt"
-    local unpack_rusage="${OUT_DIR}/${name}-unpack-rusage.txt"
+    local pack_rusage="${OUT_DIR}/${name}-${PACK_CMD}-rusage.txt"
+    local unpack_rusage="${OUT_DIR}/${name}-${UNPACK_CMD}-rusage.txt"
 
-    echo "== ${name}: pack" >&2
+    # `knit zip` doesn't have --analyze (it's a compress-side
+    # diagnostic that requires StageAnalytics wiring through the
+    # pack-specific pipeline — the ZIP compress path is separate).
+    # The unpack/unzip side does support --analyze for both modes,
+    # which is the bench's primary purpose here.
+    local pack_analyze_flag=()
+    if [[ "${MODE}" == "knit" ]]; then
+        pack_analyze_flag=(--analyze)
+    fi
+
+    echo "== ${name}: ${PACK_CMD}" >&2
     /usr/bin/time -lp -o "${pack_rusage}" \
-        "${KNIT}" pack "${input}" -o "${archive}" --analyze 2> "${pack_log}"
+        "${KNIT}" "${PACK_CMD}" "${input}" -o "${archive}" \
+            "${pack_analyze_flag[@]}" 2> "${pack_log}"
     local pack_wall pack_user pack_sys pack_cpu out_bytes ratio
     pack_wall="$(parse_rusage_field "${pack_rusage}" real)"
     pack_user="$(parse_rusage_field "${pack_rusage}" user)"
@@ -153,12 +199,12 @@ run_one() {
     out_bytes="$(size_of "${archive}")"
     ratio="$(ratio_pct "${in_bytes}" "${out_bytes}")"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "${name}" pack "${pack_wall}" "${pack_cpu}" \
+        "${name}" "${PACK_CMD}" "${pack_wall}" "${pack_cpu}" \
         "${in_bytes}" "${out_bytes}" "${ratio}" >> "${SUMMARY}"
 
-    echo "== ${name}: unpack" >&2
+    echo "== ${name}: ${UNPACK_CMD}" >&2
     /usr/bin/time -lp -o "${unpack_rusage}" \
-        "${KNIT}" unpack "${archive}" -o "${extract}" --analyze 2> "${unpack_log}"
+        "${KNIT}" "${UNPACK_CMD}" "${archive}" -o "${extract}" --analyze 2> "${unpack_log}"
     local unpack_wall unpack_user unpack_sys unpack_cpu
     unpack_wall="$(parse_rusage_field "${unpack_rusage}" real)"
     unpack_user="$(parse_rusage_field "${unpack_rusage}" user)"
@@ -168,7 +214,7 @@ run_one() {
     # Reuse the same columns but flipped — keeps summary.tsv schema
     # stable across pack/unpack rows.
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "${name}" unpack "${unpack_wall}" "${unpack_cpu}" \
+        "${name}" "${UNPACK_CMD}" "${unpack_wall}" "${unpack_cpu}" \
         "${out_bytes}" "${in_bytes}" "${ratio}" >> "${SUMMARY}"
 
     # Clean up the extracted tree and the archive. The post-run results
