@@ -56,7 +56,7 @@ export NOTARY_PROFILE="knit-notary"   # set up via `xcrun notarytool store-crede
 ./Scripts/build-pkg.sh                # → dist/Knit-Installer.pkg
 ```
 
-Without those env vars the script emits an **unsigned** `.pkg` that macOS 14+ (especially macOS 26 Tahoe) rejects with the "Apple は…検証できませんでした" dialog at install time. Enrolment in the Apple Developer Program is necessary but not sufficient — the notary submission + ticket staple are both required. Verify with:
+Without those env vars the script emits an **unsigned** `.pkg` that macOS 14+ (especially macOS 26 Tahoe) rejects at install time. Enrolment in the Apple Developer Program is necessary but not sufficient — the notary submission + ticket staple are both required. Verify with:
 
 ```bash
 pkgutil --check-signature dist/Knit-Installer.pkg
