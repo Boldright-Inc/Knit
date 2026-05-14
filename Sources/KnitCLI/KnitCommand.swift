@@ -431,16 +431,53 @@ extension KnitCommand {
                                  visibility: .private))
         var analyze: Bool = false
 
+        @Flag(name: .customLong("list"),
+              help: """
+                List entries in the archive (size, mtime, name) without \
+                extracting and exit. Symmetric to `knit unzip --list`.
+                """)
+        var list: Bool = false
+
+        @Option(name: .customLong("entry"),
+                help: """
+                Extract only this entry from the archive. Repeatable for \
+                multiple entries. Names must match the .knit footer's \
+                entry name exactly (run `knit unpack --list` to discover \
+                them).
+                """)
+        var entry: [String] = []
+
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
+
+            // --list short-circuits before any reporter / extractor
+            // setup — no decode, no output write, just a footer walk.
+            if list {
+                let reader = try KnitReader(url: inputURL)
+                let rows = reader.archive.entries.map { e in
+                    CLIListing.Row(name: e.name,
+                                   isDirectory: e.isDirectory,
+                                   size: e.uncompressedSize,
+                                   modificationDate: e.modificationDate)
+                }
+                print(CLIListing.render(archivePath: inputURL.path, rows: rows),
+                      terminator: "")
+                return
+            }
+
             let outURL = URL(fileURLWithPath: output).standardizedFileURL
             let needReporter = CLIProgress.shouldHaveReporter(
                 progress: progress, noProgress: noProgress, progressJSON: progressJSON)
             // Total uncompressed bytes for the progress bar are read out
             // of the .knit footer so we don't need a second SSD pass.
+            // When `--entry` narrows the set we sum only the selected
+            // entries so the bar reaches 100 % at the end of the
+            // actual work.
+            let entryFilter: Set<String>? = entry.isEmpty ? nil : Set(entry)
             let totalBytes: UInt64
             if needReporter {
-                totalBytes = (try? CLIProgress.totalUncompressedBytesInKnit(at: inputURL)) ?? 0
+                totalBytes = (try? Self.totalUncompressedBytesInKnit(
+                    at: inputURL, entryFilter: entryFilter)) ?? 0
             } else {
                 totalBytes = 0
             }
@@ -476,7 +513,8 @@ extension KnitCommand {
                                           postWriteVerify: !noPostVerify,
                                           progressReporter: reporter,
                                           analytics: analytics,
-                                          literalTypeAnalytics: literalTypeAnalytics)
+                                          literalTypeAnalytics: literalTypeAnalytics,
+                                          entryFilter: entryFilter)
             let stats = try extractor.extract(archive: inputURL, to: outURL)
             // Drain the printer thread before the result summary — see the
             // matching comment in the `Zip` subcommand for rationale.
@@ -500,6 +538,27 @@ extension KnitCommand {
                 let report = CLIAnalyze.renderUnpackLiteralTypes(snap)
                 FileHandle.standardError.write(Data(report.utf8))
             }
+        }
+
+        /// Sum of `uncompressedSize` across every entry in a `.knit`
+        /// archive's footer (or just the filtered entries, when
+        /// `--entry` narrows the set). Walks the footer once — the
+        /// same parse `KnitExtractor` will do moments later — so the
+        /// progress denominator costs nothing on top of normal
+        /// extract setup. Kept here (vs. CLIProgress) because it
+        /// takes a filter; the existing `CLIProgress.totalUncompressed
+        /// BytesInKnit` covers the full-archive call sites elsewhere.
+        private static func totalUncompressedBytesInKnit(at archiveURL: URL,
+                                                          entryFilter: Set<String>?) throws -> UInt64 {
+            let reader = try KnitReader(url: archiveURL)
+            var total: UInt64 = 0
+            // Loop variable `e` (not `entry`) — same shadowing
+            // caveat as the ZIP variant.
+            for e in reader.archive.entries {
+                if let f = entryFilter, !f.contains(e.name) { continue }
+                total &+= e.uncompressedSize
+            }
+            return total
         }
     }
 
@@ -559,8 +618,44 @@ extension KnitCommand {
                                  visibility: .private))
         var analyze: Bool = false
 
+        @Flag(name: .customLong("list"),
+              help: """
+                List entries in the archive (size, mtime, name) without \
+                extracting and exit. Metadata-only — mmaps the archive, \
+                walks the central directory, prints to stdout. Useful \
+                for piping into grep/awk to discover entry names for \
+                `--entry`.
+                """)
+        var list: Bool = false
+
+        @Option(name: .customLong("entry"),
+                help: """
+                Extract only this entry from the archive. Repeatable for \
+                multiple entries. Names must match the central-directory \
+                entry name exactly (run `knit unzip --list` to discover \
+                them). Order-of-magnitude speed win for the "I just need \
+                one file from a huge archive" workload.
+                """)
+        var entry: [String] = []
+
         func run() throws {
             let inputURL = URL(fileURLWithPath: input).standardizedFileURL
+
+            // --list short-circuits before any reporter / extractor
+            // setup — no decode, no output write, just a CD walk.
+            if list {
+                let reader = try ZipReader(url: inputURL)
+                let rows = reader.entries.map { e in
+                    CLIListing.Row(name: e.name,
+                                   isDirectory: e.isDirectory,
+                                   size: e.uncompressedSize,
+                                   modificationDate: e.modificationDate)
+                }
+                print(CLIListing.render(archivePath: inputURL.path, rows: rows),
+                      terminator: "")
+                return
+            }
+
             let outURL = URL(fileURLWithPath: output).standardizedFileURL
             let needReporter = CLIProgress.shouldHaveReporter(
                 progress: progress, noProgress: noProgress, progressJSON: progressJSON)
@@ -568,10 +663,15 @@ extension KnitCommand {
             // uncompressedSize from the ZIP central directory. Parsing
             // the CD is cheap (mmap + linear walk) and doesn't touch
             // any compressed payload — same cost regardless of
-            // whether we go on to extract.
+            // whether we go on to extract. When `--entry` is set we
+            // narrow the denominator to the selected entries so the
+            // bar reaches 100 % at the end of the work that's
+            // actually being done.
+            let entryFilter: Set<String>? = entry.isEmpty ? nil : Set(entry)
             let totalBytes: UInt64
             if needReporter {
-                totalBytes = (try? totalUncompressedBytesInZip(at: inputURL)) ?? 0
+                totalBytes = (try? totalUncompressedBytesInZip(
+                    at: inputURL, entryFilter: entryFilter)) ?? 0
             } else {
                 totalBytes = 0
             }
@@ -590,7 +690,8 @@ extension KnitCommand {
             let extractor = ZipExtractor(
                 postVerify: !noPostVerify,
                 progressReporter: reporter,
-                analytics: analytics
+                analytics: analytics,
+                entryFilter: entryFilter
             )
             let stats = try extractor.extract(archive: inputURL, to: outURL)
             reporter?.finish()
@@ -610,14 +711,21 @@ extension KnitCommand {
         }
 
         /// Sum of `uncompressedSize` across every entry in the ZIP's
-        /// central directory. Used as the progress bar's denominator
-        /// without needing to decompress anything — symmetric to
-        /// `CLIProgress.totalUncompressedBytesInKnit` for `.knit`.
-        private func totalUncompressedBytesInZip(at archiveURL: URL) throws -> UInt64 {
+        /// central directory (or just the filtered entries, when
+        /// `--entry` narrows the set). Used as the progress bar's
+        /// denominator without needing to decompress anything —
+        /// symmetric to `CLIProgress.totalUncompressedBytesInKnit`
+        /// for `.knit`.
+        private func totalUncompressedBytesInZip(at archiveURL: URL,
+                                                  entryFilter: Set<String>?) throws -> UInt64 {
             let reader = try ZipReader(url: archiveURL)
             var total: UInt64 = 0
-            for entry in reader.entries {
-                total &+= entry.uncompressedSize
+            // Loop variable named `e` (not `entry`) to dodge any
+            // confusion with the `@Option var entry: [String]`
+            // property declared on this same struct.
+            for e in reader.entries {
+                if let f = entryFilter, !f.contains(e.name) { continue }
+                total &+= e.uncompressedSize
             }
             return total
         }

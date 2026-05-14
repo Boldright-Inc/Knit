@@ -71,14 +71,38 @@ public final class ZipExtractor {
     /// renderer doesn't need a separate ZIP-specific format.
     public var analytics: StageAnalytics?
 
+    /// When non-nil, restricts extraction to the named entries. Any
+    /// entry whose `name` is not in the set is skipped (its compressed
+    /// payload isn't touched, its output file isn't created, its
+    /// parent directories — if not also covered by a selected entry —
+    /// aren't materialised). The filter is matched against the
+    /// central directory's verbatim entry names; use
+    /// `ZipReader.entries.map(\.name)` (or `knit unzip --list`) to
+    /// discover what to pass.
+    ///
+    /// **Why this exists.** Order-of-magnitude speed win for the
+    /// "I just need one file from a 50 GB archive" workload — we skip
+    /// all decode + write + verify work for everything else. Mirrors
+    /// `info-zip`'s `unzip <archive> <member...>` selector pattern;
+    /// the GUI/Quick-Action surface doesn't expose this (the GUI
+    /// always wants full extract), so it's a CLI-only feature for now.
+    ///
+    /// Empty set is **not** treated as "extract nothing" — pass `nil`
+    /// for full extract, pass a populated set for selective extract.
+    /// An empty set throws at extract time so a buggy caller doesn't
+    /// silently produce an empty output tree.
+    public var entryFilter: Set<String>?
+
     public init(postVerify: Bool = true,
                 progressReporter: ProgressReporter? = nil,
                 concurrency: Int = ProcessInfo.processInfo.activeProcessorCount,
-                analytics: StageAnalytics? = nil) {
+                analytics: StageAnalytics? = nil,
+                entryFilter: Set<String>? = nil) {
         self.postVerify = postVerify
         self.progressReporter = progressReporter
         self.concurrency = max(1, concurrency)
         self.analytics = analytics
+        self.entryFilter = entryFilter
     }
 
     /// Mirrors `KnitExtractor.largeEntryThreshold`. Entries below this
@@ -111,7 +135,28 @@ public final class ZipExtractor {
         _ = POSIXFile.mkdirParents(destDir.path)
         let destDirPath = destDir.path
 
-        let entries = reader.entries
+        // Apply the optional entry filter. Validation catches the
+        // common typo failure mode ("--entry FOO.txt" when the
+        // archive has "foo.txt") by listing what was missing — much
+        // better than silently producing an empty output tree.
+        let allEntries = reader.entries
+        let entries: [ZipEntry]
+        if let filter = entryFilter {
+            if filter.isEmpty {
+                throw KnitError.formatError(
+                    "zip: entryFilter is empty — pass nil for full extract")
+            }
+            let availableNames = Set(allEntries.map(\.name))
+            let missing = filter.subtracting(availableNames)
+            if !missing.isEmpty {
+                throw KnitError.formatError(
+                    "zip: entries not found in archive: " +
+                    missing.sorted().joined(separator: ", "))
+            }
+            entries = allEntries.filter { filter.contains($0.name) }
+        } else {
+            entries = allEntries
+        }
         var perEntryOutPaths: [String] = []
         perEntryOutPaths.reserveCapacity(entries.count)
         var parentPaths: Set<String> = []

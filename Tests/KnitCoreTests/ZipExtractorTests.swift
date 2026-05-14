@@ -228,6 +228,80 @@ struct ZipExtractorTests {
                 "ZipExtractor should refuse a corrupted archive (integrity or codec error)")
     }
 
+    @Test("entryFilter extracts only the named entries")
+    func entryFilterSelectsOnly() throws {
+        let tmp = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        // Build a small tree with three files in distinct subdirs so
+        // the filter target is unambiguous.
+        let inputDir = tmp.appendingPathComponent("src")
+        try FileManager.default.createDirectory(at: inputDir, withIntermediateDirectories: true)
+        try "alpha".write(to: inputDir.appendingPathComponent("a.txt"),
+                          atomically: true, encoding: .utf8)
+        try "bravo".write(to: inputDir.appendingPathComponent("b.txt"),
+                          atomically: true, encoding: .utf8)
+        try "charlie".write(to: inputDir.appendingPathComponent("c.txt"),
+                            atomically: true, encoding: .utf8)
+
+        let zipURL = tmp.appendingPathComponent("filtered.zip")
+        _ = try ZipCompressor(backend: CPUDeflate(), options: .init(level: .default))
+            .compress(input: inputDir, to: zipURL)
+
+        // Resolve the entry name for `b.txt` from the archive's CD —
+        // ZipCompressor's exact prefixing convention isn't part of
+        // ZipReader's interface, so we discover the name dynamically.
+        let reader = try ZipReader(url: zipURL)
+        guard let bName = reader.entries.first(where: { $0.name.hasSuffix("b.txt") })?.name else {
+            Issue.record("ZipReader didn't surface a 'b.txt' entry")
+            return
+        }
+
+        let restoreDir = tmp.appendingPathComponent("restore")
+        try FileManager.default.createDirectory(at: restoreDir, withIntermediateDirectories: true)
+        let extractor = ZipExtractor(entryFilter: [bName])
+        let stats = try extractor.extract(archive: zipURL, to: restoreDir)
+        // Only the one entry should have been processed.
+        #expect(stats.entries == 1)
+        #expect(stats.bytesOut == UInt64("bravo".utf8.count))
+
+        // b.txt should exist with the right content; a.txt and c.txt
+        // must NOT exist in the restore tree.
+        let restoredB = restoreDir.appendingPathComponent(bName)
+        let bContents = try? String(contentsOf: restoredB, encoding: .utf8)
+        #expect(bContents == "bravo")
+        let restoredA = restoreDir.appendingPathComponent(bName.replacingOccurrences(of: "b.txt", with: "a.txt"))
+        let restoredC = restoreDir.appendingPathComponent(bName.replacingOccurrences(of: "b.txt", with: "c.txt"))
+        #expect(!FileManager.default.fileExists(atPath: restoredA.path),
+                "ZipExtractor should not have extracted a.txt — it's outside the filter")
+        #expect(!FileManager.default.fileExists(atPath: restoredC.path),
+                "ZipExtractor should not have extracted c.txt — it's outside the filter")
+    }
+
+    @Test("entryFilter throws on names that aren't in the archive")
+    func entryFilterMissingThrows() throws {
+        let tmp = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let file = tmp.appendingPathComponent("data.bin")
+        try Data([1, 2, 3]).write(to: file)
+        let zipURL = tmp.appendingPathComponent("data.zip")
+        _ = try ZipCompressor(backend: CPUDeflate(), options: .init(level: .default))
+            .compress(input: file, to: zipURL)
+
+        let restoreDir = tmp.appendingPathComponent("restore")
+        try FileManager.default.createDirectory(at: restoreDir, withIntermediateDirectories: true)
+        var threw = false
+        do {
+            _ = try ZipExtractor(entryFilter: ["definitely-not-in-the-archive.bin"])
+                .extract(archive: zipURL, to: restoreDir)
+        } catch is KnitError {
+            threw = true
+        }
+        #expect(threw,
+                "ZipExtractor should refuse a filter with names that don't exist in the archive (typo failure-mode protection)")
+    }
+
     @Test("--no-post-verify still catches DEFLATE-level corruption via libdeflate")
     func noPostVerifyStillThrows() throws {
         // libdeflate's strict-length decode (CPUDeflateDecoder passes
