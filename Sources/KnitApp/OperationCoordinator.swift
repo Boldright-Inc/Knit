@@ -41,11 +41,16 @@ enum KnitOperation: Sendable {
 
 /// One subprocess invocation derived from a `KnitOperation`. The
 /// `executableURL` is the actual binary to spawn — usually the knit
-/// CLI we located at startup, but `/usr/bin/unzip` for `.zip` extract
-/// (knit's CLI is `.knit`-only). `progressJSON == true` means
+/// CLI we located at startup. `progressJSON == true` means
 /// `--progress-json` is on the args list and the parent should parse
-/// ndjson off stderr; `false` (unzip path) means the NSProgress stays
+/// ndjson off stderr; `false` means the NSProgress stays
 /// indeterminate until the subprocess exits.
+///
+/// Note: pre-this-PR `/usr/bin/unzip` was the fallback for `.zip`
+/// extracts (the knit CLI was `.knit`-only). With `knit unzip`
+/// shipping in this PR, every operation goes through the bundled
+/// CLI with full progress JSON — no more indeterminate spinner for
+/// ZIP extracts.
 struct Run {
     let executableURL: URL
     let args: [String]
@@ -93,17 +98,31 @@ extension KnitOperation {
                 let dir = outputDir ?? archive.deletingLastPathComponent()
                 let lower = archive.path.lowercased()
                 if lower.hasSuffix(".zip") {
-                    // `/usr/bin/unzip` is the system fallback for .zip
-                    // archives — `knit unpack` is .knit-only. unzip
-                    // doesn't produce a machine-readable progress
-                    // stream, so the NSProgress for this run stays
-                    // indeterminate (the bar shows a spinner-style
-                    // animation) until the subprocess exits.
+                    // ZIP extract path. Pre-this-PR shelled out to
+                    // `/usr/bin/unzip` because the knit CLI had no
+                    // ZIP decoder, leaving the NSProgress
+                    // indeterminate for the entire extract — users
+                    // saw a spinner-style bar with no % feedback.
+                    //
+                    // `knit unzip --progress-json` produces the
+                    // same ndjson stream as `knit unpack`, so ZIP
+                    // extracts now get the determinate bar +
+                    // file-icon overlay treatment for free. The
+                    // `--no-post-verify` flag matches the
+                    // `unpack` invocation below: decode-side
+                    // libdeflate is strict (`LIBDEFLATE_SHORT_OUTPUT`
+                    // already catches length mismatches), so the
+                    // ~few-seconds extra of the CRC pass is pure
+                    // defence-in-depth that APFS + NVMe ECC
+                    // already cover.
                     return Run(
-                        executableURL: URL(fileURLWithPath: "/usr/bin/unzip"),
-                        args: ["-q", "-o", archive.path, "-d", dir.path],
+                        executableURL: knitURL,
+                        args: ["unzip", archive.path,
+                               "-o", dir.path,
+                               "--no-post-verify",
+                               "--progress-json"],
                         outputURL: archive, sourceURL: archive,
-                        phase: .copying, progressJSON: false)
+                        phase: .copying, progressJSON: true)
                 }
                 // `--no-post-verify` (PR #75 flag, default-on
                 // when not passed): skip the post-write CRC re-read

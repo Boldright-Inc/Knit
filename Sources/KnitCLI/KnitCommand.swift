@@ -1,8 +1,9 @@
-// CLI front-end for KnitCore. Five subcommands:
+// CLI front-end for KnitCore. Six subcommands:
 //
 //   info        — environment + linked codec versions
 //   metal-info  — Metal device probe and a CRC32 self-test
 //   zip         — produce a standard ZIP (DEFLATE)
+//   unzip       — extract a standard ZIP (DEFLATE)
 //   pack        — produce a .knit (block-parallel zstd)
 //   unpack      — extract a .knit archive (CRC-verified)
 //
@@ -20,7 +21,7 @@ struct KnitCommand: ParsableCommand {
         commandName: "knit",
         abstract: "Knit — fast ZIP/.knit compression for Apple Silicon.",
         version: Knit.version,
-        subcommands: [Info.self, Zip.self, Pack.self, Unpack.self, MetalInfo.self]
+        subcommands: [Info.self, Zip.self, Unzip.self, Pack.self, Unpack.self, MetalInfo.self]
     )
 
     /// Override `ParsableCommand.main(_:)` so we can run process-wide
@@ -499,6 +500,126 @@ extension KnitCommand {
                 let report = CLIAnalyze.renderUnpackLiteralTypes(snap)
                 FileHandle.standardError.write(Data(report.utf8))
             }
+        }
+    }
+
+    /// Extract a standard ZIP archive. Symmetric to `Unpack` for the
+    /// `.knit` path. Wired purposely so the GUI launcher
+    /// (`Sources/KnitApp/OperationCoordinator.swift`) can stop shelling
+    /// out to `/usr/bin/unzip` and drive a `knit unzip --progress-json`
+    /// subprocess just like every other operation — same NSProgress
+    /// rendering, same ProgressWindow, same cancellation contract.
+    ///
+    /// `--analyze` here is the deliverable from the verification plan:
+    /// it instruments `ZipExtractor` so we can apply Rule 4.1's
+    /// decision table to real ZIP corpora and decide whether GPU
+    /// DEFLATE decode is worth pursuing (CLAUDE.md "Investigated, no-go"
+    /// + DEFLATE algorithmic constraints argue it isn't, but
+    /// bench-grounded data is the gate).
+    struct Unzip: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "unzip",
+            abstract: "Extract a standard ZIP archive (DEFLATE / stored)."
+        )
+
+        @Argument(help: "Input .zip file.")
+        var input: String
+
+        @Option(name: .shortAndLong, help: "Output directory. Defaults to current directory.")
+        var output: String = "."
+
+        @Flag(name: .customLong("no-post-verify"),
+              help: """
+                Skip the post-decompress CRC32 verify pass. libdeflate's \
+                decompress already catches "stream decompressed to wrong \
+                length" via LIBDEFLATE_SHORT_OUTPUT, so opting out only \
+                drops the additional "disk lost bytes after my write(2) \
+                returned" defence-in-depth — which APFS block checksums \
+                + NVMe ECC already cover. Symmetric to `unpack`'s flag \
+                (PR #75).
+                """)
+        var noPostVerify: Bool = false
+
+        @Flag(name: .long,
+              help: "Force the live progress bar on (overrides the default TTY-based detection).")
+        var progress: Bool = false
+
+        @Flag(name: .customLong("no-progress"),
+              help: "Suppress the live progress bar even when stderr is a terminal.")
+        var noProgress: Bool = false
+
+        @Flag(name: .customLong("progress-json"),
+              help: ArgumentHelp(
+                "Emit ndjson progress on stderr instead of the text bar. Used by Knit.app to drive an NSProgress.",
+                visibility: .private))
+        var progressJSON: Bool = false
+
+        @Flag(name: .customLong("analyze"),
+              help: ArgumentHelp("Print decode-stage timing breakdown to stderr (internal).",
+                                 visibility: .private))
+        var analyze: Bool = false
+
+        func run() throws {
+            let inputURL = URL(fileURLWithPath: input).standardizedFileURL
+            let outURL = URL(fileURLWithPath: output).standardizedFileURL
+            let needReporter = CLIProgress.shouldHaveReporter(
+                progress: progress, noProgress: noProgress, progressJSON: progressJSON)
+            // Total bytes for the progress bar: sum of all entries'
+            // uncompressedSize from the ZIP central directory. Parsing
+            // the CD is cheap (mmap + linear walk) and doesn't touch
+            // any compressed payload — same cost regardless of
+            // whether we go on to extract.
+            let totalBytes: UInt64
+            if needReporter {
+                totalBytes = (try? totalUncompressedBytesInZip(at: inputURL)) ?? 0
+            } else {
+                totalBytes = 0
+            }
+            let reporter: ProgressReporter? = needReporter
+                ? ProgressReporter(totalBytes: totalBytes, phase: .extracting) : nil
+            let printer = CLIProgress.makePrinter(
+                reporter: reporter, progress: progress,
+                noProgress: noProgress, progressJSON: progressJSON)
+            printer?.start()
+            defer {
+                reporter?.finish()
+                printer?.waitUntilFlushed()
+            }
+
+            let analytics: StageAnalytics? = analyze ? StageAnalytics() : nil
+            let extractor = ZipExtractor(
+                postVerify: !noPostVerify,
+                progressReporter: reporter,
+                analytics: analytics
+            )
+            let stats = try extractor.extract(archive: inputURL, to: outURL)
+            reporter?.finish()
+            printer?.waitUntilFlushed()
+            print(String(format: "  entries: %d", stats.entries))
+            print(String(format: "  out:   %10.2f MB", Double(stats.bytesOut) / 1_000_000))
+            print(String(format: "  time:  %10.3f s", stats.elapsed))
+            print("  verify: CPU (libdeflate)")
+            if let analytics = analytics {
+                let snap = analytics.snapshot()
+                let report = CLIAnalyze.renderUnpack(snap,
+                                                     extractElapsed: stats.elapsed,
+                                                     bytesOut: stats.bytesOut,
+                                                     entries: stats.entries)
+                FileHandle.standardError.write(Data(report.utf8))
+            }
+        }
+
+        /// Sum of `uncompressedSize` across every entry in the ZIP's
+        /// central directory. Used as the progress bar's denominator
+        /// without needing to decompress anything — symmetric to
+        /// `CLIProgress.totalUncompressedBytesInKnit` for `.knit`.
+        private func totalUncompressedBytesInZip(at archiveURL: URL) throws -> UInt64 {
+            let reader = try ZipReader(url: archiveURL)
+            var total: UInt64 = 0
+            for entry in reader.entries {
+                total &+= entry.uncompressedSize
+            }
+            return total
         }
     }
 }

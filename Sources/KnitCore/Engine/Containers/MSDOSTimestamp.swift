@@ -28,4 +28,33 @@ struct MSDOSTimestamp {
         self.date = UInt16((year << 9) | (month << 5) | day)
         self.time = UInt16((hour << 11) | (minute << 5) | second)
     }
+
+    /// Decode an MS-DOS date/time pair (the same `(date, time)` words
+    /// the encoding form above produces) into a `Date`. Used by
+    /// `ZipReader` to recover the entry's modification timestamp from
+    /// the central directory. The 2-second resolution and 1980 epoch
+    /// are inherent to the format — a round-trip through encode +
+    /// decode preserves the truncated value, not the original
+    /// sub-second precision.
+    static func dateFromMSDOS(dosTime: UInt16, dosDate: UInt16,
+                              calendar: Calendar = Calendar(identifier: .gregorian)) -> Date {
+        let year   = Int(dosDate >> 9) + 1980
+        let month  = Int((dosDate >> 5) & 0x0F)
+        let day    = Int(dosDate & 0x1F)
+        let hour   = Int(dosTime >> 11)
+        let minute = Int((dosTime >> 5) & 0x3F)
+        let second = Int(dosTime & 0x1F) * 2
+        var comps = DateComponents()
+        comps.year = year
+        comps.month = max(1, month)
+        comps.day = max(1, day)
+        comps.hour = hour
+        comps.minute = minute
+        comps.second = second
+        // Calendar.date(from:) returns nil for nonsense components
+        // (e.g. month=13 from a malformed archive). Fall back to the
+        // unix epoch in that case so the entry remains extractable;
+        // the legacy `unzip` tool does the same.
+        return calendar.date(from: comps) ?? Date(timeIntervalSince1970: 0)
+    }
 }
