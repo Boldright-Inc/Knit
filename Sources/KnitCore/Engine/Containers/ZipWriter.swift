@@ -283,10 +283,23 @@ public final class ZipWriter {
             return
         }
         let chunkSize = Self.payloadWriteChunkSize
-        if onProgress == nil || buf.count <= chunkSize {
-            // Single-shot path. Wrap the whole mmap as a no-copy Data
-            // for the one write call. (For a small entry this matches
-            // the original copying path's behaviour at lower cost.)
+        // Single-shot path is keyed on size, not on onProgress.
+        // Two reasons the chunked loop must run for any payload
+        // above `chunkSize` regardless of progress reporting:
+        //   1. macOS `write(2)` is capped at INT_MAX (≈2 GiB − 1)
+        //      bytes per call. A single `FileHandle.write(contentsOf:)`
+        //      of a 2 GiB+ buffer surfaces as Foundation's
+        //      "The file couldn't be saved" Cocoa error and the
+        //      archive aborts (incidentally a `knit zip` of a
+        //      multi-GB single file produced a stub EOCD-less
+        //      output until this was fixed).
+        //   2. The chunked loop calls `madvise(MADV_DONTNEED)` per
+        //      chunk (PR #76). Skipping it for "no progress
+        //      reporter" inputs would let the kernel accumulate ~80 GB
+        //      of resident mmap pages on memory-rich hosts (M5 Max),
+        //      which is exactly the panic chain Rule 3.1 / PR #76
+        //      addresses.
+        if buf.count <= chunkSize {
             let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: base),
                             count: buf.count,
                             deallocator: .none)
@@ -341,8 +354,10 @@ public final class ZipWriter {
     private func writeRawChunked(_ data: Data,
                                   onProgress: (@Sendable (UInt64) -> Void)?) throws {
         let chunkSize = Self.payloadWriteChunkSize
-        // Fast path: no progress wanted or small payload — single write.
-        if onProgress == nil || data.count <= chunkSize {
+        // Single-shot only for payloads that fit in one write(2).
+        // Same INT_MAX (~2 GiB − 1) ceiling as `writeRawChunkedMapped`
+        // — gating on size, not on onProgress.
+        if data.count <= chunkSize {
             try handle.write(contentsOf: data)
             currentOffset += UInt64(data.count)
             onProgress?(UInt64(data.count))
