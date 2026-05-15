@@ -599,6 +599,19 @@ extension KnitCommand {
                 """)
         var noPostVerify: Bool = false
 
+        @Flag(name: .customLong("no-gpu-verify"),
+              help: """
+                Disable the GPU CRC32 path for the post-decompress verify \
+                step. By default, entries ≥ 1 GiB route their CRC through \
+                MetalCRC32 (Apple Silicon GPU); smaller entries always \
+                stay on the parallel libdeflate CPU walk. Pass this flag \
+                to force the CPU path for every entry regardless of size \
+                — useful for benchmarking the two backends head-to-head \
+                or when running on a host where Metal device init fails \
+                in an unexpected way. Symmetric to `unpack`'s flag.
+                """)
+        var noGpuVerify: Bool = false
+
         @Flag(name: .long,
               help: "Force the live progress bar on (overrides the default TTY-based detection).")
         var progress: Bool = false
@@ -689,6 +702,7 @@ extension KnitCommand {
             let analytics: StageAnalytics? = analyze ? StageAnalytics() : nil
             let extractor = ZipExtractor(
                 postVerify: !noPostVerify,
+                useGPUVerify: !noGpuVerify,
                 progressReporter: reporter,
                 analytics: analytics,
                 entryFilter: entryFilter
@@ -699,7 +713,16 @@ extension KnitCommand {
             print(String(format: "  entries: %d", stats.entries))
             print(String(format: "  out:   %10.2f MB", Double(stats.bytesOut) / 1_000_000))
             print(String(format: "  time:  %10.3f s", stats.elapsed))
-            print("  verify: CPU (libdeflate)")
+            // GPU path only reports as active when at least one entry's
+            // CRC actually crossed the size threshold + Metal init
+            // succeeded — see `ZipExtractor.Stats.gpuVerifyUsed`.
+            if stats.gpuVerifyUsed {
+                print("  verify: GPU (MetalCRC32) + CPU (libdeflate) hybrid")
+            } else if noPostVerify {
+                print("  verify: skipped (--no-post-verify)")
+            } else {
+                print("  verify: CPU (libdeflate)")
+            }
             if let analytics = analytics {
                 let snap = analytics.snapshot()
                 let report = CLIAnalyze.renderUnpack(snap,
