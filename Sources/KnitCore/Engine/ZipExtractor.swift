@@ -35,6 +35,11 @@ public final class ZipExtractor {
         public let entries: Int
         public let bytesOut: UInt64
         public let elapsed: TimeInterval
+        /// True if at least one entry's CRC verify ran on the GPU
+        /// (`MetalCRC32`). Mirrors `KnitExtractor.Stats.gpuVerifyUsed`
+        /// so the CLI can print "verify: GPU+CPU (hybrid)" only when
+        /// GPU was actually invoked — not just when the flag was set.
+        public let gpuVerifyUsed: Bool
     }
 
     /// When true (the default), each extracted entry is CRC32-verified
@@ -47,6 +52,27 @@ public final class ZipExtractor {
     /// cover at the FS/controller level. PR #75 documented the
     /// equivalent trade-off on `.knit`.
     public var postVerify: Bool
+
+    /// When true, route large per-entry CRC32 verifies through
+    /// `MetalCRC32` (the Apple Silicon GPU implementation). Smaller
+    /// entries (and any host where Metal init fails) fall back to
+    /// `parallelCRC32(using: CPUDeflate())` silently — verification
+    /// still happens. Set to `false` via `--no-gpu-verify`.
+    ///
+    /// **Threshold + rationale.** GPU CRC is gated by
+    /// `gpuCRCMinSize` (1 GiB by default). Below that point,
+    /// `parallelCRC32` running libdeflate across N P-cores wins
+    /// outright — CLAUDE.md "Investigated, no-go" retired pack-side
+    /// MetalCRC32 on this exact basis (per-batch buffers ~32 MiB
+    /// sit below the GPU dispatch amortisation point). The
+    /// large-`.stored` single-entry regime is qualitatively
+    /// different: an 80 GB single buffer dispatches once, so
+    /// dispatch overhead amortises perfectly. Bench evidence
+    /// (Phase B of the verification plan, 2 GB random `.stored`
+    /// entry): `crc.verify` consumed 75.9 % of wall at ~1.75 GB/s
+    /// on `parallelCRC32`; expected GPU rate at 1+ GiB single
+    /// buffer is ~5 GB/s (≈3× the CPU walk).
+    public var useGPUVerify: Bool
 
     /// Optional progress sink. Receives one `advance(by:)` call per
     /// extracted entry, in uncompressed-byte units.
@@ -94,11 +120,13 @@ public final class ZipExtractor {
     public var entryFilter: Set<String>?
 
     public init(postVerify: Bool = true,
+                useGPUVerify: Bool = true,
                 progressReporter: ProgressReporter? = nil,
                 concurrency: Int = ProcessInfo.processInfo.activeProcessorCount,
                 analytics: StageAnalytics? = nil,
                 entryFilter: Set<String>? = nil) {
         self.postVerify = postVerify
+        self.useGPUVerify = useGPUVerify
         self.progressReporter = progressReporter
         self.concurrency = max(1, concurrency)
         self.analytics = analytics
@@ -124,10 +152,26 @@ public final class ZipExtractor {
     /// clear error message rather than a silent allocator failure.
     private static let maxDeflateEntrySize: UInt64 = 4 * 1024 * 1024 * 1024
 
+    /// Per-entry size threshold above which CRC verify is routed
+    /// to `MetalCRC32`. See `useGPUVerify`'s doc-block for the
+    /// 1 GiB pick — below this size `parallelCRC32(using:
+    /// CPUDeflate())` (libdeflate across all P-cores) wins.
+    private static let gpuCRCMinSize: UInt64 = 1 * 1024 * 1024 * 1024
+
     public func extract(archive: URL, to destDir: URL) throws -> Stats {
         let reader = try ZipReader(url: archive)
 
         analytics?.startWallClock()
+
+        // Lazily instantiate the GPU CRC pipeline. Same fallback
+        // contract as `KnitExtractor` (line ~143): a Metal init failure
+        // (no device, kernel compile error, headless CI host)
+        // silently returns nil, and `verifyCRC` falls through to
+        // `parallelCRC32` — verification still happens, just without
+        // GPU offload. Constructed once per extract() call (cheap;
+        // the runtime Metal library is cached by `MetalContext`).
+        let gpuCRC: MetalCRC32? = useGPUVerify ? MetalCRC32() : nil
+        var gpuUsed = false
 
         // Pre-create destination root + every parent directory in a
         // single serial pass before parallel extract. Same APFS
@@ -184,6 +228,7 @@ public final class ZipExtractor {
         let reporter = progressReporter
         let postVerifyLocal = postVerify
         let outerConcurrency = self.concurrency
+        let gpuCRCLocal = gpuCRC
 
         var i = 0
         while i < entries.count {
@@ -197,10 +242,14 @@ public final class ZipExtractor {
                     outPath: perEntryOutPaths[i],
                     concurrency: outerConcurrency,
                     analytics: analyticsLocal,
-                    postVerify: postVerifyLocal
+                    postVerify: postVerifyLocal,
+                    gpuCRC: gpuCRC
                 )
                 reporter?.advance(by: entry.uncompressedSize)
                 bytesOut += entry.uncompressedSize
+                if gpuCRC != nil, entry.uncompressedSize >= Self.gpuCRCMinSize {
+                    gpuUsed = true
+                }
                 readerLocal.releaseInputPagesFor(entry)
                 i += 1
                 continue
@@ -233,7 +282,8 @@ public final class ZipExtractor {
                     // just over-subscribe GCD.
                     concurrency: 1,
                     analytics: analyticsLocal,
-                    postVerify: postVerifyLocal
+                    postVerify: postVerifyLocal,
+                    gpuCRC: gpuCRCLocal
                 )
                 reporter?.advance(by: e.uncompressedSize)
                 readerLocal.releaseInputPagesFor(e)
@@ -242,6 +292,9 @@ public final class ZipExtractor {
 
             for e in batch {
                 bytesOut += e.uncompressedSize
+                if gpuCRC != nil, e.uncompressedSize >= Self.gpuCRCMinSize {
+                    gpuUsed = true
+                }
             }
             i = j
         }
@@ -250,7 +303,8 @@ public final class ZipExtractor {
         return Stats(
             entries: entries.count,
             bytesOut: bytesOut,
-            elapsed: elapsed.timeIntervalSeconds
+            elapsed: elapsed.timeIntervalSeconds,
+            gpuVerifyUsed: gpuUsed
         )
     }
 
@@ -269,7 +323,8 @@ public final class ZipExtractor {
                                        outPath: String,
                                        concurrency: Int,
                                        analytics: StageAnalytics?,
-                                       postVerify: Bool) throws {
+                                       postVerify: Bool,
+                                       gpuCRC: MetalCRC32?) throws {
         if entry.isDirectory {
             _ = POSIXFile.mkdirParents(outPath)
             _ = outPath.withCString { chmod($0, mode_t(entry.unixMode)) }
@@ -325,7 +380,10 @@ public final class ZipExtractor {
 
             if postVerify {
                 let crcStart = ContinuousClock.now
-                try verifyCRC(entry: entry, outPath: outPath, concurrency: concurrency)
+                try verifyCRC(entry: entry,
+                              outPath: outPath,
+                              concurrency: concurrency,
+                              gpuCRC: gpuCRC)
                 analytics?.record(stage: "crc.verify",
                                   seconds: (ContinuousClock.now - crcStart).timeIntervalSeconds)
             }
@@ -361,11 +419,20 @@ public final class ZipExtractor {
 
             if postVerify {
                 let crcStart = ContinuousClock.now
-                let computed = parallelCRC32(
-                    UnsafeBufferPointer(outBuf),
-                    using: CPUDeflate(),
-                    concurrency: concurrency
-                )
+                let computed: UInt32
+                if let gpu = gpuCRC, UInt64(outBuf.count) >= gpuCRCMinSize {
+                    // Same routing predicate as `verifyCRC` — GPU
+                    // dispatch only pays off for ≥1 GiB single
+                    // buffers; below that, parallelCRC32 across
+                    // P-cores wins.
+                    computed = try gpu.crc32(UnsafeBufferPointer(outBuf))
+                } else {
+                    computed = parallelCRC32(
+                        UnsafeBufferPointer(outBuf),
+                        using: CPUDeflate(),
+                        concurrency: concurrency
+                    )
+                }
                 analytics?.record(stage: "crc.verify",
                                   seconds: (ContinuousClock.now - crcStart).timeIntervalSeconds)
                 if computed != entry.crc32 {
@@ -474,7 +541,8 @@ public final class ZipExtractor {
     /// hardware-CRC walk on one core.
     fileprivate static func verifyCRC(entry: ZipEntry,
                                       outPath: String,
-                                      concurrency: Int) throws {
+                                      concurrency: Int,
+                                      gpuCRC: MetalCRC32?) throws {
         guard entry.uncompressedSize > 0 else {
             if entry.crc32 != 0 {
                 throw KnitError.integrity(
@@ -484,9 +552,20 @@ public final class ZipExtractor {
             return
         }
         let outMap = try MappedFile(path: outPath)
-        let computed = parallelCRC32(outMap.buffer,
+        let computed: UInt32
+        if let gpu = gpuCRC, entry.uncompressedSize >= gpuCRCMinSize {
+            // Page-aligned mmap input + ≥1 GiB single buffer hits
+            // MetalCRC32's `bytesNoCopy` fast path (no host→device
+            // copy) and the per-dispatch slicing in MetalCRC32
+            // amortises the dispatch overhead over multi-GB ranges.
+            // Below this size, parallel libdeflate across P-cores
+            // wins — see `useGPUVerify`'s doc-block.
+            computed = try gpu.crc32(outMap.buffer)
+        } else {
+            computed = parallelCRC32(outMap.buffer,
                                      using: CPUDeflate(),
                                      concurrency: concurrency)
+        }
         if computed != entry.crc32 {
             throw KnitError.integrity(
                 "zip: CRC mismatch for '\(entry.name)': " +
