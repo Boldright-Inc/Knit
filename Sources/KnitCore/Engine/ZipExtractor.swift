@@ -236,6 +236,24 @@ public final class ZipExtractor {
 
             // Large entry: serial across entries, parallel within.
             if !entry.isDirectory && entry.uncompressedSize >= Self.largeEntryThreshold {
+                // Per-chunk progress callback so the bar ticks
+                // during a multi-GB `.stored` / `.deflate` write
+                // instead of sitting at the entry's start value
+                // for the entire write's wall-clock and then
+                // jumping to 100% at completion. CLAUDE.md PR #65
+                // / PR #71 documented the equivalent issue + fix on
+                // the pack side; the unpack side regressed into the
+                // same shape because the per-entry `advance(by:)`
+                // below only fires after `extractOne` returns. For
+                // an 80 GB single-entry .pvm.zip that meant ~30 s
+                // of dead air → user-perceived "stuck progress" +
+                // "very slow" (sample trace pid 9133 / 2026-05-15).
+                let chunkProgress: (@Sendable (UInt64) -> Void)?
+                if let r = reporter {
+                    chunkProgress = { written in r.advance(by: written) }
+                } else {
+                    chunkProgress = nil
+                }
                 try Self.extractOne(
                     reader: readerLocal,
                     entry: entry,
@@ -243,9 +261,13 @@ public final class ZipExtractor {
                     concurrency: outerConcurrency,
                     analytics: analyticsLocal,
                     postVerify: postVerifyLocal,
-                    gpuCRC: gpuCRC
+                    gpuCRC: gpuCRC,
+                    onProgress: chunkProgress
                 )
-                reporter?.advance(by: entry.uncompressedSize)
+                // Per-entry catch-up advance NOT called here — the
+                // chunk callbacks already credit the reporter as
+                // bytes land on disk. Double-counting would push
+                // the bar past 100 % for the same workload.
                 bytesOut += entry.uncompressedSize
                 if gpuCRC != nil, entry.uncompressedSize >= Self.gpuCRCMinSize {
                     gpuUsed = true
@@ -283,7 +305,12 @@ public final class ZipExtractor {
                     concurrency: 1,
                     analytics: analyticsLocal,
                     postVerify: postVerifyLocal,
-                    gpuCRC: gpuCRCLocal
+                    gpuCRC: gpuCRCLocal,
+                    // Small entries take a single sub-64-MiB write,
+                    // so per-chunk progress would be the same as
+                    // per-entry. Pass nil — the per-entry advance
+                    // below covers them at exactly one tick each.
+                    onProgress: nil
                 )
                 reporter?.advance(by: e.uncompressedSize)
                 readerLocal.releaseInputPagesFor(e)
@@ -318,13 +345,22 @@ public final class ZipExtractor {
     /// CRC verify (when enabled) uses `parallelCRC32` so the inner
     /// concurrency budget is spent productively on large `.stored`
     /// entries.
+    ///
+    /// `onProgress`, when non-nil, fires once per 64 MiB write chunk
+    /// with the number of bytes that just landed on disk. Used by
+    /// the large-entry path of `extract()` to keep the progress bar
+    /// ticking during a multi-GB write instead of waiting until the
+    /// entry completes. Small-entry batch callers pass `nil` (their
+    /// per-entry advance is already chunk-grained enough at < 16
+    /// MiB).
     fileprivate static func extractOne(reader: ZipReader,
                                        entry: ZipEntry,
                                        outPath: String,
                                        concurrency: Int,
                                        analytics: StageAnalytics?,
                                        postVerify: Bool,
-                                       gpuCRC: MetalCRC32?) throws {
+                                       gpuCRC: MetalCRC32?,
+                                       onProgress: (@Sendable (UInt64) -> Void)? = nil) throws {
         if entry.isDirectory {
             _ = POSIXFile.mkdirParents(outPath)
             _ = outPath.withCString { chmod($0, mode_t(entry.unixMode)) }
@@ -374,7 +410,8 @@ public final class ZipExtractor {
             // we fall through to the single-threaded libdeflate CRC
             // (still hardware-accelerated, ~7 GB/s).
             let writeStart = ContinuousClock.now
-            try storedStreamCopy(payload: payload, outHandle: outHandle)
+            try storedStreamCopy(payload: payload, outHandle: outHandle,
+                                 onProgress: onProgress)
             analytics?.record(stage: "sink.write",
                               seconds: (ContinuousClock.now - writeStart).timeIntervalSeconds)
 
@@ -451,7 +488,8 @@ public final class ZipExtractor {
             // because the FD has F_NOCACHE — Rule 3.1 addendum / PR
             // #71.
             let writeStart = ContinuousClock.now
-            try writeDecompressedBuffer(outBuf, to: outHandle)
+            try writeDecompressedBuffer(outBuf, to: outHandle,
+                                        onProgress: onProgress)
             analytics?.record(stage: "sink.write",
                               seconds: (ContinuousClock.now - writeStart).timeIntervalSeconds)
         }
@@ -470,8 +508,15 @@ public final class ZipExtractor {
     /// large `.stored` entries don't accumulate ~80 GB of resident
     /// input pages — mirrors `ZipWriter.writeRawChunkedMapped` (PR
     /// #76 unpack-side).
+    ///
+    /// `onProgress`, when non-nil, fires after each chunk's `write(2)`
+    /// returns with the number of bytes that just landed on disk.
+    /// Drives the progress bar's tick rate during the write phase —
+    /// without it, a multi-GB extract sits at the entry's start value
+    /// for 30+ s on M5 Max NVMe and then jumps to 100 % at completion.
     fileprivate static func storedStreamCopy(payload: UnsafeBufferPointer<UInt8>,
-                                             outHandle: FileHandle) throws {
+                                             outHandle: FileHandle,
+                                             onProgress: (@Sendable (UInt64) -> Void)?) throws {
         guard let base = payload.baseAddress, payload.count > 0 else { return }
         let chunkSize = 64 * 1024 * 1024
         if payload.count <= chunkSize {
@@ -481,6 +526,7 @@ public final class ZipExtractor {
                 deallocator: .none
             )
             try outHandle.write(contentsOf: data)
+            onProgress?(UInt64(payload.count))
             return
         }
         var offset = 0
@@ -494,6 +540,7 @@ public final class ZipExtractor {
                 deallocator: .none
             )
             try outHandle.write(contentsOf: data)
+            onProgress?(UInt64(chunkLen))
             _ = madvise(UnsafeMutableRawPointer(mutating: chunkPtr),
                         chunkLen,
                         MADV_DONTNEED)
@@ -505,8 +552,10 @@ public final class ZipExtractor {
     /// 64 MiB chunking as the `.stored` path — keeps the write loop's
     /// behaviour identical regardless of method, and matches the
     /// post-PR-#73 syscall-byte-budget tuning the ZipWriter side uses.
+    /// `onProgress` has the same contract as `storedStreamCopy`.
     fileprivate static func writeDecompressedBuffer(_ buf: UnsafeMutableBufferPointer<UInt8>,
-                                                    to outHandle: FileHandle) throws {
+                                                    to outHandle: FileHandle,
+                                                    onProgress: (@Sendable (UInt64) -> Void)?) throws {
         guard let base = buf.baseAddress, buf.count > 0 else { return }
         let chunkSize = 64 * 1024 * 1024
         if buf.count <= chunkSize {
@@ -516,6 +565,7 @@ public final class ZipExtractor {
                 deallocator: .none
             )
             try outHandle.write(contentsOf: data)
+            onProgress?(UInt64(buf.count))
             return
         }
         var offset = 0
@@ -529,6 +579,7 @@ public final class ZipExtractor {
                 deallocator: .none
             )
             try outHandle.write(contentsOf: data)
+            onProgress?(UInt64(chunkLen))
             offset = end
         }
     }
