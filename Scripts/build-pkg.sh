@@ -111,13 +111,24 @@ chmod 0755 "${PKG_SCRIPTS}/postinstall"
 # ---------------------------------------------------------------------------
 if [[ -n "${APP_ID}" ]]; then
     echo ">> Signing CLI + Knit.app with: ${APP_ID}"
+    # Inner-first, outer-last. `--deep` is deprecated and does NOT reliably
+    # propagate to executables under Contents/Resources/ — the embedded CLI
+    # at Contents/Resources/bin/knit (PR #57) is then left ad-hoc signed
+    # (from build-app.sh:95). Notarization rejects with three errors on
+    # that binary: "not signed with a valid Developer ID certificate",
+    # "signature does not include a secure timestamp", "executable does
+    # not have the hardened runtime enabled". Sign each nested binary
+    # explicitly, THEN sign the outer bundle without --deep.
+    codesign --force --options runtime --timestamp \
+        --sign "${APP_ID}" \
+        "${PAYLOAD}/Applications/Knit.app/Contents/Resources/bin/knit"
     codesign --force --options runtime --timestamp \
         --sign "${APP_ID}" \
         "${PAYLOAD}/usr/local/bin/knit"
-    codesign --force --options runtime --timestamp --deep \
+    codesign --force --options runtime --timestamp \
         --sign "${APP_ID}" \
         "${PAYLOAD}/Applications/Knit.app"
-    codesign --verify --strict --verbose=2 "${PAYLOAD}/Applications/Knit.app"
+    codesign --verify --strict --verbose=2 --deep "${PAYLOAD}/Applications/Knit.app"
 else
     echo ">> APP_ID not set — skipping codesign (PKG will install but Gatekeeper will prompt)"
 fi
