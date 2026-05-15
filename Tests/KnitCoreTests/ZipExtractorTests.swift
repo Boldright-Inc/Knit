@@ -188,36 +188,39 @@ struct ZipExtractorTests {
         let tmp = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: tmp) }
 
+        // High-entropy input so the writer's entropy probe routes the
+        // entry to `.stored` (1024 random bytes are incompressible).
+        // `.stored` payload bytes are 1:1 with the input, so flipping
+        // ANY byte in the payload region is guaranteed to surface as
+        // a CRC mismatch — independent of how libdeflate happens to
+        // encode the input. The previous fixture used a single-byte
+        // repeat which DEFLATE compressed to ~6 bytes, and the
+        // `firstIndex(of: 0x41)` corruption probe walked past those
+        // ~6 payload bytes into the central directory, leaving the
+        // payload untouched and the test asserting "no throw".
         let file = tmp.appendingPathComponent("data.bin")
-        let bytes = Data(repeating: 0x41, count: 1024)
+        var rng = SystemRandomNumberGenerator()
+        var bytes = Data(count: 1024)
+        bytes.withUnsafeMutableBytes { buf in
+            for i in 0..<buf.count {
+                buf[i] = UInt8.random(in: 0...255, using: &rng)
+            }
+        }
         try bytes.write(to: file)
 
         let zipURL = tmp.appendingPathComponent("data.zip")
         _ = try ZipCompressor(backend: CPUDeflate(), options: .init(level: .default))
             .compress(input: file, to: zipURL)
 
-        // Hand-corrupt the entry's payload byte. The Local File
-        // Header sits at offset 0 (single-entry archive built from
-        // a file); the payload starts after the 30-byte fixed LFH
-        // plus name + extras. We flip a byte deep in the file body
-        // so the CRC verify fails but the DEFLATE decode itself
-        // would also likely fail — which is fine, both code paths
-        // produce a KnitError.integrity / codecFailure as designed.
-        var raw = try Data(contentsOf: zipURL)
-        // Find any 'A' (0x41) byte well past the header — the
-        // payload region of an incompressible-but-deflate'd "AAAA"
-        // file is small but flipping one bit is enough.
-        if let idx = raw.firstIndex(of: 0x41) {
-            raw[idx] = 0x42
-            try raw.write(to: zipURL)
-        }
+        try Self.corruptFirstPayloadByte(of: zipURL)
 
         let restoreDir = tmp.appendingPathComponent("restore")
         try FileManager.default.createDirectory(at: restoreDir, withIntermediateDirectories: true)
-        // Expect either an integrity throw (CRC verify catches it)
-        // or a codec throw (libdeflate rejects the malformed
-        // stream first). Both are acceptable failure paths — the
-        // test asserts that we don't silently produce wrong bytes.
+        // Either an integrity throw (post-verify CRC catches it) or a
+        // codec throw (libdeflate rejects the malformed stream first
+        // — only possible for `.deflate` entries; with `.stored` the
+        // failure path is CRC). Both produce a `KnitError` — the
+        // contract under test is "don't silently emit wrong bytes".
         var threw = false
         do {
             _ = try ZipExtractor().extract(archive: zipURL, to: restoreDir)
@@ -313,19 +316,32 @@ struct ZipExtractorTests {
         let tmp = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: tmp) }
 
+        // Moderately compressible text — long enough that the
+        // entropy probe lets it through to the `.deflate` codec
+        // (the only path that exercises libdeflate's strict decode),
+        // and the resulting DEFLATE payload is several hundred
+        // bytes so we have room to corrupt a byte cleanly inside
+        // the payload region.
         let file = tmp.appendingPathComponent("data.bin")
-        try Data(repeating: 0x55, count: 8192).write(to: file)
+        let text = String(repeating: "the quick brown fox jumped over the lazy dog\n",
+                          count: 256)
+        try text.write(to: file, atomically: true, encoding: .utf8)
         let zipURL = tmp.appendingPathComponent("data.zip")
         _ = try ZipCompressor(backend: CPUDeflate(), options: .init(level: .default))
             .compress(input: file, to: zipURL)
-
-        var raw = try Data(contentsOf: zipURL)
-        // Flip a byte well past the LFH (offset > 100 should be
-        // payload territory for any non-trivial input).
-        if raw.count > 100 {
-            raw[100] ^= 0xFF
-            try raw.write(to: zipURL)
+        // Sanity: this fixture only proves what it claims if the
+        // entry actually ended up as `.deflate`. If a future writer
+        // change reroutes this to `.stored`, the test is no longer
+        // testing libdeflate's strict decode and we want to know.
+        let reader = try ZipReader(url: zipURL)
+        guard let first = reader.entries.first(where: { !$0.isDirectory }) else {
+            Issue.record("expected at least one file entry in the test archive")
+            return
         }
+        #expect(first.method == .deflate,
+                "test fixture must be a .deflate entry for the libdeflate-strict-decode path")
+
+        try Self.corruptFirstPayloadByte(of: zipURL)
 
         let restoreDir = tmp.appendingPathComponent("restore")
         try FileManager.default.createDirectory(at: restoreDir, withIntermediateDirectories: true)
@@ -341,6 +357,46 @@ struct ZipExtractorTests {
     }
 
     // MARK: - Helpers
+
+    /// Flip the first byte of the first non-directory entry's payload
+    /// in the archive at `url`. Locates the payload coordinates by
+    /// parsing the entry's Local File Header (LFH) — a `firstIndex(of:)`
+    /// scan or a fixed-offset poke can't reliably land in the payload
+    /// region because writer-specific header sizes (name length, ZIP64
+    /// extras, CRC bytes, etc.) shift the payload start unpredictably
+    /// across input shapes.
+    ///
+    /// The corruption pattern is `byte ^= 0xFF` so a zero payload byte
+    /// becomes 0xFF and a 0xFF byte becomes zero — guaranteed change
+    /// regardless of input. The corrupted file is written back to
+    /// the same URL.
+    static func corruptFirstPayloadByte(of url: URL) throws {
+        let reader = try ZipReader(url: url)
+        guard let entry = reader.entries.first(where: { !$0.isDirectory }) else {
+            throw KnitError.formatError(
+                "test fixture: archive has no file entries to corrupt")
+        }
+        guard entry.compressedSize > 0 else {
+            throw KnitError.formatError(
+                "test fixture: first entry has zero compressed bytes — nothing to corrupt")
+        }
+        var raw = try Data(contentsOf: url)
+        // LFH layout: 30 fixed bytes, then name_len bytes, then
+        // extra_len bytes. The two length fields live at LFH+26 and
+        // LFH+28 (little-endian UInt16 each).
+        let lfh = Int(entry.localHeaderOffset)
+        guard lfh + 30 <= raw.count else {
+            throw KnitError.formatError("test fixture: LFH region runs past EOF")
+        }
+        let nameLen = Int(raw[lfh + 26]) | (Int(raw[lfh + 27]) << 8)
+        let extraLen = Int(raw[lfh + 28]) | (Int(raw[lfh + 29]) << 8)
+        let payloadStart = lfh + 30 + nameLen + extraLen
+        guard payloadStart < raw.count else {
+            throw KnitError.formatError("test fixture: payload range past EOF")
+        }
+        raw[payloadStart] ^= 0xFF
+        try raw.write(to: url)
+    }
 
     private func makeTempDir() throws -> URL {
         let url = URL(fileURLWithPath: NSTemporaryDirectory())
